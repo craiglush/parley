@@ -134,5 +134,4 @@ The editor bundle includes [CodeMirror 6](https://codemirror.net/),
 
 ## License
 
-No license file is included yet — add one (e.g. MIT) before relying on this publicly.
-Until then, default copyright applies.
+[MIT](LICENSE) © 2026 craiglush
