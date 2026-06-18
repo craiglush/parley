@@ -1,0 +1,790 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Meeting Capture & Analysis</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0a0a09">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Meetings">
+<link rel="icon" type="image/svg+xml" href="/static/icons/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png?v=3">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/icons/favicon-16.png?v=3">
+<link rel="apple-touch-icon" href="/static/icons/icon-192.png?v=3">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
+<link rel="stylesheet" href="/static/notes-tasks.css">
+<script defer src="/static/vendor/codemirror.bundle.js"></script>
+<script defer src="/static/notes-tasks.js"></script>
+<script>
+  // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
+  (function () {
+    try {
+      var t = localStorage.getItem('mb-theme');
+      if (!t) t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'alpha' : 'bravo';
+      document.documentElement.setAttribute('data-theme', t);
+    } catch (e) { document.documentElement.setAttribute('data-theme', 'bravo'); }
+  })();
+  window.toggleMoonbaseTheme = function () {
+    var next = document.documentElement.getAttribute('data-theme') === 'alpha' ? 'bravo' : 'alpha';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('mb-theme', next); } catch (e) {}
+    var b = document.getElementById('mbThemeToggle'); if (b) b.textContent = next === 'alpha' ? '☾' : '☀';
+  };
+  document.addEventListener('DOMContentLoaded', function () {
+    var hdr = document.querySelector('.header');
+    if (hdr && !document.getElementById('mbThemeToggle')) {
+      var b = document.createElement('button');
+      b.id = 'mbThemeToggle'; b.title = 'Toggle light / dark';
+      b.textContent = document.documentElement.getAttribute('data-theme') === 'alpha' ? '☾' : '☀';
+      b.style.cssText = 'background:transparent;border:1px solid var(--border);color:var(--text-secondary);border-radius:var(--radius-sm);width:34px;height:34px;cursor:pointer;font-size:15px;line-height:1;flex-shrink:0;transition:all .15s ease';
+      b.onmouseenter = function () { b.style.color = 'var(--accent)'; b.style.borderColor = 'var(--accent)'; };
+      b.onmouseleave = function () { b.style.color = 'var(--text-secondary)'; b.style.borderColor = 'var(--border)'; };
+      b.onclick = window.toggleMoonbaseTheme;
+      hdr.appendChild(b);
+    }
+  });
+</script>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<div class="header">
+  <div class="header-side header-left">
+    <button class="hamburger-btn" id="hamburgerBtn" title="Toggle sidebar">&#9776;</button>
+    <h1><span>Meeting</span> Capture &amp; Analysis</h1>
+  </div>
+  <nav class="pillar-nav" id="pillarNav" role="tablist" aria-label="Sections">
+    <button class="pillar-btn active" data-pillar="meetings" role="tab" aria-selected="true" title="Meetings">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+      <span>Meetings</span>
+    </button>
+    <button class="pillar-btn" data-pillar="notes" role="tab" aria-selected="false" title="Notes">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><polyline points="14 3 14 8 19 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>
+      <span>Notes</span>
+    </button>
+    <button class="pillar-btn" data-pillar="tasks" role="tab" aria-selected="false" title="Tasks">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 7 5 9 9 5"/><polyline points="3 17 5 19 9 15"/><line x1="13" y1="7" x2="21" y2="7"/><line x1="13" y1="17" x2="21" y2="17"/></svg>
+      <span>Tasks</span>
+      <span class="pillar-badge" id="tasksOpenBadge" hidden></span>
+    </button>
+  </nav>
+  <div class="header-side header-right">
+    <div id="connection-status" style="font-size:12px;color:var(--text-muted)"></div>
+    <button class="settings-btn" id="settingsBtn" title="LLM Prompt Settings">&#9881;</button>
+  </div>
+</div>
+
+<!-- Capture Banner -->
+<div class="capture-banner" id="captureBanner">
+  <div class="cb-bar">
+    <!-- Record Area -->
+    <div class="record-area" id="recordArea">
+      <button class="record-btn" id="recordBtn" title="Start recording">
+        <div class="record-btn-inner"></div>
+      </button>
+      <div class="record-label" id="recordLabel">Click to record</div>
+      <div class="record-timer" id="recordTimer">00:00:00</div>
+      <div class="recording-indicator" id="recordingIndicator">
+        <span class="rec-dot"></span> <span id="recordingIndicatorText">Recording</span>
+      </div>
+      <button class="pause-btn" id="pauseBtn" title="Pause">&#9646;&#9646;</button>
+      <div class="record-source-toggle" id="sourceToggle">
+        <button class="source-btn" data-source="mic" title="Record from microphone only">Mic Only</button>
+        <button class="source-btn" data-source="screen" title="Record system/tab audio via screen share">System Audio</button>
+        <button class="source-btn active" data-source="both" title="Record mic + system audio combined (recommended for calls)">Mic + System</button>
+      </div>
+      <button class="cb-loopback-gear" id="loopbackGearBtn" title="Audio device settings">&#9881;</button>
+    </div>
+
+    <div class="cb-divider"></div>
+
+    <!-- Compact Drop Zone -->
+    <div class="cb-upload-group">
+      <div class="drop-zone" id="dropZone">
+        <div class="drop-zone-icon">&#128194;</div>
+        <p><strong>Drop audio/video file here</strong></p>
+        <p>or click to browse</p>
+        <p class="formats">.wav .mp3 .m4a .mp4 .mkv .ogg .webm .flac .aac</p>
+        <span class="cb-drop-label">Drop file or click to browse</span>
+        <span class="cb-drop-formats">.wav .mp3 .m4a .mp4 .mkv .ogg .webm .flac .aac</span>
+        <input type="file" id="fileInput" accept=".wav,.mp3,.m4a,.mp4,.mkv,.ogg,.webm,.flac,.aac" hidden>
+      </div>
+    </div>
+  </div>
+
+  <!-- Audio Viz Row (shown during recording) -->
+  <div class="cb-viz-row">
+    <div class="audio-viz" id="audioViz"></div>
+    <div class="loopback-active-indicator" id="loopbackActiveIndicator" style="display:none"></div>
+  </div>
+
+  <!-- Upload Fields (shared by record & file upload) -->
+  <div class="upload-fields" id="uploadFields">
+    <div class="upload-file-info">
+      <span class="file-name" id="fileName"></span>
+      <span class="file-size" id="fileSize"></span>
+      <button class="remove-file" id="removeFile" title="Remove file">&times;</button>
+    </div>
+    <div class="cb-fields-row">
+      <div class="field">
+        <label for="meetingTitle">Meeting Title (optional)</label>
+        <input type="text" id="meetingTitle" placeholder="e.g. Sprint Planning 2026-02-16">
+      </div>
+      <div class="field">
+        <label for="numSpeakers">Speakers (optional)</label>
+        <input type="number" id="numSpeakers" min="1" max="20" placeholder="e.g. 4">
+      </div>
+      <div class="field">
+        <label for="meetingContext">Context (optional)</label>
+        <input type="text" id="meetingContext" placeholder="e.g. AWS infrastructure review">
+      </div>
+      <button class="upload-btn" id="uploadBtn">Upload & Process</button>
+    </div>
+    <div class="upload-progress" id="uploadProgress">
+      <div class="progress-bar"><div class="progress-bar-fill" id="progressFill"></div></div>
+      <div class="progress-text" id="progressText">Uploading...</div>
+    </div>
+  </div>
+
+  <!-- Loopback Popover -->
+  <div class="cb-loopback-popover" id="loopbackPopover">
+    <div class="loopback-settings" id="loopbackSettings" style="margin-top:0;max-width:none">
+      <div class="loopback-row">
+        <label>Mic:</label>
+        <select id="micDeviceSelect"><option value="">Default</option></select>
+      </div>
+      <div class="loopback-row">
+        <label>Loopback:</label>
+        <select id="loopbackDeviceSelect"><option value="">None (use screen share)</option></select>
+        <button class="refresh-devices-btn" id="refreshDevices" title="Refresh device list">&#x21bb;</button>
+      </div>
+      <div class="loopback-hint" id="loopbackHint">
+        Select a virtual audio device (VB-Cable, BlackHole) to capture desktop app audio without the screen share picker.
+      </div>
+      <div class="loopback-help">
+        <button class="loopback-help-toggle" id="loopbackHelpToggle">Setup instructions</button>
+        <div class="loopback-help-content" id="loopbackHelpContent">
+          <p><strong>Windows:</strong> Install <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener">VB-Cable</a> (free) &rarr; Set "CABLE Input" as default playback device in Sound settings &rarr; Select "CABLE Output" as loopback device above.</p>
+          <p><strong>macOS:</strong> Install <a href="https://existential.audio/blackhole/" target="_blank" rel="noopener">BlackHole</a> (free) &rarr; Create a Multi-Output Device in Audio MIDI Setup &rarr; Select "BlackHole" as loopback device above.</p>
+          <p>Your desktop app audio (Teams, Zoom, etc.) will be captured directly without needing screen share.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+<div class="app-layout">
+<aside class="sidebar" id="sidebar">
+
+  <!-- Search Section -->
+  <div class="sidebar-section">
+    <div class="search-bar">
+      <input type="text" id="searchInput" placeholder="Search meetings..." style="font-size:13px">
+      <button id="searchBtn" style="padding:8px 14px;font-size:13px">Search</button>
+    </div>
+    <div class="search-filters" id="searchFilters">
+      <div class="filter-group">
+        <label>Speaker:</label>
+        <input type="text" id="searchSpeaker" placeholder="e.g. Alex" style="width:80px">
+      </div>
+      <div class="filter-group">
+        <label>From:</label>
+        <input type="date" id="searchDateFrom" style="width:130px">
+      </div>
+      <div class="filter-group">
+        <label>To:</label>
+        <input type="date" id="searchDateTo" style="width:130px">
+      </div>
+      <div class="filter-group">
+        <label>Type:</label>
+        <select id="searchChunkType" style="width:100px">
+          <option value="">All</option>
+          <option value="transcript">Transcript</option>
+          <option value="action_item">Actions</option>
+          <option value="decision">Decisions</option>
+          <option value="summary">Summary</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <input type="checkbox" id="searchShowContext">
+        <label for="searchShowContext">Context</label>
+      </div>
+    </div>
+    <div class="search-results" id="searchResults"></div>
+  </div>
+
+  <!-- View Switcher -->
+  <div class="sidebar-section" style="padding-bottom:8px">
+    <div class="view-switcher">
+      <button class="view-btn active" data-view="week">Weekly</button>
+      <button class="view-btn" data-view="speaker">Speakers</button>
+      <button class="view-btn" data-view="keyword">Topics</button>
+      <button class="view-btn" data-view="category">Tags</button>
+      <button class="view-btn" data-view="linked">Linked</button>
+    </div>
+    <!-- Filters row -->
+    <div class="meeting-list-filters" style="margin-top:8px;margin-bottom:0">
+      <select id="meetingStatusFilter" style="flex:1">
+        <option value="">All statuses</option>
+        <option value="queued">Queued</option>
+        <option value="preprocessing">Preprocessing</option>
+        <option value="transcribing">Transcribing</option>
+        <option value="cleaning_transcript">Cleaning</option>
+        <option value="identifying_speakers">Identifying Speakers</option>
+        <option value="summarizing">Summarizing</option>
+        <option value="tagging">Tagging</option>
+        <option value="storing">Storing</option>
+        <option value="complete">Complete</option>
+        <option value="error">Error</option>
+      </select>
+      <input type="text" id="meetingTitleFilter" placeholder="Filter title..." style="flex:1">
+    </div>
+  </div>
+
+  <!-- Grouped Meeting List -->
+  <div class="sidebar-meeting-list" id="sidebarMeetingList">
+    <div class="empty-state" style="padding:24px">No meetings yet. Record or upload a file above to get started.</div>
+  </div>
+
+</aside>
+
+<!-- Main Content -->
+<main class="main-content" id="mainContent">
+  <div class="main-empty-state" id="mainEmptyState">
+    Select a meeting from the sidebar to view details
+  </div>
+
+  <!-- Inline Detail Panel (hidden by default) -->
+  <div id="inlineDetail" style="display:none">
+    <div class="main-content-inner">
+      <div class="detail-header">
+        <div>
+          <h2 id="detailTitle">Meeting Title</h2>
+          <div class="detail-meta">
+            <span id="detailDate"></span>
+            <span id="detailDuration"></span>
+            <span id="detailStatus"></span>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="detail-delete-btn" id="detailDeleteBtn" title="Delete this meeting">Delete Meeting</button>
+        </div>
+      </div>
+      <div class="action-buttons-bar" id="actionButtonsBar"></div>
+      <div class="audio-player-bar" id="audioPlayerBar">
+        <button class="audio-play-btn" id="audioPlayBtn" title="Play / Pause">&#9654;</button>
+        <button class="audio-skip-btn" id="audioSkipBack">&#8722;10s</button>
+        <span class="audio-time" id="audioCurrentTime">0:00:00</span>
+        <input type="range" class="audio-scrubber" id="audioScrubber" min="0" max="100" step="0.1" value="0">
+        <span class="audio-time" id="audioTotalTime">0:00:00</span>
+        <button class="audio-skip-btn" id="audioSkipFwd">+10s</button>
+        <select class="audio-speed-select" id="audioSpeedSelect">
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+        <audio id="meetingAudio" preload="metadata" style="display:none"></audio>
+      </div>
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="transcript">Transcript</button>
+        <button class="tab-btn" data-tab="summary">Summary</button>
+        <button class="tab-btn" data-tab="notes">Notes</button>
+        <button class="tab-btn" data-tab="chat">Chat</button>
+        <button class="tab-btn" data-tab="tags">Tags</button>
+        <button class="tab-btn" data-tab="related">Related</button>
+      </div>
+      <div class="tab-content active" id="tab-transcript">
+        <div id="transcriptContent">Loading...</div>
+      </div>
+      <div class="tab-content" id="tab-summary">
+        <div id="summaryContent">Loading...</div>
+      </div>
+      <div class="tab-content" id="tab-notes">
+        <div id="notesContent">Loading...</div>
+      </div>
+      <div class="tab-content" id="tab-chat">
+        <div id="chatContent"></div>
+      </div>
+      <div class="tab-content" id="tab-tags">
+        <div id="tagsContent">Loading...</div>
+      </div>
+      <div class="tab-content" id="tab-related">
+        <div id="relatedContent">Loading...</div>
+      </div>
+      <div class="downloads-bar" id="downloadsBar" style="display:none">
+        <a class="download-link" id="dlTranscript" href="#" download>transcript.json</a>
+        <a class="download-link" id="dlRawTranscript" href="#" download>raw_transcript.json</a>
+        <a class="download-link" id="dlSrt" href="#" download>transcript.srt</a>
+        <a class="download-link" id="dlTranscriptMd" href="#" download>transcript.md</a>
+        <a class="download-link" id="dlSummary" href="#" download>summary.md</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Notes pillar (Phase 4) ===== -->
+  <div id="notesView" class="notes-view" style="display:none">
+    <aside class="notes-tree" id="notesTree">
+      <div class="notes-tree-head">
+        <div class="notes-tree-actions">
+          <button class="nt-new-btn" id="ntNewNote" title="New note">+ Note</button>
+          <button class="nt-icon-btn" id="ntNewJournal" title="Today's journal entry">&#9789;</button>
+          <button class="nt-icon-btn" id="ntRescan" title="Re-scan notes from disk (e.g. after Obsidian edits)">&#8635;</button>
+        </div>
+        <div class="notes-search-wrap">
+          <input type="search" id="ntSearch" class="notes-search" placeholder="Search notes…" autocomplete="off">
+          <button class="nt-semantic-btn" id="ntSemanticBtn" title="Semantic (meaning) search">&#10024;</button>
+        </div>
+      </div>
+      <div class="notes-tree-body" id="notesTreeBody">
+        <div class="notes-tree-empty">Loading…</div>
+      </div>
+    </aside>
+    <section class="notes-editor-pane" id="notesEditorPane">
+      <div class="notes-welcome" id="notesWelcome">
+        <div class="notes-welcome-inner">
+          <div class="notes-welcome-mark">&#9789;</div>
+          <h2>Notes</h2>
+          <p>A local-first markdown workspace. Files live on disk and stay Obsidian-compatible.</p>
+          <div class="notes-welcome-actions">
+            <button class="nt-new-btn lg" id="ntWelcomeNew">+ New note</button>
+            <button class="nt-icon-btn lg" id="ntWelcomeJournal" title="Today's journal">&#9789; Today</button>
+          </div>
+          <p class="notes-welcome-hint"><code>[[</code> links notes · <code>- [ ]</code> makes a task · <kbd>Ctrl</kbd>/<kbd>Cmd</kbd>+click follows a link</p>
+        </div>
+      </div>
+      <div class="notes-doc" id="notesDoc" style="display:none">
+        <div class="notes-doc-head">
+          <input type="text" id="noteTitleInput" class="note-title-input" placeholder="Untitled">
+          <div class="notes-doc-meta" id="noteMetaBar"></div>
+          <div class="notes-doc-tools">
+            <button class="nt-icon-btn" id="noteToolbarToggle" title="Show/hide formatting bar">Aa</button>
+            <span class="note-save-state" id="noteSaveState"></span>
+            <button class="nt-icon-btn" id="notePreviewToggle" title="Toggle rendered preview">&#128065;</button>
+            <button class="nt-icon-btn" id="noteAttachBtn" title="Attach a file">📎</button>
+            <input type="file" id="noteAttachInput" hidden>
+            <button class="nt-icon-btn" id="noteDrawBtn" title="Insert a drawing">✏️</button>
+            <button class="nt-icon-btn" id="noteLinkMeetingBtn" title="Link a meeting">&#128279;</button>
+            <button class="nt-icon-btn" id="noteMoveBtn" title="Rename / move">&#9998;</button>
+            <button class="nt-icon-btn" id="noteRetagBtn" title="Re-tag this note now">✨</button>
+            <button class="nt-icon-btn danger" id="noteDeleteBtn" title="Move to trash">&#128465;</button>
+          </div>
+        </div>
+        <div class="note-toolbar" id="noteToolbar"></div>
+        <div class="notes-doc-body">
+          <div class="note-editor-host" id="noteEditorHost"></div>
+          <div class="note-preview" id="notePreview" style="display:none"></div>
+        </div>
+        <div class="note-footer" id="noteFooter">
+          <div class="note-tags-row" id="noteTagsRow"></div>
+          <div class="note-backlinks" id="noteBacklinks"></div>
+          <div class="note-backlinks" id="noteRelated"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===== Tasks pillar (Phase 4) ===== -->
+  <div id="tasksView" class="tasks-view" style="display:none">
+    <div class="tasks-inner">
+      <div class="tasks-head">
+        <div class="tasks-title-row">
+          <h2>Tasks</h2>
+          <div class="tasks-counts" id="tasksCounts"></div>
+        </div>
+        <div class="tasks-filters" id="tasksFilters">
+          <div class="task-filter-group" data-filter="status" role="group" aria-label="Status">
+            <button class="task-filter-btn active" data-value="open">Open</button>
+            <button class="task-filter-btn" data-value="done">Done</button>
+            <button class="task-filter-btn" data-value="">All</button>
+          </div>
+          <div class="task-filter-group" data-filter="due" role="group" aria-label="Due">
+            <button class="task-filter-btn active" data-value="">Any time</button>
+            <button class="task-filter-btn" data-value="overdue">Overdue</button>
+            <button class="task-filter-btn" data-value="today">Today</button>
+            <button class="task-filter-btn" data-value="week">This week</button>
+          </div>
+          <div class="task-filter-group" data-filter="source" role="group" aria-label="Source">
+            <button class="task-filter-btn active" data-value="">All sources</button>
+            <button class="task-filter-btn" data-value="note">Notes</button>
+            <button class="task-filter-btn" data-value="meeting">Meetings</button>
+          </div>
+          <select id="taskOwnerFilter" class="task-owner-select" aria-label="Owner"><option value="">Everyone</option></select>
+          <div class="tasks-spacer"></div>
+          <label class="task-groupby">Group:
+            <select id="taskGroupBy">
+              <option value="due">Due</option>
+              <option value="source">Source</option>
+              <option value="owner">Owner</option>
+              <option value="priority">Priority</option>
+              <option value="none">None</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div class="tasks-list" id="tasksList"><div class="tasks-empty">Loading…</div></div>
+    </div>
+  </div>
+</main>
+</div><!-- end app-layout -->
+
+<!-- Detail Overlay (mobile only) -->
+<div class="detail-overlay" id="detailOverlay">
+  <div class="detail-panel">
+    <div class="detail-header">
+      <div>
+        <h2 id="detailTitleMobile">Meeting Title</h2>
+        <div class="detail-meta">
+          <span id="detailDateMobile"></span>
+          <span id="detailDurationMobile"></span>
+          <span id="detailStatusMobile"></span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="detail-delete-btn" id="detailDeleteBtnMobile" title="Delete this meeting">Delete Meeting</button>
+        <button class="close-btn" id="closeDetail">&times;</button>
+      </div>
+    </div>
+    <div class="action-buttons-bar" id="actionButtonsBarMobile"></div>
+    <div class="audio-player-bar" id="audioPlayerBarMobile">
+      <button class="audio-play-btn" id="audioPlayBtnMobile" title="Play / Pause">&#9654;</button>
+      <button class="audio-skip-btn" id="audioSkipBackMobile">&#8722;10s</button>
+      <span class="audio-time" id="audioCurrentTimeMobile">0:00:00</span>
+      <input type="range" class="audio-scrubber" id="audioScrubberMobile" min="0" max="100" step="0.1" value="0">
+      <span class="audio-time" id="audioTotalTimeMobile">0:00:00</span>
+      <button class="audio-skip-btn" id="audioSkipFwdMobile">+10s</button>
+      <select class="audio-speed-select" id="audioSpeedSelectMobile">
+        <option value="0.75">0.75×</option>
+        <option value="1" selected>1×</option>
+        <option value="1.25">1.25×</option>
+        <option value="1.5">1.5×</option>
+        <option value="2">2×</option>
+      </select>
+      <audio id="meetingAudioMobile" preload="metadata" style="display:none"></audio>
+    </div>
+    <div class="tabs" id="tabsMobile">
+      <button class="tab-btn active" data-tab="transcript">Transcript</button>
+      <button class="tab-btn" data-tab="summary">Summary</button>
+      <button class="tab-btn" data-tab="notes">Notes</button>
+      <button class="tab-btn" data-tab="chat">Chat</button>
+      <button class="tab-btn" data-tab="tags">Tags</button>
+      <button class="tab-btn" data-tab="related">Related</button>
+    </div>
+    <div class="tab-content active" id="tab-transcript-mobile">
+      <div id="transcriptContentMobile">Loading...</div>
+    </div>
+    <div class="tab-content" id="tab-summary-mobile">
+      <div id="summaryContentMobile">Loading...</div>
+    </div>
+    <div class="tab-content" id="tab-notes-mobile">
+      <div id="notesContentMobile">Loading...</div>
+    </div>
+    <div class="tab-content" id="tab-chat-mobile">
+      <div id="chatContentMobile"></div>
+    </div>
+    <div class="tab-content" id="tab-tags-mobile">
+      <div id="tagsContentMobile">Loading...</div>
+    </div>
+    <div class="tab-content" id="tab-related-mobile">
+      <div id="relatedContentMobile">Loading...</div>
+    </div>
+    <div class="downloads-bar" id="downloadsBarMobile" style="display:none">
+      <a class="download-link" id="dlTranscriptMobile" href="#" download>transcript.json</a>
+      <a class="download-link" id="dlRawTranscriptMobile" href="#" download>raw_transcript.json</a>
+      <a class="download-link" id="dlSrtMobile" href="#" download>transcript.srt</a>
+      <a class="download-link" id="dlTranscriptMdMobile" href="#" download>transcript.md</a>
+      <a class="download-link" id="dlSummaryMobile" href="#" download>summary.md</a>
+    </div>
+  </div>
+</div>
+
+<!-- Link Picker Modal -->
+<div class="link-picker-overlay" id="linkPickerOverlay">
+  <div class="link-picker-panel">
+    <div class="link-picker-header">
+      <h3>Link a Meeting</h3>
+      <button class="close-btn" onclick="closeLinkPicker()">&times;</button>
+    </div>
+    <div class="link-picker-search">
+      <input type="text" id="linkPickerSearch" placeholder="Search meetings...">
+    </div>
+    <div class="link-picker-list" id="linkPickerList"></div>
+  </div>
+</div>
+
+<!-- Settings Overlay -->
+<div class="settings-overlay" id="settingsOverlay">
+  <div class="settings-panel">
+    <div class="settings-header">
+      <h2>LLM Prompt Settings</h2>
+      <button class="close-btn" id="closeSettings">&times;</button>
+    </div>
+    <div class="settings-body" id="settingsBody">
+
+      <!-- Model & Temperature -->
+      <div class="settings-section">
+        <div class="settings-section-title">Model & Temperature</div>
+        <div class="settings-model-row">
+          <div class="field">
+            <label for="settingsModel">Ollama Model</label>
+            <input type="text" id="settingsModel" placeholder="e.g. llama3.1:8b">
+          </div>
+          <div class="field">
+            <label>Temperature: <span class="settings-temp-value" id="tempDisplay">0.3</span></label>
+            <input type="range" class="settings-temp-slider" id="settingsTemp" min="0" max="1" step="0.05" value="0.3">
+          </div>
+        </div>
+      </div>
+
+      <!-- Cleanup System Prompt -->
+      <div class="settings-section">
+        <div class="settings-section-title">Transcript Cleanup Prompt</div>
+        <div class="settings-section-desc">
+          System instructions for cleaning up speech-to-text segments. The segment data, context, and numbering are appended automatically by the system.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{meeting_context}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptCleanup" rows="8"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="cleanup_system">Reset to Default</button>
+      </div>
+
+      <!-- Speaker Identification Prompt -->
+      <div class="settings-section">
+        <div class="settings-section-title">Speaker Identification Prompt</div>
+        <div class="settings-section-desc">
+          Prompt for identifying real speaker names from the transcript. The JSON example structure is appended automatically.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{speaker_list}</span>
+          <span class="placeholder-tag">{transcript}</span>
+          <span class="placeholder-tag">{json_example}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptSpeakerId" rows="10"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="speaker_id">Reset to Default</button>
+      </div>
+
+      <!-- Analysis Pass A: Summary & Topics -->
+      <div class="settings-section">
+        <div class="settings-section-title">Pass A: Summary & Topics</div>
+        <div class="settings-section-desc">
+          Extracts the meeting title, a concise summary, and the main topics discussed.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{transcript}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptPassA" rows="8"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="analysis_pass_a">Reset to Default</button>
+      </div>
+
+      <!-- Analysis Pass B: Action Items -->
+      <div class="settings-section">
+        <div class="settings-section-title">Pass B: Action Items</div>
+        <div class="settings-section-desc">
+          Extracts tasks, assignments, deadlines, and priorities.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{transcript}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptPassB" rows="8"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="analysis_pass_b">Reset to Default</button>
+      </div>
+
+      <!-- Analysis Pass C: Decisions & Open Questions -->
+      <div class="settings-section">
+        <div class="settings-section-title">Pass C: Decisions & Open Questions</div>
+        <div class="settings-section-desc">
+          Extracts decisions made and unanswered questions remaining.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{transcript}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptPassC" rows="8"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="analysis_pass_c">Reset to Default</button>
+      </div>
+
+      <!-- Analysis Pass D: Concerns & Risks -->
+      <div class="settings-section">
+        <div class="settings-section-title">Pass D: Concerns & Risks</div>
+        <div class="settings-section-desc">
+          Extracts concerns, objections, risks, and hesitations raised by participants.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{transcript}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptPassD" rows="8"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="analysis_pass_d">Reset to Default</button>
+      </div>
+
+      <!-- Analysis Pass E: Numbers & Dates -->
+      <div class="settings-section">
+        <div class="settings-section-title">Pass E: Numbers & Dates</div>
+        <div class="settings-section-desc">
+          Extracts specific figures, dates, costs, metrics, and quantitative data mentioned.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{transcript}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptPassE" rows="8"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="analysis_pass_e">Reset to Default</button>
+      </div>
+
+      <!-- Analysis Pass F: Sentiment -->
+      <div class="settings-section">
+        <div class="settings-section-title">Pass F: Sentiment</div>
+        <div class="settings-section-desc">
+          Assesses overall emotional tone and notable moments.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{transcript}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptPassF" rows="6"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="analysis_pass_f">Reset to Default</button>
+      </div>
+
+      <!-- Analysis Pass G: Auto-Tagging -->
+      <div class="settings-section">
+        <div class="settings-section-title">Pass G: Auto-Tagging</div>
+        <div class="settings-section-desc">
+          Extracts category, keywords, and named entities (people, companies, projects, technologies, dates) for meeting tagging and discovery.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{transcript}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptPassG" rows="8"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="analysis_pass_g">Reset to Default</button>
+      </div>
+
+      <!-- Chunk Summary Prompt -->
+      <div class="settings-section">
+        <div class="settings-section-title">Chunk Summary Prompt (Long Meetings)</div>
+        <div class="settings-section-desc">
+          Used for meetings over 90 minutes. Each 15-minute chunk is summarized individually, then all summaries are run through the 6 analysis passes above.
+        </div>
+        <div class="settings-placeholders">
+          <span class="placeholder-tag">{chunk_index}</span>
+          <span class="placeholder-tag">{chunk_total}</span>
+          <span class="placeholder-tag">{chunk}</span>
+        </div>
+        <textarea class="settings-textarea" id="promptChunkSummary" rows="6"></textarea>
+        <button class="settings-reset-prompt-btn" data-prompt="chunk_summary">Reset to Default</button>
+      </div>
+
+      <!-- Chat Settings -->
+      <div class="settings-section">
+        <div class="settings-section-title">AI Chat</div>
+        <div class="settings-section-desc">
+          Configure the AI chat endpoint used for querying meeting content.
+        </div>
+        <div class="settings-model-row">
+          <div class="field">
+            <label for="chatEndpoint">Endpoint</label>
+            <select id="chatEndpoint" style="padding:6px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-input);color:var(--text-primary);">
+              <option value="ollama">Ollama (Default)</option>
+              <option value="openwebui">OpenWebUI Proxy</option>
+              <option value="custom">Custom OpenAI-compatible</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="chatModel">Model Override</label>
+            <input type="text" id="chatModel" placeholder="(empty = use main model)">
+          </div>
+        </div>
+        <div id="chatCustomFields" class="chat-settings-conditional">
+          <div class="settings-model-row" style="margin-top:8px">
+            <div class="field">
+              <label for="chatCustomUrl">Custom URL</label>
+              <input type="text" id="chatCustomUrl" placeholder="https://api.example.com/v1/chat/completions">
+            </div>
+            <div class="field">
+              <label for="chatCustomKey">API Key</label>
+              <input type="password" id="chatCustomKey" placeholder="sk-...">
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <label>Chat Temperature: <span id="chatTempDisplay">0.50</span></label>
+          <input type="range" class="settings-temp-slider" id="chatTemp" min="0" max="1" step="0.05" value="0.5">
+        </div>
+        <div style="margin-top:8px">
+          <label for="chatMaxChunks">Max Context Chunks</label>
+          <input type="number" id="chatMaxChunks" min="1" max="50" value="15" style="width:80px;padding:4px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-input);color:var(--text-primary);">
+        </div>
+        <div style="margin-top:8px">
+          <label for="chatSystemPrompt">System Prompt</label>
+          <textarea class="settings-textarea" id="chatSystemPrompt" rows="4"></textarea>
+          <button class="settings-reset-prompt-btn" id="chatResetSystemPrompt">Reset to Default</button>
+        </div>
+      </div>
+
+    </div>
+    <div class="settings-footer">
+      <button class="settings-reset-all-btn" id="settingsResetAll">Reset All to Defaults</button>
+      <span class="settings-unsaved" id="settingsUnsaved">Unsaved changes</span>
+      <button class="settings-cancel-btn" id="settingsCancel">Cancel</button>
+      <button class="settings-save-btn" id="settingsSave">Save Settings</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js');
+}
+</script>
+
+<!-- Floating Chat Widget -->
+<button id="floatingChatFab" title="Chat with meetings">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+  </svg>
+</button>
+
+<div id="floatingChatPanel">
+  <div class="fc-header">
+    <span class="fc-header-title">Meeting Chat</span>
+    <button onclick="clearFloatingChat()" title="Clear chat">&#x1f5d1;</button>
+    <button onclick="toggleFloatingChat()" title="Close">&times;</button>
+  </div>
+  <div class="fc-scope-bar">
+    <span class="fc-scope-label">Scope:</span>
+    <span class="fc-scope-value" id="fcScopeValue">Auto</span>
+    <button class="fc-scope-toggle" id="fcScopeToggle">Change</button>
+  </div>
+  <div class="fc-meeting-selector" id="fcMeetingSelector">
+    <div class="fc-preset-bar">
+      <button class="fc-preset-btn active" data-mode="auto" onclick="setFloatingChatMode('auto')">Auto (current)</button>
+      <button class="fc-preset-btn" data-mode="all" onclick="setFloatingChatMode('all')">All Meetings</button>
+      <button class="fc-preset-btn" data-mode="custom" onclick="setFloatingChatMode('custom')">Pick meetings...</button>
+    </div>
+    <div class="fc-custom-picker" id="fcCustomPicker">
+      <div class="fc-picker-search">
+        <input type="text" id="fcPickerSearch" placeholder="Search meetings..." oninput="renderFloatingMeetingList(this.value)">
+      </div>
+      <div class="fc-picker-list" id="fcPickerList"></div>
+      <div class="fc-picker-summary" id="fcPickerSummary">0 meetings selected</div>
+    </div>
+  </div>
+  <div class="fc-messages" id="fcMessages">
+    <div class="fc-empty">Ask questions about your meetings</div>
+  </div>
+  <div class="fc-input-area">
+    <textarea id="fcInput" placeholder="Ask about meetings..." rows="1"
+      onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendFloatingChatMessage();}"></textarea>
+    <button class="chat-send-btn" id="fcSendBtn" onclick="sendFloatingChatMessage()">Send</button>
+  </div>
+</div>
+
+<script src="/static/floating-chat.js"></script>
+
+</body>
+</html>

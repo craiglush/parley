@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Node (CodeMirror frontend build)
+node_modules/
+package-lock.json
+
+# Local env / secrets — never commit these
+.env
+.env.local
+*.local
+
+# Runtime data
+data/
+
+# Editor / OS / misc
+.worktrees/
+*.log
+.DS_Store

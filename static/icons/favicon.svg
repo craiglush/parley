@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg_meetings" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#141413"/>
+      <stop offset="100%" stop-color="#1e1e1c"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="108" ry="108" fill="url(#bg_meetings)"/>
+  <rect x="2" y="2" width="508" height="508" rx="106" ry="106" fill="none" stroke="#2a2a27" stroke-width="3"/>
+  <g transform="translate(256,256)">
+    <!-- Microphone body -->
+    <rect x="-30" y="-100" width="60" height="100" rx="30"
+          fill="none" stroke="#d4a039" stroke-width="12"/>
+    <rect x="-30" y="-100" width="60" height="100" rx="30"
+          fill="#d4a039" opacity="0.15"/>
+    <!-- Mic cage -->
+    <path d="M-60,0 C-60,50 -30,85 0,85 C30,85 60,50 60,0"
+          fill="none" stroke="#d4a039" stroke-width="10" stroke-linecap="round"/>
+    <!-- Stand -->
+    <line x1="0" y1="85" x2="0" y2="115" stroke="#d4a039" stroke-width="10" stroke-linecap="round"/>
+    <line x1="-35" y1="115" x2="35" y2="115" stroke="#d4a039" stroke-width="10" stroke-linecap="round"/>
+    <!-- Recording indicator -->
+    <circle cx="55" cy="-85" r="12" fill="#c45c3c" opacity="0.7"/>
+    <circle cx="55" cy="-85" r="6" fill="#c45c3c"/>
+  </g>
+</svg>

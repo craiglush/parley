@@ -1,0 +1,25 @@
+{
+  "name": "meeting-service-frontend-build",
+  "private": true,
+  "version": "1.0.0",
+  "description": "One-time esbuild bundling of CodeMirror 6 + markdown editor glue into static/vendor (offline, no CDN).",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.18.4",
+    "@codemirror/commands": "^6.7.1",
+    "@codemirror/lang-markdown": "^6.3.1",
+    "@codemirror/language": "^6.10.8",
+    "@codemirror/state": "^6.5.0",
+    "@codemirror/view": "^6.36.1",
+    "@lezer/highlight": "^1.2.1",
+    "dompurify": "^3.4.11",
+    "marked": "^15.0.4",
+    "meeting-service-frontend-build": "file:"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  }
+}

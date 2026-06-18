@@ -1,0 +1,10 @@
+# Build-context trimming. The Dockerfile only COPYs *.py and static/, but the whole
+# directory is sent to the daemon as context — keep heavy/host-only dirs out.
+frontend-build/
+.worktrees/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+docs/
+.gitignore

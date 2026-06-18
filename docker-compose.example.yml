@@ -1,0 +1,42 @@
+# Example compose for running Meeting Service standalone.
+# Copy to `docker-compose.yml` and adjust. No secrets live here — values come from
+# your `.env` (see .env.example). WhisperX (STT) and Ollama are expected to be
+# provided separately; point the URLs at your own instances.
+
+services:
+  meeting-service:
+    build: .
+    container_name: meeting-service
+    ports:
+      - "8191:8000"
+    volumes:
+      - ./data/meetings:/data/meetings
+      - ./data/notes:/data/notes
+    environment:
+      - WHISPERX_URL=${WHISPERX_URL:-http://whisperx:8000}
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:9b}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+      - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
+      - OPENWEBUI_URL=${OPENWEBUI_URL:-}
+      - OPENWEBUI_API_KEY=${OPENWEBUI_API_KEY:-}
+      - NOTES_DIR=/data/notes
+      - MEETINGS_DIR=/data/meetings
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: meeting-qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    restart: unless-stopped
+
+  # WhisperX / faster-whisper (STT) and Ollama (LLM + embeddings) are NOT included
+  # here — run them yourself and set WHISPERX_URL / OLLAMA_URL accordingly. Ollama
+  # typically runs natively on the host (reached via host.docker.internal).
