@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v7-favicon';
+const CACHE_NAME = 'meetings-v8-task-crud';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.

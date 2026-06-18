@@ -64,6 +64,51 @@ def test_tasks_rollup_and_toggle(tmp_path, monkeypatch):
     assert r2.status_code == 409
 
 
+def test_task_full_crud(tmp_path, monkeypatch):
+    client, app = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(app, "meetings", {})
+
+    # CREATE with no note_id -> auto-creates the "Tasks" inbox note
+    r = client.post("/api/tasks", json={"text": "buy milk", "owner": "alex",
+                                        "due": "2026-07-01", "priority": "high"})
+    assert r.status_code == 200
+    inbox_id = r.json()["note_id"]
+
+    t = next(t for t in client.get("/api/tasks").json()["tasks"] if t["text"] == "buy milk")
+    assert (t["owner"], t["due"], t["priority"]) == ("alex", "2026-07-01", "high")
+    assert t["source"] == "note" and t["source_id"] == inbox_id
+    assert any(n["title"] == "Tasks" for n in client.get("/api/notes").json()["notes"])
+
+    # CREATE again reuses the same inbox (no duplicate note)
+    client.post("/api/tasks", json={"text": "second"})
+    assert sum(1 for n in client.get("/api/notes").json()["notes"] if n["title"] == "Tasks") == 1
+
+    # empty text -> 400
+    assert client.post("/api/tasks", json={"text": "   "}).status_code == 400
+
+    # UPDATE text + metadata
+    r = client.patch("/api/tasks", json={"note_id": inbox_id, "line": t["line"],
+                                         "expected_text": "buy milk", "text": "buy oat milk",
+                                         "owner": "sam", "due": "", "priority": "low"})
+    assert r.status_code == 200
+    t2 = next(t for t in client.get("/api/tasks").json()["tasks"] if t["text"] == "buy oat milk")
+    assert t2["owner"] == "sam" and t2["priority"] == "low" and not t2["due"]
+
+    # UPDATE with stale expected_text -> 409
+    assert client.patch("/api/tasks", json={"note_id": inbox_id, "line": t2["line"],
+                                            "expected_text": "WRONG", "text": "x"}).status_code == 409
+
+    # DELETE
+    r = client.request("DELETE", "/api/tasks", json={"note_id": inbox_id, "line": t2["line"],
+                                                     "expected_text": "buy oat milk"})
+    assert r.status_code == 200
+    assert not any(t["text"] == "buy oat milk" for t in client.get("/api/tasks").json()["tasks"])
+
+    # DELETE with stale expected_text -> 409
+    assert client.request("DELETE", "/api/tasks", json={"note_id": inbox_id, "line": 0,
+                                                        "expected_text": "NOPE"}).status_code == 409
+
+
 def test_rename_and_push_action_items(tmp_path, monkeypatch):
     client, app = _client(tmp_path, monkeypatch)
 

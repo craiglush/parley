@@ -3776,6 +3776,30 @@ class TaskToggle(BaseModel):
     expected_text: Optional[str] = None
 
 
+class TaskCreate(BaseModel):
+    text: str
+    note_id: Optional[str] = None  # None -> the "Tasks" inbox note (created if absent)
+    owner: Optional[str] = None
+    due: Optional[str] = None
+    priority: Optional[str] = None
+
+
+class TaskUpdate(BaseModel):
+    note_id: str
+    line: int
+    text: str
+    expected_text: Optional[str] = None
+    owner: Optional[str] = None
+    due: Optional[str] = None
+    priority: Optional[str] = None
+
+
+class TaskDelete(BaseModel):
+    note_id: str
+    line: int
+    expected_text: Optional[str] = None
+
+
 class NoteRename(BaseModel):
     title: Optional[str] = None
     folder: Optional[str] = None
@@ -4019,6 +4043,65 @@ async def api_toggle_task(payload: TaskToggle):
     if rec is None:
         raise HTTPException(status_code=404, detail="Note not found")
     new_body, ok = tasks_store.toggle_line(rec["body"], payload.line, payload.done,
+                                           expected_text=payload.expected_text)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
+    notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+    return {"ok": True}
+
+
+TASKS_INBOX_TITLE = "Tasks"
+
+
+def _find_or_create_tasks_inbox() -> str:
+    """Return the id of the root 'Tasks' inbox note, creating it if it doesn't exist."""
+    for rec in notes_store.list_notes(notes_store.NOTES_DIR, folder=""):
+        if (rec.get("title") or "").strip().lower() == TASKS_INBOX_TITLE.lower():
+            return rec["id"]
+    rec = notes_store.create_note(notes_store.NOTES_DIR, title=TASKS_INBOX_TITLE,
+                                  folder="", type="note", body="")
+    _index_note_safe(rec)
+    return rec["id"]
+
+
+@app.post("/api/tasks")
+async def api_create_task(payload: TaskCreate):
+    if not (payload.text or "").strip():
+        raise HTTPException(status_code=400, detail="Task text is required")
+    note_id = payload.note_id or _find_or_create_tasks_inbox()
+    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    line = tasks_store.format_task_line(payload.text, owner=payload.owner,
+                                        due=payload.due, priority=payload.priority)
+    rec = notes_store.append_task_line(notes_store.NOTES_DIR, note_id, line)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    _index_note_safe(rec)
+    return {"ok": True, "note_id": note_id}
+
+
+@app.patch("/api/tasks")
+async def api_update_task(payload: TaskUpdate):
+    if not (payload.text or "").strip():
+        raise HTTPException(status_code=400, detail="Task text is required")
+    rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    new_body, ok = tasks_store.update_line(rec["body"], payload.line, payload.expected_text,
+                                           payload.text, owner=payload.owner,
+                                           due=payload.due, priority=payload.priority)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
+    notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+    return {"ok": True}
+
+
+@app.delete("/api/tasks")
+async def api_delete_task(payload: TaskDelete):
+    rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    new_body, ok = tasks_store.delete_line(rec["body"], payload.line,
                                            expected_text=payload.expected_text)
     if not ok:
         raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")

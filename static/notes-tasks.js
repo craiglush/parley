@@ -196,7 +196,10 @@
     const owner = t.owner ? '<span class="task-chip owner">@' + esc(t.owner) + '</span>' : '';
     const srcIcon = isNote ? '📝' : '🎙';
     const src = '<span class="task-chip source" data-open-source="' + idx + '" title="Open ' + esc(t.source) + '">' + srcIcon + ' ' + esc(t.source_title || t.source) + '</span>';
-    const actions = isNote ? '' : '<div class="task-actions"><button class="task-push-btn" data-push="' + idx + '">→ Note</button></div>';
+    const actions = isNote
+      ? '<div class="task-actions"><button class="task-mini-btn" data-edit="' + idx + '" title="Edit task">✎</button>'
+        + '<button class="task-mini-btn danger" data-del="' + idx + '" title="Delete task">🗑</button></div>'
+      : '<div class="task-actions"><button class="task-push-btn" data-push="' + idx + '">→ Note</button></div>';
     return '<div class="task-row' + (t.done ? ' done' : '') + '" data-idx="' + idx + '">'
       + '<input type="checkbox" class="task-check"' + (t.done ? ' checked' : '') + (isNote ? '' : ' disabled title="Meeting tasks are read-only — push to a note to track"') + ' data-toggle="' + idx + '">'
       + '<div class="task-main"><div class="task-text">' + esc(t.text) + '</div>'
@@ -292,6 +295,82 @@
     else { setActivePillar('meetings'); if (typeof window.openMeeting === 'function') { try { window.openMeeting(t.source_id); } catch (e) {} } }
   }
 
+  // ---- task create / edit / delete ----------------------------------------
+  function taskFormModal(opts) {
+    const t = opts.task || {};
+    const prios = [['', 'None'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']];
+    const m = modal(
+      '<h3>' + esc(opts.heading) + '</h3>'
+      + '<label>Task<input type="text" id="tfText" placeholder="What needs doing?" value="' + esc(t.text || '') + '"></label>'
+      + '<label>Owner<input type="text" id="tfOwner" placeholder="name (optional)" value="' + esc(t.owner || '') + '"></label>'
+      + '<label>Due<input type="date" id="tfDue" value="' + esc(t.due || '') + '"></label>'
+      + '<label>Priority<select id="tfPrio">'
+      + prios.map((p) => '<option value="' + p[0] + '"' + (p[0] === (t.priority || '') ? ' selected' : '') + '>' + p[1] + '</option>').join('')
+      + '</select></label>'
+      + '<div class="nt-modal-actions"><button class="nt-modal-btn" data-cancel>Cancel</button>'
+      + '<button class="nt-modal-btn primary" data-save>' + esc(opts.saveLabel || 'Save') + '</button></div>'
+    );
+    m.q('[data-cancel]').onclick = m.close;
+    const textEl = m.q('#tfText');
+    const submit = () => {
+      const val = { text: textEl.value.trim(), owner: m.q('#tfOwner').value.trim(), due: m.q('#tfDue').value, priority: m.q('#tfPrio').value };
+      if (!val.text) { textEl.focus(); return; }
+      opts.onSave(val, m);
+    };
+    m.q('[data-save]').onclick = submit;
+    textEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    setTimeout(() => textEl.focus(), 30);
+  }
+
+  function newTask() {
+    taskFormModal({ heading: 'New task', saveLabel: 'Add', task: null, onSave: async (val, m) => {
+      try {
+        await api('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(val) });
+        m.close(); toast('Task added', 'success');
+        allNotes = []; await loadTasks();
+        if (currentNoteId && noteEditor) reloadCurrentNoteBody();
+      } catch (e) { toast('Add failed: ' + e.message, 'error'); }
+    } });
+  }
+
+  function editTask(idx) {
+    const t = allTasks[idx]; if (!t || t.source !== 'note') return;
+    taskFormModal({ heading: 'Edit task', saveLabel: 'Save', task: { text: t.text, owner: t.owner, due: t.due, priority: t.priority },
+      onSave: async (val, m) => {
+        try {
+          await api('/api/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text, text: val.text, owner: val.owner, due: val.due, priority: val.priority }) });
+          m.close(); toast('Task updated', 'success');
+          await loadTasks();
+          if (currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
+        } catch (e) {
+          if (e.status === 409) { m.close(); toast('That task moved — refreshing', 'error'); loadTasks(); }
+          else toast('Update failed: ' + e.message, 'error');
+        }
+      } });
+  }
+
+  function deleteTask(idx) {
+    const t = allTasks[idx]; if (!t || t.source !== 'note') return;
+    const m = modal('<h3>Delete task?</h3><p class="nt-modal-text">' + esc(t.text) + '</p>'
+      + '<div class="nt-modal-actions"><button class="nt-modal-btn" data-cancel>Cancel</button>'
+      + '<button class="nt-modal-btn danger" data-yes>Delete</button></div>');
+    m.q('[data-cancel]').onclick = m.close;
+    m.q('[data-yes]').onclick = async () => {
+      try {
+        await api('/api/tasks', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text }) });
+        m.close(); toast('Task deleted', 'success');
+        await loadTasks();
+        if (currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
+      } catch (e) {
+        m.close();
+        if (e.status === 409) { toast('That task moved — refreshing', 'error'); loadTasks(); }
+        else toast('Delete failed: ' + e.message, 'error');
+      }
+    };
+  }
+
   function initTasksView() {
     const filters = $('tasksFilters');
     if (filters) filters.addEventListener('click', (e) => {
@@ -305,9 +384,13 @@
     if (owner) owner.addEventListener('change', () => { taskFilters.owner = owner.value; renderTasks(); });
     const gb = $('taskGroupBy');
     if (gb) gb.addEventListener('change', () => { taskGroupBy = gb.value; renderTasks(); });
+    const newBtn = $('taskNewBtn');
+    if (newBtn) newBtn.addEventListener('click', newTask);
     const list = $('tasksList');
     if (list) list.addEventListener('click', (e) => {
       const cb = e.target.closest('[data-toggle]'); if (cb) { toggleTaskByIndex(+cb.dataset.toggle, cb); return; }
+      const ed = e.target.closest('[data-edit]'); if (ed) { editTask(+ed.dataset.edit); return; }
+      const del = e.target.closest('[data-del]'); if (del) { deleteTask(+del.dataset.del); return; }
       const push = e.target.closest('[data-push]'); if (push) { pushMeetingToNote(+push.dataset.push); return; }
       const src = e.target.closest('[data-open-source]'); if (src) { openTaskSource(+src.dataset.openSource); return; }
     });

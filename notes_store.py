@@ -332,6 +332,17 @@ def append_to_body(notes_dir, note_id: str, text: str) -> dict | None:
     return update_note(notes_dir, note_id, body=new_body)
 
 
+def append_task_line(notes_dir, note_id: str, line: str) -> dict | None:
+    """Append a single checkbox task line to a note's body, joined tightly (one newline)
+    so consecutive tasks stay in the same Markdown list. Returns the updated record."""
+    rec = read_note(notes_dir, note_id)
+    if rec is None:
+        return None
+    cur = (rec.get("body") or "").rstrip("\n")
+    new_body = (cur + "\n" + line) if cur.strip() else line
+    return update_note(notes_dir, note_id, body=new_body)
+
+
 def link_meeting(notes_dir, note_id: str, meeting_id: str, add: bool = True) -> dict | None:
     p = find_path(notes_dir, note_id)
     if not p:

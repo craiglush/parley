@@ -147,3 +147,60 @@ def format_action_item_as_checkbox(item: dict) -> str:
     if prio in _PRIORITY_TO_EMOJI:
         parts.append(_PRIORITY_TO_EMOJI[prio])
     return " ".join(parts)
+
+
+def _task_remainder(text: str, owner=None, due=None, priority=None) -> str:
+    """Build the part after the checkbox: 'text @owner 📅 YYYY-MM-DD <prio-emoji>'."""
+    parts = [(text or "").strip()]
+    if owner:
+        parts.append("@" + re.sub(r"\s+", "-", str(owner).strip().lstrip("@")))
+    d = (due or "").strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+        parts.append("📅 " + d)
+    prio = (priority or "").strip().lower()
+    if prio in _PRIORITY_TO_EMOJI:
+        parts.append(_PRIORITY_TO_EMOJI[prio])
+    return " ".join(p for p in parts if p)
+
+
+def format_task_line(text: str, owner=None, due=None, priority=None, done: bool = False) -> str:
+    """Render a GFM checkbox task line from explicit fields (text + optional metadata)."""
+    return f"- [{'x' if done else ' '}] " + _task_remainder(text, owner, due, priority)
+
+
+def update_line(body: str, line_index: int, expected_text, text: str,
+                owner=None, due=None, priority=None):
+    """Rewrite the checkbox at line_index with new text + metadata, preserving its done
+    state, indent and bullet char. Returns (new_body, ok); refuses (body, False) if the
+    line is not a checkbox, the index is out of range, or expected_text doesn't match."""
+    lines = (body or "").split("\n")
+    if line_index < 0 or line_index >= len(lines):
+        return body, False
+    m = _CHECKBOX_RE.match(lines[line_index])
+    if not m:
+        return body, False
+    if expected_text is not None:
+        cur_text, _, _, _ = parse_inline_metadata(m.group(4))
+        if cur_text != expected_text:
+            return body, False
+    done = m.group(3).lower() == "x"
+    remainder = _task_remainder(text, owner, due, priority)
+    lines[line_index] = f"{m.group(1)}{m.group(2)} [{'x' if done else ' '}] {remainder}"
+    return "\n".join(lines), True
+
+
+def delete_line(body: str, line_index: int, expected_text=None):
+    """Remove the checkbox line at line_index. Returns (new_body, ok); refuses (body, False)
+    if the line is not a checkbox, index is out of range, or expected_text doesn't match."""
+    lines = (body or "").split("\n")
+    if line_index < 0 or line_index >= len(lines):
+        return body, False
+    m = _CHECKBOX_RE.match(lines[line_index])
+    if not m:
+        return body, False
+    if expected_text is not None:
+        cur_text, _, _, _ = parse_inline_metadata(m.group(4))
+        if cur_text != expected_text:
+            return body, False
+    del lines[line_index]
+    return "\n".join(lines), True
