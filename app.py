@@ -487,7 +487,25 @@ class IFrameMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class CacheControlMiddleware(BaseHTTPMiddleware):
+    """Mark the app shell (HTML, sw.js, manifest, /static/*) `no-cache` so updates land
+    immediately. The static files carry ETag/Last-Modified, so `no-cache` means
+    "revalidate before use" -> a conditional request returns 304 when unchanged (cheap)
+    and fresh bytes after a deploy. Without this, .js/.css get edge-cached (Cloudflare)
+    or held by the service worker and a stale UI is served after every deploy — including
+    a stale sw.js, which blocks the new worker from ever installing. Data downloads
+    (audio/transcripts/attachments) are left untouched."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        p = request.url.path
+        if p in ("/", "/sw.js", "/manifest.json") or p.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 app.add_middleware(IFrameMiddleware)
+app.add_middleware(CacheControlMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(ALLOWED_CORS_ORIGINS),
