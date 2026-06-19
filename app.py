@@ -3800,6 +3800,23 @@ class TaskDelete(BaseModel):
     expected_text: Optional[str] = None
 
 
+class MeetingTaskToggle(BaseModel):
+    index: int
+    done: bool
+
+
+class MeetingTaskEdit(BaseModel):
+    index: int
+    text: str
+    owner: Optional[str] = None
+    due: Optional[str] = None
+    priority: Optional[str] = None
+
+
+class MeetingTaskDismiss(BaseModel):
+    index: int
+
+
 class NoteRename(BaseModel):
     title: Optional[str] = None
     folder: Optional[str] = None
@@ -4008,6 +4025,47 @@ def _collect_note_tasks() -> list:
     return out
 
 
+def _meeting_overlay_path(meeting_id: str) -> Optional[Path]:
+    """Path to a meeting's task-overlay sidecar (in-place complete/edit state for its
+    AI-derived action items). None if the meeting/output_dir is unknown."""
+    m = meetings.get(meeting_id)
+    out_dir = m.get("output_dir") if m else None
+    return (Path(out_dir) / "task_overlay.json") if out_dir else None
+
+
+def _load_meeting_overlay(meeting_id: str) -> dict:
+    p = _meeting_overlay_path(meeting_id)
+    if p and p.exists():
+        try:
+            data = json.loads(p.read_text())
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_meeting_overlay(meeting_id: str, overlay: dict) -> bool:
+    p = _meeting_overlay_path(meeting_id)
+    if not p:
+        return False
+    _atomic_write(p, json.dumps(overlay, indent=2))
+    return True
+
+
+def _meeting_action_item_count(meeting_id: str) -> int:
+    m = meetings.get(meeting_id)
+    out_dir = m.get("output_dir") if m else None
+    if not out_dir:
+        return 0
+    sp = Path(out_dir) / "summary.json"
+    if not sp.exists():
+        return 0
+    try:
+        return len(json.loads(sp.read_text()).get("action_items", []))
+    except Exception:
+        return 0
+
+
 def _collect_meeting_tasks() -> list:
     out = []
     for mid, m in meetings.items():
@@ -4023,8 +4081,13 @@ def _collect_meeting_tasks() -> list:
             summary = json.loads(sp.read_text())
         except Exception:
             continue
-        for item in summary.get("action_items", []):
-            out.append(tasks_store.meeting_action_item_to_task(item, mid, m.get("title", mid)))
+        overlay = _load_meeting_overlay(mid)
+        for i, item in enumerate(summary.get("action_items", [])):
+            task = tasks_store.meeting_action_item_to_task(item, mid, m.get("title", mid))
+            task["index"] = i  # stable per-meeting id (summary.json is immutable post-processing)
+            task = tasks_store.apply_meeting_overlay(task, overlay.get(str(i)))
+            if task is not None:
+                out.append(task)
     return out
 
 
@@ -4106,6 +4169,60 @@ async def api_delete_task(payload: TaskDelete):
     if not ok:
         raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
     notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+    return {"ok": True}
+
+
+# --- Meeting tasks: in-place complete/edit/dismiss via a per-meeting overlay ---
+# Meeting action items are an AI-derived projection (no note to edit), so their
+# mutable state lives in task_overlay.json beside the meeting, keyed by the
+# action item's index in summary.json.
+
+def _require_meeting_index(meeting_id: str, index: int) -> None:
+    if meeting_id not in meetings:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    if index < 0 or index >= _meeting_action_item_count(meeting_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+
+
+@app.post("/api/meetings/{meeting_id}/tasks/toggle")
+async def api_meeting_task_toggle(meeting_id: str, payload: MeetingTaskToggle):
+    _require_meeting_index(meeting_id, payload.index)
+    ov = _load_meeting_overlay(meeting_id)
+    entry = ov.get(str(payload.index)) or {}
+    entry["done"] = bool(payload.done)
+    ov[str(payload.index)] = entry
+    if not _save_meeting_overlay(meeting_id, ov):
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    return {"ok": True}
+
+
+@app.patch("/api/meetings/{meeting_id}/tasks")
+async def api_meeting_task_edit(meeting_id: str, payload: MeetingTaskEdit):
+    if not (payload.text or "").strip():
+        raise HTTPException(status_code=400, detail="Task text is required")
+    _require_meeting_index(meeting_id, payload.index)
+    ov = _load_meeting_overlay(meeting_id)
+    entry = ov.get(str(payload.index)) or {}
+    entry["edited"] = True
+    entry["text"] = payload.text.strip()
+    entry["owner"] = (payload.owner or "").strip() or None
+    entry["due"] = (payload.due or "").strip() or None
+    entry["priority"] = (payload.priority or "").strip().lower() or None
+    ov[str(payload.index)] = entry
+    if not _save_meeting_overlay(meeting_id, ov):
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    return {"ok": True}
+
+
+@app.delete("/api/meetings/{meeting_id}/tasks")
+async def api_meeting_task_dismiss(meeting_id: str, payload: MeetingTaskDismiss):
+    _require_meeting_index(meeting_id, payload.index)
+    ov = _load_meeting_overlay(meeting_id)
+    entry = ov.get(str(payload.index)) or {}
+    entry["deleted"] = True
+    ov[str(payload.index)] = entry
+    if not _save_meeting_overlay(meeting_id, ov):
+        raise HTTPException(status_code=404, detail="Meeting not found")
     return {"ok": True}
 
 

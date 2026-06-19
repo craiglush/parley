@@ -196,12 +196,13 @@
     const owner = t.owner ? '<span class="task-chip owner">@' + esc(t.owner) + '</span>' : '';
     const srcIcon = isNote ? '📝' : '🎙';
     const src = '<span class="task-chip source" data-open-source="' + idx + '" title="Open ' + esc(t.source) + '">' + srcIcon + ' ' + esc(t.source_title || t.source) + '</span>';
+    const editDel = '<button class="task-mini-btn" data-edit="' + idx + '" title="Edit task">✎</button>'
+      + '<button class="task-mini-btn danger" data-del="' + idx + '" title="' + (isNote ? 'Delete task' : 'Dismiss task') + '">🗑</button>';
     const actions = isNote
-      ? '<div class="task-actions"><button class="task-mini-btn" data-edit="' + idx + '" title="Edit task">✎</button>'
-        + '<button class="task-mini-btn danger" data-del="' + idx + '" title="Delete task">🗑</button></div>'
-      : '<div class="task-actions"><button class="task-push-btn" data-push="' + idx + '">→ Note</button></div>';
+      ? '<div class="task-actions">' + editDel + '</div>'
+      : '<div class="task-actions">' + editDel + '<button class="task-push-btn" data-push="' + idx + '" title="Copy into a note">→ Note</button></div>';
     return '<div class="task-row' + (t.done ? ' done' : '') + '" data-idx="' + idx + '">'
-      + '<input type="checkbox" class="task-check"' + (t.done ? ' checked' : '') + (isNote ? '' : ' disabled title="Meeting tasks are read-only — push to a note to track"') + ' data-toggle="' + idx + '">'
+      + '<input type="checkbox" class="task-check"' + (t.done ? ' checked' : '') + ' data-toggle="' + idx + '">'
       + '<div class="task-main"><div class="task-text">' + esc(t.text) + '</div>'
       + '<div class="task-meta">' + due + prio + owner + src + '</div></div>'
       + actions + '</div>';
@@ -246,14 +247,19 @@
   }
 
   async function toggleTaskByIndex(idx, checkboxEl) {
-    const t = allTasks[idx]; if (!t || t.source !== 'note') return;
+    const t = allTasks[idx]; if (!t) return;
     const target = !t.done;
     try {
-      await api('/api/tasks/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ note_id: t.source_id, line: t.line, done: target, expected_text: t.text }) });
+      if (t.source === 'note') {
+        await api('/api/tasks/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ note_id: t.source_id, line: t.line, done: target, expected_text: t.text }) });
+      } else {
+        await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: t.index, done: target }) });
+      }
       t.done = target;
       renderTasks(); updateTaskBadge();
-      if (currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
+      if (t.source === 'note' && currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
     } catch (e) {
       if (checkboxEl) checkboxEl.checked = t.done;
       if (e.status === 409) { toast('That task moved — refreshing', 'error'); loadTasks(); }
@@ -334,15 +340,20 @@
   }
 
   function editTask(idx) {
-    const t = allTasks[idx]; if (!t || t.source !== 'note') return;
+    const t = allTasks[idx]; if (!t) return;
     taskFormModal({ heading: 'Edit task', saveLabel: 'Save', task: { text: t.text, owner: t.owner, due: t.due, priority: t.priority },
       onSave: async (val, m) => {
         try {
-          await api('/api/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text, text: val.text, owner: val.owner, due: val.due, priority: val.priority }) });
+          if (t.source === 'note') {
+            await api('/api/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text, text: val.text, owner: val.owner, due: val.due, priority: val.priority }) });
+          } else {
+            await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ index: t.index, text: val.text, owner: val.owner, due: val.due, priority: val.priority }) });
+          }
           m.close(); toast('Task updated', 'success');
           await loadTasks();
-          if (currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
+          if (t.source === 'note' && currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
         } catch (e) {
           if (e.status === 409) { m.close(); toast('That task moved — refreshing', 'error'); loadTasks(); }
           else toast('Update failed: ' + e.message, 'error');
@@ -351,18 +362,25 @@
   }
 
   function deleteTask(idx) {
-    const t = allTasks[idx]; if (!t || t.source !== 'note') return;
-    const m = modal('<h3>Delete task?</h3><p class="nt-modal-text">' + esc(t.text) + '</p>'
+    const t = allTasks[idx]; if (!t) return;
+    const isNote = t.source === 'note';
+    const m = modal('<h3>' + (isNote ? 'Delete task?' : 'Dismiss task?') + '</h3><p class="nt-modal-text">' + esc(t.text) + '</p>'
+      + (isNote ? '' : '<p class="nt-modal-text" style="opacity:.7">This hides the action item from the meeting; it stays in the meeting summary.</p>')
       + '<div class="nt-modal-actions"><button class="nt-modal-btn" data-cancel>Cancel</button>'
-      + '<button class="nt-modal-btn danger" data-yes>Delete</button></div>');
+      + '<button class="nt-modal-btn danger" data-yes>' + (isNote ? 'Delete' : 'Dismiss') + '</button></div>');
     m.q('[data-cancel]').onclick = m.close;
     m.q('[data-yes]').onclick = async () => {
       try {
-        await api('/api/tasks', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text }) });
-        m.close(); toast('Task deleted', 'success');
+        if (isNote) {
+          await api('/api/tasks', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text }) });
+        } else {
+          await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: t.index }) });
+        }
+        m.close(); toast(isNote ? 'Task deleted' : 'Task dismissed', 'success');
         await loadTasks();
-        if (currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
+        if (isNote && currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
       } catch (e) {
         m.close();
         if (e.status === 409) { toast('That task moved — refreshing', 'error'); loadTasks(); }

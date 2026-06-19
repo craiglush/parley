@@ -109,6 +109,45 @@ def test_task_full_crud(tmp_path, monkeypatch):
                                                         "expected_text": "NOPE"}).status_code == 409
 
 
+def test_meeting_task_overlay_crud(tmp_path, monkeypatch):
+    client, app = _client(tmp_path, monkeypatch)
+    mdir = tmp_path / "_m"
+    mdir.mkdir()
+    (mdir / "summary.json").write_text(json.dumps({"action_items": [
+        {"task": "Send report", "who": "Amy", "deadline": "2026-07-01", "priority": "high"},
+        {"task": "Book venue", "who": "Bob", "priority": "low"},
+    ]}))
+    monkeypatch.setattr(app, "meetings", {"m1": {"title": "Sync", "status": app.MeetingStatus.complete, "output_dir": str(mdir)}})
+
+    mt = [t for t in client.get("/api/tasks").json()["tasks"] if t["source"] == "meeting"]
+    assert len(mt) == 2
+    t0 = next(t for t in mt if t["text"] == "Send report")
+    assert t0["done"] is False and t0["index"] == 0
+
+    # complete in place -> persisted to a sidecar (no note created)
+    assert client.post("/api/meetings/m1/tasks/toggle", json={"index": 0, "done": True}).status_code == 200
+    assert (mdir / "task_overlay.json").exists()
+    assert next(t for t in client.get("/api/tasks").json()["tasks"]
+                if t["source"] == "meeting" and t["text"] == "Send report")["done"] is True
+
+    # edit text + metadata (done state preserved; due cleared)
+    assert client.patch("/api/meetings/m1/tasks", json={"index": 0, "text": "Send final report",
+                                                        "owner": "Carol", "due": "", "priority": "low"}).status_code == 200
+    edited = next(t for t in client.get("/api/tasks").json()["tasks"]
+                  if t["source"] == "meeting" and t["text"] == "Send final report")
+    assert edited["owner"] == "Carol" and edited["priority"] == "low" and not edited["due"] and edited["done"] is True
+
+    # dismiss -> drops out of the list, other items keep their index
+    assert client.request("DELETE", "/api/meetings/m1/tasks", json={"index": 0}).status_code == 200
+    remaining = [t for t in client.get("/api/tasks").json()["tasks"] if t["source"] == "meeting"]
+    assert len(remaining) == 1 and remaining[0]["text"] == "Book venue" and remaining[0]["index"] == 1
+
+    # guards: bad index 404, empty edit 400, unknown meeting 404
+    assert client.post("/api/meetings/m1/tasks/toggle", json={"index": 99, "done": True}).status_code == 404
+    assert client.patch("/api/meetings/m1/tasks", json={"index": 1, "text": "  "}).status_code == 400
+    assert client.post("/api/meetings/nope/tasks/toggle", json={"index": 0, "done": True}).status_code == 404
+
+
 def test_rename_and_push_action_items(tmp_path, monkeypatch):
     client, app = _client(tmp_path, monkeypatch)
 

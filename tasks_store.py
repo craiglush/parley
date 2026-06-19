@@ -204,3 +204,23 @@ def delete_line(body: str, line_index: int, expected_text=None):
             return body, False
     del lines[line_index]
     return "\n".join(lines), True
+
+
+def apply_meeting_overlay(task: dict, entry: dict | None) -> dict | None:
+    """Apply a saved per-meeting overlay entry to a meeting task (in-place edit/complete
+    state for AI-derived action items, which have no note to live in). Returns the
+    updated task, or None if the entry dismisses (deletes) it. `done` is independent of
+    an edit; an `edited` entry fully replaces text + metadata (empty -> cleared)."""
+    if not entry:
+        return task
+    if entry.get("deleted"):
+        return None
+    t = dict(task)
+    if "done" in entry:
+        t["done"] = bool(entry["done"])
+    if entry.get("edited"):
+        t["text"] = entry.get("text", t.get("text", ""))
+        t["owner"] = entry.get("owner") or None
+        t["due"] = entry.get("due") or None
+        t["priority"] = entry.get("priority") or None
+    return t
