@@ -63,6 +63,16 @@ Meeting-AI tools are everywhere — but they ship your most sensitive conversati
 
 Your meetings and notes are plain files on disk (`MEETINGS_DIR`, `NOTES_DIR`) — portable and Obsidian-compatible. Vector indexing is best-effort and off the request path, so the UI stays snappy.
 
+## Flexible by design
+
+Parley runs entirely on **local Ollama** out of the box — that's the whole point. But the AI backends are swappable:
+
+- **Analysis & embeddings** (transcript cleanup, the six-pass extraction, auto-tagging, summaries, semantic search) run on your local **Ollama** models. **OpenWebUI is not required** — it's only an optional alternative backend for the chat box.
+- **Chat** ("ask your meetings") can point at Ollama (default), an existing **OpenWebUI** instance, or **any OpenAI-compatible endpoint** — so you can use a different local server, or a cloud model, just for chat if you want.
+- **Transcription** uses your local **WhisperX**.
+
+Nothing leaves your machine unless *you* explicitly configure the chat box to use a remote endpoint.
+
 ## Quick start
 
 You'll need **Docker**, an **Ollama** instance (with an LLM such as `qwen3.5:9b` and an embedding model like `qwen3-embedding:0.6b`), a **Qdrant** instance, and a **WhisperX / faster-whisper** endpoint for transcription. (Notes & Tasks work without WhisperX — that's only needed to transcribe audio.)
