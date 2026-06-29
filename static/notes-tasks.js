@@ -108,7 +108,15 @@
     if (!nav) return;
     nav.addEventListener('click', (e) => {
       const btn = e.target.closest('.pillar-btn'); if (!btn) return;
-      setActivePillar(btn.dataset.pillar);
+      const target = btn.dataset.pillar;
+      // Guard leaving the Meetings pillar while a recording is in progress or
+      // staged-but-unsaved (the capture UI lives on the Meetings pillar).
+      if (target !== 'meetings' && currentPillar === 'meetings'
+          && typeof window.captureGuardConfirm === 'function'
+          && !window.captureGuardConfirm()) {
+        return;
+      }
+      setActivePillar(target);
     });
     document.body.dataset.pillar = 'meetings';
   }

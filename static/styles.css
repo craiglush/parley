@@ -2180,6 +2180,18 @@ body {
   position: relative;
 }
 
+/* No-audio / silent-capture warning */
+.capture-warning {
+  margin: 0 24px 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--red);
+  background: var(--red-dim);
+  color: var(--red);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .cb-bar {
   display: flex;
   align-items: center;
@@ -2386,4 +2398,59 @@ body {
     min-width: auto;
     z-index: 200;
   }
+}
+
+/* --- Unsaved recording recovery banner --- */
+.recovery-banner {
+  margin: 12px 20px 0;
+  padding: 0;
+  border-radius: var(--radius);
+  background: var(--yellow-dim);
+  border: 1px solid rgba(212, 160, 57, 0.3);
+  overflow: hidden;
+}
+.recovery-banner-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  flex-wrap: wrap;
+}
+.recovery-banner-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+.recovery-banner-text {
+  flex: 1;
+  font-size: 14px;
+  color: var(--text-primary);
+  min-width: 160px;
+}
+.recovery-banner-load,
+.recovery-banner-dismiss {
+  font-family: var(--font-ui);
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  padding: 6px 14px;
+  white-space: nowrap;
+  transition: background .15s ease;
+}
+.recovery-banner-load {
+  background: var(--accent);
+  color: #000;
+  border: none;
+}
+.recovery-banner-load:hover {
+  background: var(--accent-hover);
+}
+.recovery-banner-dismiss {
+  background: transparent;
+  border: 1px solid var(--border-light);
+  color: var(--text-secondary);
+}
+.recovery-banner-dismiss:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }

@@ -46,6 +46,73 @@ let pauseStartTime = null;
 // Extra streams to clean up for combined mode
 let extraStreams = [];
 
+// Live signal monitoring (drives the "no audio detected" safety net).
+let recordingPeakLevel = 0;   // max audio level seen this session (0..255 scale)
+let lastSignalTime = 0;       // timestamp of the last frame with real signal
+let noAudioWarned = false;    // whether the no-audio warning is currently shown
+
+// True when a *recording* is staged but not yet uploaded (vs a drag-dropped
+// file, which still exists on disk). Drives the beforeunload / nav "are you
+// sure" prompts. stagedSilent gates the pre-upload silent-recording confirm.
+let stagedFromRecording = false;
+let stagedSilent = false;
+
+// --- IndexedDB Recording Backup ---
+const DB_NAME = 'meeting-service';
+const DB_VERSION = 1;
+const STORE_NAME = 'unsaved-recordings';
+
+function _openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function _saveRecordingBackup(blob, fileName, mimeType) {
+  try {
+    const db = await _openDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    store.put({ id: 'current', blob, fileName, mimeType, createdAt: Date.now(), duration: recordTimer.textContent });
+    await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); });
+    db.close();
+  } catch (e) { console.warn('IndexedDB save failed (non-fatal):', e); }
+}
+
+async function _loadRecordingBackup() {
+  try {
+    const db = await _openDB();
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const entry = await new Promise((resolve, reject) => {
+      const req = store.get('current');
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    return entry;
+  } catch (e) { console.warn('IndexedDB load failed:', e); return null; }
+}
+
+async function _clearRecordingBackup() {
+  try {
+    const db = await _openDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    store.delete('current');
+    await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); });
+    db.close();
+  } catch (e) { console.warn('IndexedDB clear failed:', e); }
+}
+
 const recordBtn = $('recordBtn');
 const recordArea = $('recordArea');
 const recordLabel = $('recordLabel');
@@ -77,6 +144,13 @@ document.querySelectorAll('.source-btn').forEach(btn => {
 recordBtn.addEventListener('click', async () => {
   if (mediaRecorder && (mediaRecorder.state === 'recording' || mediaRecorder.state === 'paused')) {
     stopRecording();
+  } else if (selectedFile) {
+    if (!confirm('Discard your unsaved recording and start a new one?')) return;
+    _clearRecordingBackup();
+    selectedFile = null;
+    fileInput.value = '';
+    uploadFields.classList.remove('visible');
+    await startRecording();
   } else {
     await startRecording();
   }
@@ -295,6 +369,13 @@ async function startRecording() {
       }
 
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Created AFTER awaiting getUserMedia + the screen-share/loopback prompt,
+      // so Chrome starts it SUSPENDED — a suspended context pulls no samples
+      // through the destination, making the mixed recording (and visualizer)
+      // silent. Resume before wiring up. Root cause of empty 'Both' recordings.
+      if (ctx.state === 'suspended') {
+        try { await ctx.resume(); } catch (e) { console.warn('AudioContext resume failed:', e); }
+      }
       const dest = ctx.createMediaStreamDestination();
       const micSource = ctx.createMediaStreamSource(micStream);
       const sysSource = ctx.createMediaStreamSource(sysStream);
@@ -332,6 +413,13 @@ async function startRecording() {
 
 function setupRecorderFromStream(stream, usingLoopback, loopbackName) {
     recordedChunks = [];
+
+    // Reset signal monitoring + clear any stale no-audio warning.
+    recordingPeakLevel = 0;
+    lastSignalTime = 0;
+    noAudioWarned = false;
+    stagedSilent = false;
+    hideCaptureWarning();
 
     const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4']
       .find(m => MediaRecorder.isTypeSupported(m)) || '';
@@ -446,6 +534,7 @@ function togglePause() {
       function draw() {
         vizAnimFrame = requestAnimationFrame(draw);
         analyserNode.getByteFrequencyData(dataArray);
+        updateSignalLevel(dataArray);
         const step = Math.max(1, Math.floor(dataArray.length / VIZ_BARS));
         for (let i = 0; i < VIZ_BARS; i++) {
           const val = dataArray[Math.min(i * step, dataArray.length - 1)];
@@ -477,6 +566,7 @@ function onRecordingStopped() {
   $('loopbackSettings').style.display = '';
   $('loopbackGearBtn').style.display = '';
   document.querySelector('.rec-dot').style.animationPlayState = '';
+  hideCaptureWarning();
 
   if (!recordedChunks.length) return;
 
@@ -488,6 +578,44 @@ function onRecordingStopped() {
   const file = new File([blob], fileName, { type: mimeType });
 
   selectFile(file);
+  _saveRecordingBackup(blob, fileName, mimeType);
+  stagedFromRecording = true;
+
+  // Surface a silent capture before the user uploads (and later transcribes) it.
+  stagedSilent = (recordingPeakLevel <= SIGNAL_THRESHOLD);
+  if (stagedSilent) {
+    showCaptureWarning('&#9888;&#65039; This recording appears to contain no audio (silent capture). Check your mic/system-audio source — upload anyway only if you expected silence.');
+  }
+}
+
+// --- Live signal monitoring (no-audio safety net) ---
+const SIGNAL_THRESHOLD = 6;   // byte-FFT bin value above the silence noise floor
+
+function updateSignalLevel(dataArray) {
+  let max = 0;
+  for (let i = 0; i < dataArray.length; i++) if (dataArray[i] > max) max = dataArray[i];
+  if (max > SIGNAL_THRESHOLD) {
+    lastSignalTime = Date.now();
+    if (max > recordingPeakLevel) recordingPeakLevel = max;
+    if (noAudioWarned) hideCaptureWarning();
+  }
+}
+
+function showCaptureWarning(msg) {
+  noAudioWarned = true;
+  const el = $('captureWarning');
+  if (el) {
+    // innerHTML is safe here: callers only ever pass a trusted static literal
+    // (the entities below render the warning glyph); no user input reaches this.
+    el.innerHTML = msg || '&#9888;&#65039; No audio detected — check your microphone / system-audio source. This recording may be silent.';
+    el.style.display = 'block';
+  }
+}
+
+function hideCaptureWarning() {
+  noAudioWarned = false;
+  const el = $('captureWarning');
+  if (el) el.style.display = 'none';
 }
 
 function updateRecordTimer() {
@@ -497,11 +625,22 @@ function updateRecordTimer() {
   const s = elapsed % 60;
   recordTimer.textContent =
     `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+
+  // No-audio safety net: a few seconds in with no real signal -> warn the user
+  // immediately instead of letting them find out after an empty transcription.
+  // (This tick is paused while recording is paused, so it won't false-fire.)
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    const noSignal = lastSignalTime === 0 || (Date.now() - lastSignalTime > 3000);
+    if (elapsed >= 4 && noSignal) showCaptureWarning();
+  }
 }
 
 function setupAudioViz(stream) {
   const ctx = audioContext || new (window.AudioContext || window.webkitAudioContext)();
   audioContext = ctx;
+  // Created after media-prompt awaits -> may start suspended; resume so the
+  // analyser produces data (also powers the no-audio detector).
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
   const source = ctx.createMediaStreamSource(stream);
   analyserNode = ctx.createAnalyser();
   analyserNode.fftSize = 64;
@@ -513,6 +652,7 @@ function setupAudioViz(stream) {
   function draw() {
     vizAnimFrame = requestAnimationFrame(draw);
     analyserNode.getByteFrequencyData(dataArray);
+    updateSignalLevel(dataArray);
     const step = Math.max(1, Math.floor(dataArray.length / VIZ_BARS));
     for (let i = 0; i < VIZ_BARS; i++) {
       const val = dataArray[Math.min(i * step, dataArray.length - 1)];
@@ -547,6 +687,9 @@ fileInput.addEventListener('change', () => {
 
 function selectFile(file) {
   selectedFile = file;
+  // A drag-dropped / picked file still exists on disk, so it's not "unsaved".
+  // onRecordingStopped() and the recovery flow re-set this to true after calling us.
+  stagedFromRecording = false;
   $('fileName').textContent = file.name;
   $('fileSize').textContent = formatBytes(file.size);
   uploadFields.classList.add('visible');
@@ -556,10 +699,19 @@ $('removeFile').addEventListener('click', () => {
   selectedFile = null;
   fileInput.value = '';
   uploadFields.classList.remove('visible');
+  hideCaptureWarning();
+  stagedFromRecording = false;
+  stagedSilent = false;
+  _clearRecordingBackup();
 });
 
 uploadBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
+
+  // Guard against accidentally queueing a silent recording for transcription.
+  if (stagedFromRecording && stagedSilent) {
+    if (!confirm('This recording appears to contain no audio. Upload and process it anyway?')) return;
+  }
 
   uploadBtn.disabled = true;
   const progress = $('uploadProgress');
@@ -596,6 +748,10 @@ uploadBtn.addEventListener('click', async () => {
       if (xhr.status === 202) {
         const data = JSON.parse(xhr.responseText);
         $('progressText').textContent = `Queued! Meeting ID: ${data.meeting_id}`;
+        stagedFromRecording = false;
+        stagedSilent = false;
+        hideCaptureWarning();
+        _clearRecordingBackup();
         setTimeout(() => {
           selectedFile = null;
           fileInput.value = '';
@@ -2903,6 +3059,58 @@ function closeSettings() {
   settingsOverlay.classList.remove('visible');
   document.body.style.overflow = '';
 }
+
+// --- Unsaved recording recovery on page load ---
+(async function checkRecovery() {
+  const entry = await _loadRecordingBackup();
+  if (!entry) return;
+  const banner = $('recoveryBanner');
+  const loadBtn = $('recoveryLoadBtn');
+  const dismissBtn = $('recoveryDismissBtn');
+  banner.hidden = false;
+
+  loadBtn.addEventListener('click', () => {
+    const file = new File([entry.blob], entry.fileName, { type: entry.mimeType });
+    selectFile(file);
+    stagedFromRecording = true;   // keep it protected until uploaded
+    banner.hidden = true;
+  });
+
+  dismissBtn.addEventListener('click', () => {
+    _clearRecordingBackup();
+    banner.hidden = true;
+  });
+})();
+
+// ---------------------------------------------------------------------------
+// Unsaved-recording guards: warn before leaving / navigating away while a
+// recording is in progress or staged-but-not-uploaded. The recording is also
+// autosaved (IndexedDB), so it's recoverable even if they proceed.
+// ---------------------------------------------------------------------------
+function isCapturing() {
+  return !!(mediaRecorder && (mediaRecorder.state === 'recording' || mediaRecorder.state === 'paused'));
+}
+
+// Returns true if it's OK to navigate away (no risk, or user confirmed).
+// Exposed for the pillar nav (notes-tasks.js) and any other in-app navigation.
+window.captureGuardConfirm = function () {
+  if (isCapturing()) {
+    return confirm('A recording is still in progress. It keeps running in the background and is auto-saved — switch anyway?');
+  }
+  if (stagedFromRecording) {
+    return confirm('You have a recording that hasn’t been uploaded yet. It’s saved and can be recovered later — leave it for now?');
+  }
+  return true;
+};
+window.isCapturing = isCapturing;
+
+window.addEventListener('beforeunload', (e) => {
+  if (isCapturing() || stagedFromRecording) {
+    e.preventDefault();
+    e.returnValue = '';   // triggers the browser's native "leave site?" prompt
+    return '';
+  }
+});
 
 // --- Init ---
 refreshGroupedView();

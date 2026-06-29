@@ -17,9 +17,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
-<link rel="stylesheet" href="/static/notes-tasks.css?v=9">
-<script defer src="/static/vendor/codemirror.bundle.js?v=9"></script>
-<script defer src="/static/notes-tasks.js?v=9"></script>
+<link rel="stylesheet" href="/static/notes-tasks.css?v=10">
+<script defer src="/static/vendor/codemirror.bundle.js?v=10"></script>
+<script defer src="/static/notes-tasks.js?v=10"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -49,7 +49,7 @@
     }
   });
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=9">
+<link rel="stylesheet" href="/static/styles.css?v=10">
 </head>
 <body>
 
@@ -122,6 +122,19 @@
     <div class="audio-viz" id="audioViz"></div>
     <div class="loopback-active-indicator" id="loopbackActiveIndicator" style="display:none"></div>
   </div>
+
+  <!-- Recovery banner (hidden by default, shown on page load if unsaved recording found) -->
+  <div class="recovery-banner" id="recoveryBanner" hidden>
+    <div class="recovery-banner-body">
+      <span class="recovery-banner-icon">&#9888;</span>
+      <span class="recovery-banner-text">Unsaved recording found from your last session.</span>
+      <button class="recovery-banner-load" id="recoveryLoadBtn">Load &amp; upload</button>
+      <button class="recovery-banner-dismiss" id="recoveryDismissBtn">Dismiss</button>
+    </div>
+  </div>
+
+  <!-- Live no-audio / silent-capture warning -->
+  <div class="capture-warning" id="captureWarning" style="display:none"></div>
 
   <!-- Upload Fields (shared by record & file upload) -->
   <div class="upload-fields" id="uploadFields">
@@ -736,7 +749,7 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=9"></script>
+<script src="/static/app.js?v=10"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js');
@@ -785,7 +798,7 @@ if ('serviceWorker' in navigator) {
   </div>
 </div>
 
-<script src="/static/floating-chat.js?v=9"></script>
+<script src="/static/floating-chat.js?v=10"></script>
 
 </body>
 </html>
