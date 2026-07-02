@@ -186,7 +186,8 @@ def build_index(notes_dir) -> dict:
 
 # Re-validating the on-disk signature means stat-ing every note file, which is
 # slow over a large vault (esp. a Docker bind-mount). Within this window we trust
-# a warm cache and skip the re-stat entirely; API writes pass force=True.
+# a warm cache and skip the re-stat entirely; a write invalidates it (see
+# _invalidate) so the next read re-checks and picks the change up.
 _INDEX_TTL_S = 10.0
 
 
@@ -195,7 +196,7 @@ def get_index(notes_dir, force: bool = False) -> dict:
 
     A warm cache is served without touching the filesystem for _INDEX_TTL_S
     seconds; after that we re-check the cheap directory signature. External
-    edits therefore appear within the TTL; in-process writes force a refresh."""
+    edits appear within the TTL; in-process writes call _invalidate."""
     base = Path(notes_dir).resolve()
     key = str(base)
     cached = _index_cache.get(key)
@@ -208,6 +209,19 @@ def get_index(notes_dir, force: bool = False) -> dict:
     index = build_index(base)
     _index_cache[key] = {"sig": sig, "index": index, "checked": time.monotonic()}
     return index
+
+
+def _invalidate(notes_dir) -> None:
+    """Mark the warm caches stale after a write so the next read re-checks the
+    filesystem. Cheap and never serves stale data: the (offloaded) read path
+    re-stats the signature and rebuilds only if it actually changed. This
+    replaces a synchronous full re-index, which is catastrophic over a slow
+    bind-mount (a single write would block for seconds reading every note)."""
+    key = str(Path(notes_dir).resolve())
+    cached = _index_cache.get(key)
+    if cached:
+        cached["checked"] = 0.0  # force the signature re-check on next get_index
+    _folders_cache.pop(key, None)
 
 
 def find_path(notes_dir, note_id: str) -> Path | None:
@@ -237,7 +251,7 @@ def create_note(notes_dir, title: str, folder: str = "", type: str = "note", bod
     directory.mkdir(parents=True, exist_ok=True)
     path = _unique_path(directory, slugify(title))
     _atomic_write(path, serialize_note(meta, body))
-    get_index(notes_dir, force=True)  # new file -> refresh cache so it's visible immediately
+    _invalidate(notes_dir)  # new note -> visible on the next read
     return _record(notes_dir, path, meta, body)
 
 
@@ -261,7 +275,7 @@ def update_note(notes_dir, note_id: str, *, title=None, body=None, tags=None) ->
     meta["updated"] = now_iso()
     new_body = cur_body if body is None else body
     _atomic_write(p, serialize_note(meta, new_body))
-    get_index(notes_dir, force=True)  # file changed -> refresh cache
+    _invalidate(notes_dir)  # file changed -> next read refreshes
     return _record(notes_dir, p, meta, new_body)
 
 
@@ -273,7 +287,7 @@ def delete_note(notes_dir, note_id: str) -> bool:
     trash.mkdir(parents=True, exist_ok=True)
     dest = _unique_path(trash, p.stem)
     p.replace(dest)
-    get_index(notes_dir, force=True)
+    _invalidate(notes_dir)
     return True
 
 
@@ -349,7 +363,7 @@ def rename_note(notes_dir, note_id: str, *, title=None, folder=None) -> dict | N
     _atomic_write(new_path, serialize_note(meta, body))
     if new_path.resolve() != p.resolve():
         p.unlink()
-    get_index(notes_dir, force=True)
+    _invalidate(notes_dir)
     return _record(notes_dir, new_path, meta, body)
 
 
@@ -387,7 +401,7 @@ def link_meeting(notes_dir, note_id: str, meeting_id: str, add: bool = True) -> 
     meta["linked_meetings"] = links
     meta["updated"] = now_iso()
     _atomic_write(p, serialize_note(meta, body))
-    get_index(notes_dir, force=True)
+    _invalidate(notes_dir)
     return _record(notes_dir, p, meta, body)
 
 
@@ -453,5 +467,5 @@ def apply_auto_tags(notes_dir, note_id: str, category: str, keywords) -> dict | 
         meta["category"] = category
     meta["updated"] = now_iso()
     _atomic_write(p, serialize_note(meta, body))
-    get_index(notes_dir, force=True)
+    _invalidate(notes_dir)
     return _record(notes_dir, p, meta, body)
