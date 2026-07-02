@@ -9,6 +9,7 @@ import os
 import re
 import json
 import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,10 @@ def new_note_id() -> str:
 
 def slugify(title: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    # Cap length so the filename stays under filesystem path limits (Windows MAX_PATH);
+    # _unique_path handles any collisions truncation may introduce.
+    if len(s) > 80:
+        s = s[:80].rstrip("-")
     return s or "untitled"
 
 
@@ -179,16 +184,29 @@ def build_index(notes_dir) -> dict:
     return index
 
 
+# Re-validating the on-disk signature means stat-ing every note file, which is
+# slow over a large vault (esp. a Docker bind-mount). Within this window we trust
+# a warm cache and skip the re-stat entirely; API writes pass force=True.
+_INDEX_TTL_S = 10.0
+
+
 def get_index(notes_dir, force: bool = False) -> dict:
-    """Return the id->record index, rebuilding only when files changed (or force)."""
+    """Return the id->record index, rebuilding only when files changed (or force).
+
+    A warm cache is served without touching the filesystem for _INDEX_TTL_S
+    seconds; after that we re-check the cheap directory signature. External
+    edits therefore appear within the TTL; in-process writes force a refresh."""
     base = Path(notes_dir).resolve()
     key = str(base)
-    sig = _dir_signature(base)
     cached = _index_cache.get(key)
+    if not force and cached and (time.monotonic() - cached["checked"]) < _INDEX_TTL_S:
+        return cached["index"]
+    sig = _dir_signature(base)
     if not force and cached and cached["sig"] == sig:
+        cached["checked"] = time.monotonic()
         return cached["index"]
     index = build_index(base)
-    _index_cache[key] = {"sig": sig, "index": index}
+    _index_cache[key] = {"sig": sig, "index": index, "checked": time.monotonic()}
     return index
 
 
@@ -219,6 +237,7 @@ def create_note(notes_dir, title: str, folder: str = "", type: str = "note", bod
     directory.mkdir(parents=True, exist_ok=True)
     path = _unique_path(directory, slugify(title))
     _atomic_write(path, serialize_note(meta, body))
+    get_index(notes_dir, force=True)  # new file -> refresh cache so it's visible immediately
     return _record(notes_dir, path, meta, body)
 
 
@@ -283,15 +302,27 @@ def list_notes(notes_dir, *, folder=None, tag=None, type=None, q=None) -> list:
     return out
 
 
+_folders_cache: dict = {}  # notes_dir(str) -> {"at": monotonic, "folders": list}
+
+
 def list_folders(notes_dir) -> list:
-    """Distinct relative folder paths containing notes (excludes root and .trash)."""
+    """Distinct relative folder paths containing notes (excludes root and .trash).
+
+    Walking the vault is slow over a large notes dir, so the result is cached for
+    _INDEX_TTL_S seconds (new folders appear within the TTL)."""
     base = Path(notes_dir).resolve()
+    key = str(base)
+    cached = _folders_cache.get(key)
+    if cached and (time.monotonic() - cached["at"]) < _INDEX_TTL_S:
+        return cached["folders"]
     folders = set()
     for p in _iter_note_files(base):
         rel = p.parent.resolve().relative_to(base).as_posix()
         if rel and rel != ".":
             folders.add(rel)
-    return sorted(folders)
+    result = sorted(folders)
+    _folders_cache[key] = {"at": time.monotonic(), "folders": result}
+    return result
 
 
 def rename_note(notes_dir, note_id: str, *, title=None, folder=None) -> dict | None:

@@ -3910,8 +3910,13 @@ async def _tag_worker():
 @app.get("/api/notes")
 async def api_list_notes(folder: Optional[str] = None, tag: Optional[str] = None,
                          type: Optional[str] = None, q: Optional[str] = None):
-    return {"notes": notes_store.list_notes(
-        notes_store.NOTES_DIR, folder=folder, tag=tag, type=type, q=q)}
+    # Scanning the vault is blocking file IO; run it off the event loop so a
+    # large vault can't freeze the whole service.
+    def _do():
+        return notes_store.list_notes(
+            notes_store.NOTES_DIR, folder=folder, tag=tag, type=type, q=q)
+    notes = await asyncio.get_event_loop().run_in_executor(None, _do)
+    return {"notes": notes}
 
 
 @app.post("/api/notes")
@@ -3929,12 +3934,17 @@ async def api_create_note(payload: NoteCreate):
 
 @app.get("/api/notes/folders")
 async def api_list_folders():
-    return {"folders": notes_store.list_folders(notes_store.NOTES_DIR)}
+    # Walking the tree is blocking file IO; offload it off the event loop.
+    folders = await asyncio.get_event_loop().run_in_executor(
+        None, notes_store.list_folders, notes_store.NOTES_DIR)
+    return {"folders": folders}
 
 
 @app.post("/api/notes/rescan")
 async def api_rescan_notes():
-    idx = notes_store.get_index(notes_store.NOTES_DIR, force=True)
+    # Full re-index reads every note file; offload so it can't freeze the app.
+    idx = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: notes_store.get_index(notes_store.NOTES_DIR, force=True))
     return {"count": len(idx)}
 
 
