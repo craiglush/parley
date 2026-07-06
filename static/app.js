@@ -2946,6 +2946,42 @@ $('chatResetSystemPrompt').addEventListener('click', () => {
   }
 });
 
+// SMTP / email settings listeners
+function toggleSmtpFields() {
+  const fields = $('smtpFields');
+  if (fields) fields.classList.toggle('visible', $('smtpEnabled').checked);
+}
+$('smtpEnabled').addEventListener('change', () => { toggleSmtpFields(); markSettingsDirty(); });
+['smtpHost', 'smtpPort', 'smtpUsername', 'smtpPassword', 'smtpFromEmail',
+ 'smtpFromName', 'smtpReplyTo', 'smtpRecipients'].forEach(id => {
+  $(id).addEventListener('input', markSettingsDirty);
+});
+$('smtpSecure').addEventListener('change', markSettingsDirty);
+$('smtpTestBtn').addEventListener('click', async () => {
+  const status = $('smtpTestStatus');
+  if (settingsDirty) {
+    status.style.color = 'var(--yellow, #b8860b)';
+    status.textContent = 'Save your settings first, then send a test.';
+    return;
+  }
+  status.style.color = 'var(--text-secondary)';
+  status.textContent = 'Sending…';
+  try {
+    const resp = await fetch(`${API}/api/settings/test-email`, { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      status.style.color = 'var(--green, #2e7d32)';
+      status.textContent = data.detail || 'Test email sent.';
+    } else {
+      status.style.color = 'var(--red, #c62828)';
+      status.textContent = data.detail || 'Failed to send test email.';
+    }
+  } catch (err) {
+    status.style.color = 'var(--red, #c62828)';
+    status.textContent = 'Failed: ' + err.message;
+  }
+});
+
 // Per-prompt reset buttons
 document.querySelectorAll('.settings-reset-prompt-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -2987,6 +3023,18 @@ $('settingsSave').addEventListener('click', async () => {
       temperature: parseFloat($('chatTemp').value),
       max_context_chunks: parseInt($('chatMaxChunks').value) || 15,
       system_prompt: $('chatSystemPrompt').value,
+    },
+    smtp: {
+      enabled: $('smtpEnabled').checked,
+      host: $('smtpHost').value.trim(),
+      port: parseInt($('smtpPort').value) || 587,
+      secure: $('smtpSecure').checked,
+      username: $('smtpUsername').value.trim(),
+      password: $('smtpPassword').value,
+      from_email: $('smtpFromEmail').value.trim(),
+      from_name: $('smtpFromName').value.trim(),
+      reply_to: $('smtpReplyTo').value.trim(),
+      recipients: $('smtpRecipients').value.trim(),
     },
   };
   for (const [key, ta] of Object.entries(promptFields)) {
@@ -3050,6 +3098,21 @@ function populateSettingsForm(settings, defaults) {
   $('chatMaxChunks').value = chat.max_context_chunks || 15;
   $('chatSystemPrompt').value = chat.system_prompt || '';
   toggleChatCustomFields();
+
+  // SMTP / email settings
+  const smtp = settings.smtp || {};
+  $('smtpEnabled').checked = smtp.enabled === true;
+  $('smtpHost').value = smtp.host || '';
+  $('smtpPort').value = smtp.port || 587;
+  $('smtpSecure').checked = smtp.secure === true;
+  $('smtpUsername').value = smtp.username || '';
+  $('smtpPassword').value = smtp.password || '';
+  $('smtpFromEmail').value = smtp.from_email || '';
+  $('smtpFromName').value = smtp.from_name || 'Meeting Service';
+  $('smtpReplyTo').value = smtp.reply_to || '';
+  $('smtpRecipients').value = smtp.recipients || '';
+  $('smtpTestStatus').textContent = '';
+  toggleSmtpFields();
 }
 
 function closeSettings() {

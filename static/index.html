@@ -739,6 +739,73 @@
         </div>
       </div>
 
+      <!-- Email Notifications (SMTP) -->
+      <div class="settings-section">
+        <div class="settings-section-title">Email Notifications (SMTP)</div>
+        <div class="settings-section-desc">
+          Automatically email a meeting summary (overview, participants, action items, dates)
+          to a recipient list when a meeting finishes processing.
+        </div>
+        <div style="margin-top:8px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="smtpEnabled">
+            Email a summary automatically after each meeting
+          </label>
+        </div>
+        <div id="smtpFields" class="chat-settings-conditional">
+          <div class="settings-model-row" style="margin-top:8px">
+            <div class="field" style="flex:2">
+              <label for="smtpHost">SMTP Host</label>
+              <input type="text" id="smtpHost" placeholder="smtp.office365.com">
+            </div>
+            <div class="field" style="flex:1">
+              <label for="smtpPort">Port</label>
+              <input type="number" id="smtpPort" min="1" max="65535" value="587" style="width:100%;padding:4px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-input);color:var(--text-primary);">
+            </div>
+          </div>
+          <div style="margin-top:8px">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+              <input type="checkbox" id="smtpSecure">
+              Use implicit TLS (SSL, port 465). Leave off for STARTTLS (port 587).
+            </label>
+          </div>
+          <div class="settings-model-row" style="margin-top:8px">
+            <div class="field">
+              <label for="smtpUsername">Username</label>
+              <input type="text" id="smtpUsername" placeholder="user@example.com" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="smtpPassword">Password</label>
+              <input type="password" id="smtpPassword" placeholder="••••••••" autocomplete="new-password">
+            </div>
+          </div>
+          <div class="settings-model-row" style="margin-top:8px">
+            <div class="field">
+              <label for="smtpFromEmail">From Address</label>
+              <input type="text" id="smtpFromEmail" placeholder="meetings@example.com">
+            </div>
+            <div class="field">
+              <label for="smtpFromName">From Name</label>
+              <input type="text" id="smtpFromName" placeholder="Meeting Service">
+            </div>
+          </div>
+          <div class="settings-model-row" style="margin-top:8px">
+            <div class="field">
+              <label for="smtpReplyTo">Reply-To (optional)</label>
+              <input type="text" id="smtpReplyTo" placeholder="you@example.com">
+            </div>
+            <div class="field" style="flex:2">
+              <label for="smtpRecipients">Recipients</label>
+              <input type="text" id="smtpRecipients" placeholder="alice@example.com, bob@example.com">
+            </div>
+          </div>
+          <div style="margin-top:12px;display:flex;align-items:center;gap:12px;">
+            <button type="button" class="settings-reset-prompt-btn" id="smtpTestBtn">Send test email</button>
+            <span id="smtpTestStatus" style="font-size:13px;color:var(--text-secondary);"></span>
+          </div>
+        </div>
+      </div>
+
     </div>
     <div class="settings-footer">
       <button class="settings-reset-all-btn" id="settingsResetAll">Reset All to Defaults</button>

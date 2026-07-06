@@ -48,6 +48,7 @@ import vector
 import notes_store
 import notes_vectors
 import tasks_store
+import emailer
 # Phase-4 modularization: pure LLM helpers live in llm.py. Re-bound here so
 # existing app.py references (and tests that do `app._strip_think`) still work.
 from llm import (
@@ -123,64 +124,102 @@ RELATED_MIN_SCORE = 0.30
 
 DEFAULT_PROMPTS = {
     "cleanup_system": (
-        "You are a transcript editor. Clean up the following speech-to-text segments.\n"
+        "You are a professional transcription editor. You are given raw speech-to-text\n"
+        "segments from a meeting, one per line, each prefixed with its index like [0], [1], [2].\n"
         "\n"
-        "Rules:\n"
-        "- Fix misheard words, acronyms, technical terms, grammar, and proper nouns.\n"
-        "- Do NOT change the meaning, merge segments, or split segments.\n"
-        "- Return EXACTLY the same number of lines as segments to clean.\n"
+        "Correct transcription errors WITHOUT changing meaning:\n"
+        "- Fix misheard words, homophones, run-together words, punctuation, capitalization, and grammar.\n"
+        "- Correct proper nouns, people's names, company and product names, and technical\n"
+        "  terms/acronyms using context from the surrounding conversation.\n"
+        "- Keep the speaker's own wording, tone, and intent. Do NOT paraphrase, translate,\n"
+        "  summarize, censor, add, remove, merge, or split segments.\n"
+        "- Leave filler as-is unless it is clearly a recognition error.\n"
+        "\n"
+        "Output rules (critical):\n"
+        "- Return EXACTLY one line per input segment, in the same order.\n"
+        "- Keep each segment's original [index] prefix.\n"
         "- Use the format: [0] corrected text"
     ),
     "speaker_id": (
         "You are analyzing a meeting transcript to identify who each speaker is.\n"
         "\n"
-        "The transcript uses generic labels: {speaker_list}\n"
+        "The transcript uses generic diarization labels: {speaker_list}\n"
         "\n"
-        "Look for clues in the conversation such as:\n"
-        "- Self-introductions: \"Hi, I'm Alex\" or \"This is Sarah from Acme Corp\"\n"
-        "- Others addressing a speaker by name: \"Alex, what do you think?\" (the next speaker or the one being addressed is Alex)\n"
-        "- Role/title mentions: \"As the project manager...\" or \"Speaking as CTO...\"\n"
-        "- Company mentions: \"We at Acme Corp...\" or \"On behalf of TechStart...\"\n"
-        "- Email signatures or references: \"I'll send it from alex@example.com\"\n"
+        "Work only from evidence in the transcript. Look for clues such as:\n"
+        "- Self-introductions: \"Hi, I'm Craig\" or \"This is Sarah from Acme Corp\".\n"
+        "- People being addressed by name: \"Craig, what do you think?\" (the person who\n"
+        "  answers, or the one being addressed, is likely Craig).\n"
+        "- Role or title mentions: \"As the project manager...\", \"Speaking as CTO...\".\n"
+        "- Company or team mentions: \"We at Acme Corp...\", \"On behalf of TechStart...\".\n"
+        "- Email addresses, signatures, or handles: \"I'll send it from craig@acme.com\".\n"
+        "\n"
+        "Do NOT guess. Only assign a name when the transcript gives real evidence for it.\n"
+        "Prefer a full name when available; capture role/title and company when stated.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
         "\n"
-        "Respond ONLY with valid JSON (no markdown fences). For each speaker where you can identify at least a name, include an entry. Skip speakers you cannot identify.\n"
+        "Respond ONLY with valid JSON (no markdown fences, no commentary). Include an entry\n"
+        "for each speaker you can identify by at least a name; omit speakers you cannot identify.\n"
         "\n"
         "{json_example}"
     ),
     "analysis_pass_a": (
-        "You are a meeting analyst. Read this meeting transcript and extract the title, a concise summary, and the main topics discussed.\n"
+        "You are a meeting analyst. Read the transcript and produce a title, a concise\n"
+        "overview, and the main topics discussed. Base everything strictly on what is in the\n"
+        "transcript — do not invent details.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
+        "\n"
+        "Guidance:\n"
+        "- title: a short, specific, descriptive meeting title (not a generic label).\n"
+        "- summary: 2-3 sentences capturing the purpose and the most important outcomes.\n"
+        "- topics: the distinct subjects actually discussed; for each, a brief summary of the\n"
+        "  discussion and the outcome or next step (use \"\" for outcome if none was reached).\n"
         "\n"
         "Respond ONLY with valid JSON, no other text:\n"
         "{\n"
         '  "title": "Short descriptive meeting title",\n'
         '  "summary": "2-3 sentence overview of the meeting",\n'
         '  "topics": [\n'
-        '    {"topic": "Topic name", "summary": "Brief summary of discussion", "outcome": "What was concluded or next step"}\n'
+        '    {"topic": "Topic name", "summary": "Brief summary of discussion", "outcome": "What was concluded or the next step"}\n'
         "  ]\n"
         "}"
     ),
     "analysis_pass_b": (
-        "You are a meeting analyst. Read this meeting transcript and extract every action item, task, or commitment made.\n"
+        "You are a meeting analyst. Extract every action item, task, or commitment that was\n"
+        "made in the meeting. Include only real commitments to do something — not general\n"
+        "discussion, opinions, or ideas that were rejected.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
+        "\n"
+        "Guidance:\n"
+        "- task: what needs to be done, phrased as a clear action.\n"
+        "- who: the person responsible; use \"UNKNOWN\" if the transcript does not say.\n"
+        "- deadline: any due date or timeframe mentioned; use \"\" if none.\n"
+        "- priority: \"high\", \"medium\", or \"low\" based on urgency and emphasis.\n"
+        "If there are no action items, return an empty array [].\n"
         "\n"
         "Respond ONLY with a valid JSON array, no other text:\n"
         "[\n"
-        '  {"task": "What needs to be done", "who": "Person responsible or UNKNOWN", "deadline": "Deadline if mentioned or null", "priority": "high/medium/low"}\n'
+        '  {"task": "What needs to be done", "who": "Person responsible or UNKNOWN", "deadline": "Deadline if mentioned or empty", "priority": "high/medium/low"}\n'
         "]"
     ),
     "analysis_pass_c": (
-        "You are a meeting analyst. Read this meeting transcript and extract all decisions that were made and any open questions that remain unanswered.\n"
+        "You are a meeting analyst. Extract the decisions that were actually made and the\n"
+        "questions that were raised but left unanswered. Ground every item in the transcript.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
+        "\n"
+        "Guidance:\n"
+        "- decisions: concrete conclusions the group committed to; include brief context for why.\n"
+        "- open_questions: questions that were asked but not resolved; set \"answered\" to false\n"
+        "  if left open, true if it was later answered in the meeting. Use \"UNKNOWN\" when the\n"
+        "  asker is unclear.\n"
+        "Return empty arrays if there were no decisions or no open questions.\n"
         "\n"
         "Respond ONLY with valid JSON, no other text:\n"
         "{\n"
@@ -193,10 +232,18 @@ DEFAULT_PROMPTS = {
         "}"
     ),
     "analysis_pass_d": (
-        "You are a meeting analyst. Read this meeting transcript and identify any concerns, risks, objections, or hesitations raised by participants.\n"
+        "You are a meeting analyst. Identify concerns, risks, objections, blockers, or\n"
+        "hesitations raised by participants. Capture the substance, not passing remarks.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
+        "\n"
+        "Guidance:\n"
+        "- concern: what the concern, risk, or objection is.\n"
+        "- raised_by: who raised it; use \"UNKNOWN\" if unclear.\n"
+        "- resolved: true if it was addressed or resolved during the meeting, otherwise false.\n"
+        "- notes: any resolution, mitigation, or follow-up discussed; use \"\" if none.\n"
+        "If no concerns were raised, return an empty array [].\n"
         "\n"
         "Respond ONLY with a valid JSON array, no other text:\n"
         "[\n"
@@ -204,10 +251,18 @@ DEFAULT_PROMPTS = {
         "]"
     ),
     "analysis_pass_e": (
-        "You are a meeting analyst. Read this meeting transcript and extract any specific numbers, dates, costs, metrics, deadlines, or quantitative data mentioned.\n"
+        "You are a meeting analyst. Extract specific quantitative facts mentioned in the\n"
+        "meeting: numbers, dates, costs, budgets, metrics, percentages, quantities, and\n"
+        "deadlines. Only include figures that actually appear in the transcript.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
+        "\n"
+        "Guidance:\n"
+        "- figure: the number, date, amount, or metric exactly as stated.\n"
+        "- context: what it refers to or why it matters.\n"
+        "- said_by: who mentioned it; use \"UNKNOWN\" if unclear.\n"
+        "If no specific figures were mentioned, return an empty array [].\n"
         "\n"
         "Respond ONLY with a valid JSON array, no other text:\n"
         "[\n"
@@ -215,10 +270,17 @@ DEFAULT_PROMPTS = {
         "]"
     ),
     "analysis_pass_f": (
-        "Read this meeting transcript and describe the overall sentiment and emotional tone.\n"
+        "You are a meeting analyst. Assess the overall sentiment and emotional tone of the\n"
+        "meeting based on how participants spoke and reacted.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
+        "\n"
+        "Guidance:\n"
+        "- overall: one of \"positive\", \"neutral\", \"negative\", or \"mixed\".\n"
+        "- notable_moments: specific moments that stood out emotionally (agreement, tension,\n"
+        "  frustration, humour, excitement), each with a short tone label. Use an empty array\n"
+        "  if nothing notable stood out.\n"
         "\n"
         "Respond ONLY with valid JSON, no other text:\n"
         "{\n"
@@ -229,10 +291,16 @@ DEFAULT_PROMPTS = {
         "}"
     ),
     "analysis_pass_g": (
-        "You are a meeting analyst. Read this meeting transcript and summary, then extract tags for categorization.\n"
+        "You are a meeting analyst. Read the transcript and produce categorization tags and\n"
+        "the key entities mentioned. Only include entities that actually appear in the transcript.\n"
         "\n"
         "TRANSCRIPT:\n"
         "{transcript}\n"
+        "\n"
+        "Guidance:\n"
+        "- category: choose the single best-fitting type of meeting from the list below.\n"
+        "- keywords: 3-5 short, specific tags describing what the meeting was about.\n"
+        "- entities: real names grouped by type; use empty arrays for types with no matches.\n"
         "\n"
         "Respond ONLY with valid JSON, no other text:\n"
         "{\n"
@@ -248,7 +316,10 @@ DEFAULT_PROMPTS = {
         "}"
     ),
     "chunk_summary": (
-        "Summarize this portion (segment {chunk_index}/{chunk_total}) of a meeting transcript in 3-5 bullet points:\n"
+        "This is one portion (segment {chunk_index} of {chunk_total}) of a long meeting\n"
+        "transcript. Summarize what happens in THIS portion as 3-5 concise bullet points,\n"
+        "capturing key discussion, decisions, and action items. Base it only on the text\n"
+        "below; do not speculate about other portions.\n"
         "\n"
         "{chunk}"
     ),
@@ -403,6 +474,18 @@ DEFAULT_SETTINGS = {
         "temperature": 0.5,
         "max_context_chunks": 15,
     },
+    "smtp": {
+        "enabled": False,
+        "host": os.getenv("SMTP_HOST", ""),
+        "port": int(os.getenv("SMTP_PORT", "587") or "587"),
+        "secure": os.getenv("SMTP_SECURE", "").lower() == "true",  # True = implicit TLS (465)
+        "username": os.getenv("SMTP_USER", ""),
+        "password": os.getenv("SMTP_PASSWORD", ""),
+        "from_email": os.getenv("EMAIL_FROM", ""),
+        "from_name": os.getenv("EMAIL_FROM_NAME", "Meeting Service"),
+        "reply_to": os.getenv("EMAIL_REPLY_TO", ""),
+        "recipients": os.getenv("EMAIL_RECIPIENTS", ""),  # comma-separated
+    },
 }
 
 
@@ -412,11 +495,14 @@ def load_settings() -> dict:
     if SETTINGS_PATH.exists():
         try:
             saved = json.loads(SETTINGS_PATH.read_text())
-            # Merge prompts (keep saved values, fill missing with defaults)
+            # Merge prompts (keep saved values, fill missing with defaults).
+            # A blank saved value falls back to the built-in default so the analysis
+            # pipeline (and the settings UI) never run on an empty prompt.
             if "prompts" in saved and isinstance(saved["prompts"], dict):
                 for key in DEFAULT_PROMPTS:
-                    if key in saved["prompts"]:
-                        settings["prompts"][key] = saved["prompts"][key]
+                    val = saved["prompts"].get(key)
+                    if isinstance(val, str) and val.strip():
+                        settings["prompts"][key] = val
             if "ollama_model" in saved:
                 settings["ollama_model"] = saved["ollama_model"]
             if "temperature" in saved:
@@ -424,8 +510,19 @@ def load_settings() -> dict:
             # Merge chat settings
             if "chat" in saved and isinstance(saved["chat"], dict):
                 for key in DEFAULT_SETTINGS["chat"]:
-                    if key in saved["chat"]:
-                        settings["chat"][key] = saved["chat"][key]
+                    if key not in saved["chat"]:
+                        continue
+                    val = saved["chat"][key]
+                    # A blank system prompt falls back to the built-in default;
+                    # other chat fields may legitimately be empty.
+                    if key == "system_prompt" and isinstance(val, str) and not val.strip():
+                        continue
+                    settings["chat"][key] = val
+            # Merge SMTP settings
+            if "smtp" in saved and isinstance(saved["smtp"], dict):
+                for key in DEFAULT_SETTINGS["smtp"]:
+                    if key in saved["smtp"]:
+                        settings["smtp"][key] = saved["smtp"][key]
         except Exception as e:
             logger.warning(f"Failed to load settings: {e}")
     return settings
@@ -1766,6 +1863,12 @@ async def process_meeting(meeting_id: str):
         except Exception as e:
             logger.warning(f"[{meeting_id}] Auto-linking failed (non-fatal): {e}")
 
+        # Email the summary if SMTP is enabled (non-fatal)
+        try:
+            await _maybe_send_summary_email(meeting_id, meeting, summary)
+        except Exception as e:
+            logger.warning(f"[{meeting_id}] Summary email failed (non-fatal): {e}")
+
     except Exception as e:
         meeting["status"] = MeetingStatus.error
         meeting["error"] = str(e)
@@ -1773,6 +1876,26 @@ async def process_meeting(meeting_id: str):
         logger.error(f"[{meeting_id}] Processing failed: {e}")
         _save_index()
         raise
+
+
+async def _maybe_send_summary_email(meeting_id: str, meeting: dict, summary: dict):
+    """Email the meeting summary if SMTP is enabled and recipients are configured (best-effort)."""
+    smtp = load_settings().get("smtp", {})
+    if not smtp.get("enabled"):
+        return
+    recipients = emailer.parse_recipients(smtp.get("recipients"))
+    if not smtp.get("host") or not recipients:
+        logger.info(f"[{meeting_id}] Summary email skipped: SMTP host or recipients not configured")
+        return
+
+    text_body = build_summary_markdown(summary, meeting)
+    subject, html_body, text_body = emailer.render_summary_email(
+        meeting, summary, meeting.get("speaker_info", {}), text_body=text_body
+    )
+    await asyncio.get_event_loop().run_in_executor(
+        None, emailer.send_email, smtp, recipients, subject, html_body, text_body
+    )
+    logger.info(f"[{meeting_id}] Summary email sent to {', '.join(recipients)}")
 
 
 async def _upload_to_openwebui(meeting_id: str, summary_md: str, meeting: dict):
@@ -3702,11 +3825,25 @@ class ChatSettingsRequest(BaseModel):
     max_context_chunks: Optional[int] = None
 
 
+class SmtpSettingsRequest(BaseModel):
+    enabled: Optional[bool] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    secure: Optional[bool] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    from_email: Optional[str] = None
+    from_name: Optional[str] = None
+    reply_to: Optional[str] = None
+    recipients: Optional[str] = None
+
+
 class SettingsRequest(BaseModel):
     prompts: Optional[dict[str, str]] = None
     ollama_model: Optional[str] = None
     temperature: Optional[float] = None
     chat: Optional[ChatSettingsRequest] = None
+    smtp: Optional[SmtpSettingsRequest] = None
 
 
 @app.get("/api/settings")
@@ -3753,6 +3890,29 @@ async def update_settings(body: SettingsRequest):
         if body.chat.max_context_chunks is not None:
             chat["max_context_chunks"] = max(1, min(50, body.chat.max_context_chunks))
 
+    if body.smtp is not None:
+        smtp = settings.setdefault("smtp", json.loads(json.dumps(DEFAULT_SETTINGS["smtp"])))
+        if body.smtp.enabled is not None:
+            smtp["enabled"] = bool(body.smtp.enabled)
+        if body.smtp.host is not None:
+            smtp["host"] = body.smtp.host.strip()
+        if body.smtp.port is not None:
+            smtp["port"] = max(1, min(65535, int(body.smtp.port)))
+        if body.smtp.secure is not None:
+            smtp["secure"] = bool(body.smtp.secure)
+        if body.smtp.username is not None:
+            smtp["username"] = body.smtp.username.strip()
+        if body.smtp.password is not None:
+            smtp["password"] = body.smtp.password
+        if body.smtp.from_email is not None:
+            smtp["from_email"] = body.smtp.from_email.strip()
+        if body.smtp.from_name is not None:
+            smtp["from_name"] = body.smtp.from_name.strip()
+        if body.smtp.reply_to is not None:
+            smtp["reply_to"] = body.smtp.reply_to.strip()
+        if body.smtp.recipients is not None:
+            smtp["recipients"] = body.smtp.recipients.strip()
+
     save_settings(settings)
     return {"detail": "Settings updated", "settings": settings}
 
@@ -3763,6 +3923,38 @@ async def reset_settings():
     settings = json.loads(json.dumps(DEFAULT_SETTINGS))
     save_settings(settings)
     return {"detail": "Settings reset to defaults", "settings": settings}
+
+
+@app.post("/api/settings/test-email")
+async def test_email():
+    """Send a test email using the currently-saved SMTP config, to the saved recipients."""
+    smtp = load_settings().get("smtp", {})
+    recipients = emailer.parse_recipients(smtp.get("recipients"))
+    if not smtp.get("host"):
+        raise HTTPException(status_code=400, detail="SMTP host is not configured")
+    if not recipients:
+        raise HTTPException(status_code=400, detail="No recipients configured")
+
+    subject = "Meeting Service — test email"
+    html_body = (
+        '<div style="font-family:Arial,sans-serif;font-size:15px;color:#1a1a1a;">'
+        "<p>This is a test email from your Meeting Service.</p>"
+        "<p>If you received it, SMTP is configured correctly and meeting summaries "
+        "will be delivered here automatically.</p></div>"
+    )
+    text_body = (
+        "This is a test email from your Meeting Service.\n\n"
+        "If you received it, SMTP is configured correctly and meeting summaries "
+        "will be delivered here automatically."
+    )
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, emailer.send_email, smtp, recipients, subject, html_body, text_body
+        )
+    except Exception as e:
+        logger.warning(f"Test email failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Send failed: {e}")
+    return {"detail": f"Test email sent to {', '.join(recipients)}"}
 
 
 # ---------------------------------------------------------------------------
