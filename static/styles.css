@@ -2400,57 +2400,58 @@ body {
   }
 }
 
-/* --- Unsaved recording recovery banner --- */
-.recovery-banner {
-  margin: 12px 20px 0;
-  padding: 0;
-  border-radius: var(--radius);
-  background: var(--yellow-dim);
-  border: 1px solid rgba(212, 160, 57, 0.3);
-  overflow: hidden;
-}
-.recovery-banner-body {
+/* --- Unsaved-recording recovery banner (lists every autosaved session) --- */
+.capture-recovery {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   gap: 10px;
+  margin: 12px 20px 0;
   padding: 12px 16px;
-  flex-wrap: wrap;
+  border: 1px solid rgba(212, 160, 57, 0.3);
+  background: var(--yellow-dim);
+  border-radius: var(--radius);
+  font-size: 13px;
 }
-.recovery-banner-icon {
-  font-size: 18px;
-  flex-shrink: 0;
-}
-.recovery-banner-text {
-  flex: 1;
-  font-size: 14px;
-  color: var(--text-primary);
-  min-width: 160px;
-}
-.recovery-banner-load,
-.recovery-banner-dismiss {
+.cap-recovery-heading { font-weight: 700; color: var(--text-primary); }
+.cap-recovery-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cap-recovery-msg { color: var(--text-primary); font-weight: 500; flex: 1 1 auto; min-width: 160px; }
+.cap-recovery-btn {
   font-family: var(--font-ui);
+  padding: 6px 14px;
+  border: none;
+  background: var(--accent);
+  color: #000;
+  border-radius: var(--radius-sm);
   font-size: 13px;
   font-weight: 500;
-  border-radius: var(--radius-sm);
   cursor: pointer;
-  padding: 6px 14px;
   white-space: nowrap;
   transition: background .15s ease;
 }
-.recovery-banner-load {
-  background: var(--accent);
-  color: #000;
-  border: none;
-}
-.recovery-banner-load:hover {
-  background: var(--accent-hover);
-}
-.recovery-banner-dismiss {
+.cap-recovery-btn:hover { background: var(--accent-hover); }
+.cap-recovery-discard {
   background: transparent;
-  border: 1px solid var(--border-light);
   color: var(--text-secondary);
+  border: 1px solid var(--border-light);
 }
-.recovery-banner-dismiss:hover {
-  background: var(--bg-hover);
+.cap-recovery-discard:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/* Trim modal */
+.trim-panel { max-width: 500px; }
+.trim-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.trim-hint { font-size: 12px; color: var(--text-muted); margin: 0; line-height: 1.5; }
+.trim-row { display: flex; align-items: center; gap: 8px; }
+.trim-row label { width: 42px; flex: 0 0 auto; font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+.trim-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
   color: var(--text-primary);
+  font-size: 13px;
 }
+.trim-error { color: var(--red); font-size: 12px; }
+.trim-actions { display: flex; justify-content: flex-end; }

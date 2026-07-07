@@ -17,9 +17,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
-<link rel="stylesheet" href="/static/notes-tasks.css?v=10">
-<script defer src="/static/vendor/codemirror.bundle.js?v=10"></script>
-<script defer src="/static/notes-tasks.js?v=10"></script>
+<link rel="stylesheet" href="/static/notes-tasks.css?v=11">
+<script defer src="/static/vendor/codemirror.bundle.js?v=11"></script>
+<script defer src="/static/notes-tasks.js?v=11"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -49,7 +49,7 @@
     }
   });
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=10">
+<link rel="stylesheet" href="/static/styles.css?v=11">
 </head>
 <body>
 
@@ -123,15 +123,8 @@
     <div class="loopback-active-indicator" id="loopbackActiveIndicator" style="display:none"></div>
   </div>
 
-  <!-- Recovery banner (hidden by default, shown on page load if unsaved recording found) -->
-  <div class="recovery-banner" id="recoveryBanner" hidden>
-    <div class="recovery-banner-body">
-      <span class="recovery-banner-icon">&#9888;</span>
-      <span class="recovery-banner-text">Unsaved recording found from your last session.</span>
-      <button class="recovery-banner-load" id="recoveryLoadBtn">Load &amp; upload</button>
-      <button class="recovery-banner-dismiss" id="recoveryDismissBtn">Dismiss</button>
-    </div>
-  </div>
+  <!-- Recovery banner (hidden by default; lists every autosaved recording found on load) -->
+  <div class="capture-recovery" id="captureRecovery" style="display:none"></div>
 
   <!-- Live no-audio / silent-capture warning -->
   <div class="capture-warning" id="captureWarning" style="display:none"></div>
@@ -534,6 +527,37 @@
   </div>
 </div>
 
+<!-- Trim Audio Modal -->
+<div class="link-picker-overlay" id="trimOverlay">
+  <div class="link-picker-panel trim-panel">
+    <div class="link-picker-header">
+      <h3>Trim Audio &rarr; New Meeting</h3>
+      <button class="close-btn" onclick="closeTrimModal()">&times;</button>
+    </div>
+    <div class="trim-body">
+      <p class="trim-hint">Cuts the span below out of this meeting's audio and saves it as a <strong>new meeting</strong> (transcribed and summarized as usual). The original meeting is untouched. Times are h:mm:ss &mdash; pause the player where you want a cut and hit "Use player position".</p>
+      <div class="trim-row">
+        <label for="trimStart">Start</label>
+        <input type="text" id="trimStart" placeholder="0:00:00">
+        <button class="action-btn" id="trimStartFromPlayer" type="button">Use player position</button>
+      </div>
+      <div class="trim-row">
+        <label for="trimEnd">End</label>
+        <input type="text" id="trimEnd" placeholder="0:00:00">
+        <button class="action-btn" id="trimEndFromPlayer" type="button">Use player position</button>
+      </div>
+      <div class="trim-row">
+        <label for="trimTitle">Title</label>
+        <input type="text" id="trimTitle" placeholder="Optional — defaults to the original title + (trimmed)">
+      </div>
+      <div class="trim-error" id="trimError" style="display:none"></div>
+      <div class="trim-actions">
+        <button class="cap-recovery-btn" id="trimSubmitBtn" type="button">Trim &amp; create meeting</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- Settings Overlay -->
 <div class="settings-overlay" id="settingsOverlay">
   <div class="settings-panel">
@@ -816,7 +840,7 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=10"></script>
+<script src="/static/app.js?v=11"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js');
@@ -865,7 +889,7 @@ if ('serviceWorker' in navigator) {
   </div>
 </div>
 
-<script src="/static/floating-chat.js?v=10"></script>
+<script src="/static/floating-chat.js?v=11"></script>
 
 </body>
 </html>

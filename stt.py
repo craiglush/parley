@@ -58,17 +58,10 @@ async def _retry_whisperx_call(
     raise last_exc
 
 
-def preprocess_audio(input_path: str, output_path: str) -> float:
-    """Convert any audio/video to 16 kHz mono WAV. Returns duration in seconds."""
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
-        output_path,
-    ]
-    subprocess.run(cmd, capture_output=True, check=True, timeout=900)
-    # Get duration
+def probe_duration(path: str) -> float:
+    """Return an audio file's duration in seconds (0.0 if undeterminable)."""
     probe = subprocess.run(
-        ["ffmpeg", "-i", output_path, "-f", "null", "-"],
+        ["ffmpeg", "-i", path, "-f", "null", "-"],
         capture_output=True, text=True, timeout=900,
     )
     duration = 0.0
@@ -79,6 +72,27 @@ def preprocess_audio(input_path: str, output_path: str) -> float:
                 h, m, s, ms = match.groups()
                 duration = int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 100
     return duration
+
+
+def preprocess_audio(input_path: str, output_path: str) -> float:
+    """Convert any audio/video to 16 kHz mono WAV. Returns duration in seconds."""
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
+        output_path,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True, timeout=900)
+    return probe_duration(output_path)
+
+
+def trim_audio(input_path: str, output_path: str, start: float, end: float) -> None:
+    """Cut [start, end] out of an audio file without re-encoding (stream copy)."""
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-ss", str(start), "-to", str(end),
+        "-c", "copy", output_path,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True, timeout=900)
 
 
 def split_audio(wav_path: str, duration: float) -> list[dict]:

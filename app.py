@@ -65,7 +65,9 @@ from llm import (
 from stt import (
     _retry_whisperx_call,
     preprocess_audio,
+    probe_duration,
     split_audio,
+    trim_audio,
     merge_chunk_segments,
     step_transcribe,
 )
@@ -3626,6 +3628,81 @@ async def retry_meeting(meeting_id: str):
     m["_task"] = task
 
     return {"detail": f"Meeting {meeting_id} queued for retry", "status": "queued"}
+
+
+class TrimRequest(BaseModel):
+    start: float
+    end: float
+    title: Optional[str] = None
+
+
+@app.post("/meetings/{meeting_id}/trim")
+async def trim_meeting(meeting_id: str, body: TrimRequest):
+    """Cut a time span out of a meeting's audio and process it as a NEW meeting.
+
+    The source meeting is left untouched; the trimmed copy goes through the
+    normal upload -> process pipeline (transcription, summary, tags).
+    """
+    if meeting_id not in meetings:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    m = meetings[meeting_id]
+
+    out_dir = m.get("output_dir")
+    audio_files = list(Path(out_dir).glob("audio.*")) if out_dir else []
+    if not audio_files:
+        raise HTTPException(status_code=404, detail="No stored audio for this meeting")
+    src = audio_files[0]
+
+    start = max(0.0, float(body.start))
+    end = float(body.end)
+    duration = await asyncio.to_thread(probe_duration, str(src))
+    if duration > 0:
+        end = min(end, duration)
+        if start >= duration:
+            raise HTTPException(status_code=400, detail="Start is beyond the end of the audio")
+    if end - start < 1.0:
+        raise HTTPException(status_code=400, detail="Trimmed span must be at least 1 second")
+
+    new_id = str(uuid.uuid4())[:8]
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    suffix = src.suffix.lower()
+    MEETINGS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = str(MEETINGS_DIR / f"_upload_{new_id}{suffix}")
+    try:
+        await asyncio.to_thread(trim_audio, str(src), tmp_path, start, end)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace")[-400:] if e.stderr else ""
+        logger.error(f"[{meeting_id}] Trim failed: {stderr}")
+        raise HTTPException(status_code=500, detail="ffmpeg failed to trim the audio")
+
+    title = (body.title or "").strip() or f"{m.get('title', 'Meeting')} (trimmed)"
+    meeting = {
+        "id": new_id,
+        "date": date_str,
+        "title": title,
+        "status": MeetingStatus.queued,
+        "original_path": tmp_path,
+        "original_filename": f"{src.stem}_trim{suffix}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "min_speakers": m.get("min_speakers"),
+        "max_speakers": m.get("max_speakers"),
+        "meeting_context": m.get("meeting_context"),
+        "trimmed_from": {"meeting_id": meeting_id, "start": start, "end": end},
+        "progress_percent": 0,
+        "progress_detail": "Queued",
+    }
+    meetings[new_id] = meeting
+    _save_index()
+
+    logger.info(f"[{new_id}] Trimmed from [{meeting_id}]: {start:.1f}s-{end:.1f}s of {src.name}")
+
+    task = asyncio.create_task(process_meeting(new_id))
+    meeting["_task"] = task
+
+    return JSONResponse(
+        content={"meeting_id": new_id, "status": "queued", "title": title},
+        status_code=202,
+    )
 
 
 class ReprocessRequest(BaseModel):

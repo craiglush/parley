@@ -57,60 +57,191 @@ let noAudioWarned = false;    // whether the no-audio warning is currently shown
 let stagedFromRecording = false;
 let stagedSilent = false;
 
-// --- IndexedDB Recording Backup ---
-const DB_NAME = 'meeting-service';
-const DB_VERSION = 1;
-const STORE_NAME = 'unsaved-recordings';
+// ---------------------------------------------------------------------------
+// Capture store (IndexedDB) — autosave the in-progress recording so it survives
+// navigating away, switching functions, reload, or a crash. v2: every recording
+// gets its OWN session — starting a new recording never wipes a previous one,
+// and chunks persist every second (not just on stop). A session is removed only
+// after its successful upload, an explicit confirmed discard, or a 14-day
+// expiry sweep. No backend involvement.
+// ---------------------------------------------------------------------------
+const CAP_DB = 'meeting-capture';
+const CAP_VERSION = 2;
+const CAP_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+let capDbPromise = null;
 
-function _openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
-      }
+function capOpenDB() {
+  if (capDbPromise) return capDbPromise;
+  capDbPromise = new Promise((resolve, reject) => {
+    let req;
+    try { req = indexedDB.open(CAP_DB, CAP_VERSION); }
+    catch (e) { reject(e); return; }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'k' });
+      if (!db.objectStoreNames.contains('chunks')) db.createObjectStore('chunks', { keyPath: ['sid', 'seq'] });
     };
-    req.onsuccess = () => resolve(req.result);
+    req.onblocked = () => console.warn('meeting-capture upgrade blocked — close other tabs of this app so autosave can migrate');
+    req.onsuccess = () => {
+      const db = req.result;
+      // Release our connection if another tab needs to upgrade the schema,
+      // so that tab's autosave isn't silently blocked. Next use reopens.
+      db.onversionchange = () => { try { db.close(); } catch (_) {} capDbPromise = null; };
+      resolve(db);
+    };
     req.onerror = () => reject(req.error);
+  });
+  return capDbPromise;
+}
+
+function capTx(db, mode, stores, fn) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(stores, mode);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+    fn(tx);
   });
 }
 
-async function _saveRecordingBackup(blob, fileName, mimeType) {
-  try {
-    const db = await _openDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    store.put({ id: 'current', blob, fileName, mimeType, createdAt: Date.now(), duration: recordTimer.textContent });
-    await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); });
-    db.close();
-  } catch (e) { console.warn('IndexedDB save failed (non-fatal):', e); }
+let capSeq = 0;
+// Session this tab's recorder is currently writing (null when not recording).
+let capSessionId = null;
+// Session backing the staged/recovered file in the upload box (null when the
+// staged file came from disk instead of the recorder/recovery).
+let stagedSessionId = null;
+
+// All chunk keys for one session: [sid] <= key <= [sid, <anything>].
+function capSessionRange(sid) {
+  return IDBKeyRange.bound([sid], [sid, []]);
 }
 
-async function _loadRecordingBackup() {
+// Start a fresh autosave session for a new recording. Previous sessions are
+// left untouched — they stay recoverable until uploaded or discarded.
+async function capStartSession(meta) {
+  capSeq = 0;
+  capSessionId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   try {
-    const db = await _openDB();
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const store = tx.objectStore(STORE_NAME);
-    const entry = await new Promise((resolve, reject) => {
-      const req = store.get('current');
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+    const db = await capOpenDB();
+    const sid = capSessionId;
+    await capTx(db, 'readwrite', ['meta'], tx => {
+      tx.objectStore('meta').put({ k: sid, status: 'recording', ...meta });
     });
-    db.close();
-    return entry;
-  } catch (e) { console.warn('IndexedDB load failed:', e); return null; }
+  } catch (e) { console.warn('capStartSession failed (autosave disabled):', e); }
 }
 
-async function _clearRecordingBackup() {
+// Persist one recorded chunk (called for every MediaRecorder dataavailable).
+async function capAppendChunk(blob) {
+  if (!capSessionId) return;
   try {
-    const db = await _openDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    store.delete('current');
-    await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); });
-    db.close();
-  } catch (e) { console.warn('IndexedDB clear failed:', e); }
+    const db = await capOpenDB();
+    const sid = capSessionId, seq = capSeq++;
+    await capTx(db, 'readwrite', ['chunks'], tx => {
+      tx.objectStore('chunks').put({ sid, seq, blob });
+    });
+  } catch (e) { /* best-effort; don't disrupt recording */ }
+}
+
+// Mark the active session stopped (kept for recovery until uploaded or discarded).
+async function capMarkStopped(extra) {
+  const sid = capSessionId;
+  if (!sid) return;
+  try {
+    const db = await capOpenDB();
+    const meta = await new Promise((res) => {
+      const tx = db.transaction(['meta'], 'readonly');
+      const r = tx.objectStore('meta').get(sid);
+      r.onsuccess = () => res(r.result); r.onerror = () => res(null);
+    });
+    if (!meta) return;
+    await capTx(db, 'readwrite', ['meta'], tx => {
+      tx.objectStore('meta').put({ ...meta, status: 'stopped', ...extra });
+    });
+  } catch (e) { /* best-effort */ }
+}
+
+// Remove ONE saved session (after its successful upload or explicit discard).
+async function capClear(sid) {
+  if (!sid) return;
+  try {
+    const db = await capOpenDB();
+    await capTx(db, 'readwrite', ['meta', 'chunks'], tx => {
+      tx.objectStore('meta').delete(sid);
+      tx.objectStore('chunks').delete(capSessionRange(sid));
+    });
+  } catch (e) { /* best-effort */ }
+}
+
+// Load every recoverable session (newest first). Returns [{meta, blob}, ...].
+async function capLoadAllPending() {
+  try {
+    const db = await capOpenDB();
+    const metas = await new Promise((res) => {
+      const tx = db.transaction(['meta'], 'readonly');
+      const r = tx.objectStore('meta').getAll();
+      r.onsuccess = () => res(r.result || []); r.onerror = () => res([]);
+    });
+    const out = [];
+    for (const meta of metas) {
+      const sid = meta.k;
+      if (sid === capSessionId) continue;   // the recording this tab is writing right now
+      const chunks = await new Promise((res) => {
+        const tx = db.transaction(['chunks'], 'readonly');
+        const r = tx.objectStore('chunks').getAll(capSessionRange(sid));
+        r.onsuccess = () => res(r.result || []); r.onerror = () => res([]);
+      });
+      if (!chunks.length) { capClear(sid); continue; }   // stale meta with no data
+      if ((meta.startedAt || 0) < Date.now() - CAP_MAX_AGE_MS) {
+        console.warn('Expiring autosaved recording older than 14 days:', meta.startedAt, meta.fileName || '');
+        capClear(sid);
+        continue;
+      }
+      chunks.sort((a, b) => a.seq - b.seq);
+      out.push({ meta, blob: new Blob(chunks.map(c => c.blob), { type: meta.mimeType || 'audio/webm' }) });
+    }
+    out.sort((a, b) => (b.meta.startedAt || 0) - (a.meta.startedAt || 0));
+    return out;
+  } catch (e) { return []; }
+}
+
+// One-time import: older builds saved a single backup in DB 'meeting-service' /
+// store 'unsaved-recordings' (whole blob, written on stop). Move any pending
+// entry into the session store so it shows in the recovery list, then remove
+// the old copy so it isn't imported twice.
+async function capImportLegacyBackup() {
+  try {
+    if (indexedDB.databases) {
+      const dbs = await indexedDB.databases();
+      if (!dbs.some(d => d.name === 'meeting-service')) return;
+    }
+    const old = await new Promise((res, rej) => {
+      const r = indexedDB.open('meeting-service', 1);
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+    if (!old.objectStoreNames.contains('unsaved-recordings')) { old.close(); return; }
+    const entry = await new Promise((res) => {
+      const tx = old.transaction('unsaved-recordings', 'readonly');
+      const q = tx.objectStore('unsaved-recordings').get('current');
+      q.onsuccess = () => res(q.result); q.onerror = () => res(null);
+    });
+    if (entry && entry.blob && entry.blob.size) {
+      const sid = 'legacy-' + (entry.createdAt || Date.now());
+      const db = await capOpenDB();
+      await capTx(db, 'readwrite', ['meta', 'chunks'], tx => {
+        tx.objectStore('meta').put({
+          k: sid, status: 'stopped',
+          mimeType: entry.mimeType || 'audio/webm',
+          startedAt: entry.createdAt || Date.now(),
+          durationLabel: entry.duration, fileName: entry.fileName,
+        });
+        tx.objectStore('chunks').put({ sid, seq: 0, blob: entry.blob });
+      });
+    }
+    const tx2 = old.transaction('unsaved-recordings', 'readwrite');
+    tx2.objectStore('unsaved-recordings').delete('current');
+    await new Promise((res) => { tx2.oncomplete = res; tx2.onerror = res; tx2.onabort = res; });
+    old.close();
+  } catch (e) { /* best-effort migration */ }
 }
 
 const recordBtn = $('recordBtn');
@@ -146,7 +277,8 @@ recordBtn.addEventListener('click', async () => {
     stopRecording();
   } else if (selectedFile) {
     if (!confirm('Discard your unsaved recording and start a new one?')) return;
-    _clearRecordingBackup();
+    capClear(stagedSessionId);
+    stagedSessionId = null;
     selectedFile = null;
     fileInput.value = '';
     uploadFields.classList.remove('visible');
@@ -426,8 +558,14 @@ function setupRecorderFromStream(stream, usingLoopback, loopbackName) {
 
     mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
 
+    // Begin autosaving this recording to IndexedDB (survives navigation/reload).
+    capStartSession({ mimeType: mimeType || 'audio/webm', source: recordSource, startedAt: Date.now() });
+
     mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0) recordedChunks.push(e.data);
+      if (e.data.size > 0) {
+        recordedChunks.push(e.data);
+        capAppendChunk(e.data);   // best-effort persist
+      }
     };
 
     mediaRecorder.onstop = () => {
@@ -578,8 +716,10 @@ function onRecordingStopped() {
   const file = new File([blob], fileName, { type: mimeType });
 
   selectFile(file);
-  _saveRecordingBackup(blob, fileName, mimeType);
   stagedFromRecording = true;
+  capMarkStopped({ durationLabel: recordTimer.textContent, fileName });
+  stagedSessionId = capSessionId;   // the staged file is backed by this session
+  capSessionId = null;              // recording finished — nothing being written now
 
   // Surface a silent capture before the user uploads (and later transcribes) it.
   stagedSilent = (recordingPeakLevel <= SIGNAL_THRESHOLD);
@@ -696,13 +836,18 @@ function selectFile(file) {
 }
 
 $('removeFile').addEventListener('click', () => {
+  if (stagedFromRecording) {
+    // This is an un-uploaded recording — removing it destroys the only copy.
+    if (!confirm('Permanently discard this recording? It has not been uploaded.')) return;
+    capClear(stagedSessionId);
+    stagedSessionId = null;
+  }
   selectedFile = null;
   fileInput.value = '';
   uploadFields.classList.remove('visible');
   hideCaptureWarning();
   stagedFromRecording = false;
   stagedSilent = false;
-  _clearRecordingBackup();
 });
 
 uploadBtn.addEventListener('click', async () => {
@@ -751,7 +896,9 @@ uploadBtn.addEventListener('click', async () => {
         stagedFromRecording = false;
         stagedSilent = false;
         hideCaptureWarning();
-        _clearRecordingBackup();
+        // Persisted server-side now — drop this session's autosave.
+        capClear(stagedSessionId);
+        stagedSessionId = null;
         setTimeout(() => {
           selectedFile = null;
           fileInput.value = '';
@@ -1067,6 +1214,7 @@ async function populateDetail(id, mobile) {
         <button class="action-btn" onclick="reprocessStep('${id}', 'identify_speakers')">Re-identify Speakers</button>
         <button class="action-btn" onclick="reprocessStep('${id}', 'summarize')">Re-summarize</button>
         <button class="action-btn" onclick="reprocessStep('${id}', 'tagging')">Re-tag</button>
+        <button class="action-btn" onclick="openTrimModal('${id}')">Trim</button>
       `;
       actionBarEl.classList.add('visible');
     }
@@ -2055,6 +2203,89 @@ async function reprocessStep(id, step) {
     alert('Reprocess failed: ' + err.message);
   }
 }
+
+// --- Trim audio -> new meeting ---
+let trimMeetingId = null;
+
+// The <audio> element openMeeting initialized for the current view (desktop or mobile).
+function activeMeetingAudio() {
+  const mob = $('meetingAudioMobile');
+  if (mob && mob.getAttribute('src')) return mob;
+  return $('meetingAudio');
+}
+
+// Accepts "ss", "mm:ss", or "h:mm:ss" (decimals allowed in the last part).
+function parseTimeInput(str) {
+  const s = (str || '').trim();
+  if (!s || !/^[\d:.]+$/.test(s)) return NaN;
+  const parts = s.split(':').map(Number);
+  if (parts.some(isNaN)) return NaN;
+  return parts.reduce((acc, p) => acc * 60 + p, 0);
+}
+
+function openTrimModal(id) {
+  trimMeetingId = id;
+  const audio = activeMeetingAudio();
+  $('trimStart').value = '0:00:00';
+  $('trimEnd').value = (audio && isFinite(audio.duration) && audio.duration > 0)
+    ? formatTimestamp(Math.floor(audio.duration)) : '';
+  $('trimTitle').value = '';
+  $('trimError').style.display = 'none';
+  $('trimOverlay').classList.add('visible');
+}
+
+function closeTrimModal() {
+  $('trimOverlay').classList.remove('visible');
+  trimMeetingId = null;
+}
+
+$('trimStartFromPlayer').addEventListener('click', () => {
+  const audio = activeMeetingAudio();
+  if (audio) $('trimStart').value = formatTimestamp(Math.floor(audio.currentTime));
+});
+
+$('trimEndFromPlayer').addEventListener('click', () => {
+  const audio = activeMeetingAudio();
+  if (audio) $('trimEnd').value = formatTimestamp(Math.floor(audio.currentTime));
+});
+
+$('trimSubmitBtn').addEventListener('click', async () => {
+  if (!trimMeetingId) return;
+  const errEl = $('trimError');
+  const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = ''; };
+  const start = parseTimeInput($('trimStart').value);
+  const end = parseTimeInput($('trimEnd').value);
+  if (isNaN(start) || isNaN(end)) { showErr('Enter times as h:mm:ss (e.g. 0:12:30).'); return; }
+  if (end - start < 1) { showErr('End must be at least 1 second after start.'); return; }
+  const audio = activeMeetingAudio();
+  if (audio && isFinite(audio.duration) && audio.duration > 0 && start >= audio.duration) {
+    showErr('Start is beyond the end of the audio.'); return;
+  }
+  errEl.style.display = 'none';
+
+  const btn = $('trimSubmitBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`${API}/meetings/${trimMeetingId}/trim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ start, end, title: $('trimTitle').value.trim() || null }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.status === 202) {
+      closeTrimModal();
+      startPolling();
+      refreshMeetings();
+      alert(`Trimmed copy queued as a new meeting: "${data.title}"`);
+    } else {
+      showErr(data.detail || resp.statusText);
+    }
+  } catch (err) {
+    showErr(err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // --- Speaker Name Mapping ---
 let currentSpeakerMap = {};
@@ -3123,27 +3354,91 @@ function closeSettings() {
   document.body.style.overflow = '';
 }
 
-// --- Unsaved recording recovery on page load ---
-(async function checkRecovery() {
-  const entry = await _loadRecordingBackup();
-  if (!entry) return;
-  const banner = $('recoveryBanner');
-  const loadBtn = $('recoveryLoadBtn');
-  const dismissBtn = $('recoveryDismissBtn');
-  banner.hidden = false;
+// --- Recovery of autosaved recordings from previous sessions ---
+function renderRecoveryList(pendings) {
+  const el = $('captureRecovery');
+  if (!el) return;
+  el.textContent = '';   // DOM-built (no innerHTML) — content includes derived metadata
+  if (!pendings.length) { el.style.display = 'none'; return; }
 
-  loadBtn.addEventListener('click', () => {
-    const file = new File([entry.blob], entry.fileName, { type: entry.mimeType });
-    selectFile(file);
-    stagedFromRecording = true;   // keep it protected until uploaded
-    banner.hidden = true;
-  });
+  const hideIfEmpty = () => {
+    if (!el.querySelector('.cap-recovery-row')) el.style.display = 'none';
+  };
 
-  dismissBtn.addEventListener('click', () => {
-    _clearRecordingBackup();
-    banner.hidden = true;
-  });
-})();
+  const heading = document.createElement('div');
+  heading.className = 'cap-recovery-heading';
+  heading.textContent = pendings.length === 1
+    ? '⚠️ Unsaved recording recovered — upload, download, or discard it:'
+    : `⚠️ ${pendings.length} unsaved recordings recovered — upload, download, or discard them:`;
+  el.appendChild(heading);
+
+  for (const { meta, blob } of pendings) {
+    const sid = meta.k;
+    const when = meta.startedAt ? new Date(meta.startedAt).toLocaleString() : 'a previous session';
+    const dur = meta.durationLabel ? ` (${meta.durationLabel})` : '';
+    const sizeKb = Math.round(blob.size / 1024);
+    const mt = meta.mimeType || 'audio/webm';
+    const ext = mt.includes('ogg') ? '.ogg' : mt.includes('mp4') ? '.m4a' : '.webm';
+    const name = meta.fileName || `recovered_${new Date(meta.startedAt || Date.now()).toISOString().slice(0,10)}${ext}`;
+
+    const row = document.createElement('div');
+    row.className = 'cap-recovery-row';
+
+    const msg = document.createElement('span');
+    msg.className = 'cap-recovery-msg';
+    msg.textContent = `${when}${dur} — ${sizeKb} KB`;
+
+    const recoverBtn = document.createElement('button');
+    recoverBtn.className = 'cap-recovery-btn';
+    recoverBtn.textContent = 'Recover & upload';
+    recoverBtn.addEventListener('click', () => {
+      selectFile(new File([blob], name, { type: mt }));
+      stagedFromRecording = true;   // keep it protected until uploaded
+      stagedSessionId = sid;
+      row.remove();
+      hideIfEmpty();
+    });
+
+    // Belt-and-braces: save the audio straight to disk, no server involved.
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'cap-recovery-btn';
+    dlBtn.textContent = 'Download';
+    dlBtn.addEventListener('click', () => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    });
+
+    const discardBtn = document.createElement('button');
+    discardBtn.className = 'cap-recovery-btn cap-recovery-discard';
+    discardBtn.textContent = 'Discard';
+    discardBtn.addEventListener('click', () => {
+      if (!confirm('Permanently discard this recovered recording?')) return;
+      capClear(sid);
+      row.remove();
+      hideIfEmpty();
+    });
+
+    row.appendChild(msg);
+    row.appendChild(recoverBtn);
+    row.appendChild(dlBtn);
+    row.appendChild(discardBtn);
+    el.appendChild(row);
+  }
+  el.style.display = 'flex';
+}
+
+async function checkPendingRecording() {
+  try {
+    // Ask the browser to shield this origin's storage from automatic eviction.
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    await capImportLegacyBackup();
+    renderRecoveryList(await capLoadAllPending());
+  } catch (e) { /* recovery is best-effort */ }
+}
+checkPendingRecording();
 
 // ---------------------------------------------------------------------------
 // Unsaved-recording guards: warn before leaving / navigating away while a
