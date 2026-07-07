@@ -17,9 +17,9 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
-<link rel="stylesheet" href="/static/notes-tasks.css?v=11">
-<script defer src="/static/vendor/codemirror.bundle.js?v=11"></script>
-<script defer src="/static/notes-tasks.js?v=11"></script>
+<link rel="stylesheet" href="/static/notes-tasks.css?v=12">
+<script defer src="/static/vendor/codemirror.bundle.js?v=12"></script>
+<script defer src="/static/notes-tasks.js?v=12"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -49,7 +49,7 @@
     }
   });
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=11">
+<link rel="stylesheet" href="/static/styles.css?v=12">
 </head>
 <body>
 
@@ -582,6 +582,14 @@
         </div>
       </div>
 
+      <div class="settings-section">
+        <div class="settings-section-title">Recording Backup</div>
+        <div class="settings-section-desc">While recording, stream a copy to the server so a long meeting survives even if this device dies before you upload. Recordings are always auto-saved in this browser regardless.</div>
+        <label style="display:block;margin-top:8px">
+          <input type="checkbox" id="settingsStreamBackup"> Stream a server-side backup while recording
+        </label>
+      </div>
+
       <!-- Cleanup System Prompt -->
       <div class="settings-section">
         <div class="settings-section-title">Transcript Cleanup Prompt</div>
@@ -840,7 +848,7 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=11"></script>
+<script src="/static/app.js?v=12"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js');
@@ -889,7 +897,7 @@ if ('serviceWorker' in navigator) {
   </div>
 </div>
 
-<script src="/static/floating-chat.js?v=11"></script>
+<script src="/static/floating-chat.js?v=12"></script>
 
 </body>
 </html>

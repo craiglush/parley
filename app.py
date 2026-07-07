@@ -544,6 +544,16 @@ OVERLAP_SECONDS = 30
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))  # 500MB
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".mp4", ".mkv", ".ogg", ".webm", ".flac", ".aac"}
 
+# Streaming capture (server shadow backup) — see
+# docs/superpowers/specs/2026-07-07-streaming-capture-design.md. Each in-progress
+# recording streams its chunks here so a copy survives even if the recording
+# device dies before the user uploads. Staging: _captures/{sid}/chunks/{seq}.part.
+# (The root is derived from MEETINGS_DIR at call time via _captures_root() so it
+# tracks a monkeypatched MEETINGS_DIR in tests, like the upload/trim routes do.)
+CAPTURE_MAX_CHUNK_BYTES = 2 * 1024 * 1024          # generous — 1s of opus is a few KB
+CAPTURE_MAX_AGE_SECONDS = 14 * 24 * 60 * 60        # mirrors the client CAP_MAX_AGE_MS sweep
+_SID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
 # Attachment handling
 ATTACH_MAX_BYTES = 50 * 1024 * 1024
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
@@ -627,6 +637,7 @@ async def _verify_embedding_dim_on_startup():
             logger.warning(f"Embedding dim check skipped (non-fatal): {e}")
     _probe_t = asyncio.create_task(_probe()); _bg_tasks.add(_probe_t); _probe_t.add_done_callback(_bg_tasks.discard)
     _tag_t = asyncio.create_task(_tag_worker()); _bg_tasks.add(_tag_t); _tag_t.add_done_callback(_bg_tasks.discard)
+    _gc_t = asyncio.create_task(_capture_gc_worker()); _bg_tasks.add(_gc_t); _gc_t.add_done_callback(_bg_tasks.discard)
 
 
 # In-memory meeting registry (survives container restarts via on-disk JSON index)
@@ -3703,6 +3714,243 @@ async def trim_meeting(meeting_id: str, body: TrimRequest):
         content={"meeting_id": new_id, "status": "queued", "title": title},
         status_code=202,
     )
+
+
+# ---------------------------------------------------------------------------
+# Streaming capture (server shadow backup)
+# ---------------------------------------------------------------------------
+
+
+def _valid_sid(sid: str) -> bool:
+    return bool(_SID_RE.match(sid or ""))
+
+
+def _captures_root() -> Path:
+    return MEETINGS_DIR / "_captures"
+
+
+def _capture_dir(sid: str) -> Path:
+    return _captures_root() / sid
+
+
+def _read_capture_meta(sid: str) -> Optional[dict]:
+    mp = _capture_dir(sid) / "meta.json"
+    if not mp.exists():
+        return None
+    try:
+        return json.loads(mp.read_text())
+    except Exception:
+        return None
+
+
+def _write_capture_meta(sid: str, meta: dict) -> None:
+    d = _capture_dir(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "meta.json").write_text(json.dumps(meta))
+
+
+def _gc_captures() -> int:
+    """Prune capture staging dirs older than CAPTURE_MAX_AGE_SECONDS (or unreadable)."""
+    if not _captures_root().exists():
+        return 0
+    cutoff = datetime.now(timezone.utc).timestamp() - CAPTURE_MAX_AGE_SECONDS
+    pruned = 0
+    for d in _captures_root().iterdir():
+        if not d.is_dir():
+            continue
+        meta = _read_capture_meta(d.name)
+        updated = (meta or {}).get("updated_at", 0)
+        if not meta or updated < cutoff:
+            logger.info(f"GC: pruning stale capture {d.name} (updated_at={updated})")
+            shutil.rmtree(d, ignore_errors=True)
+            pruned += 1
+    return pruned
+
+
+async def _capture_gc_worker():
+    """Sweep stale captures on startup and once a day thereafter."""
+    while True:
+        try:
+            await asyncio.to_thread(_gc_captures)
+        except Exception as e:
+            logger.warning(f"Capture GC failed (non-fatal): {e}")
+        await asyncio.sleep(24 * 60 * 60)
+
+
+class CaptureStartRequest(BaseModel):
+    sid: str
+    mimeType: Optional[str] = "audio/webm"
+    source: Optional[str] = None
+    startedAt: Optional[int] = None
+
+
+@app.post("/captures")
+async def capture_start(body: CaptureStartRequest):
+    """Announce a new streaming capture. Idempotent: re-announcing keeps existing chunks."""
+    sid = body.sid
+    if not _valid_sid(sid):
+        raise HTTPException(status_code=400, detail="Invalid capture id")
+    if (_capture_dir(sid) / "meta.json").exists():
+        return JSONResponse(content={"sid": sid, "status": "exists"}, status_code=200)
+    (_capture_dir(sid) / "chunks").mkdir(parents=True, exist_ok=True)
+    _write_capture_meta(sid, {
+        "sid": sid,
+        "mimeType": body.mimeType or "audio/webm",
+        "source": body.source,
+        "startedAt": body.startedAt,
+        "stopped": False,
+        "bytes": 0,
+        "last_seq": -1,
+        "chunk_count": 0,
+        "updated_at": datetime.now(timezone.utc).timestamp(),
+    })
+    return JSONResponse(content={"sid": sid, "status": "created"}, status_code=201)
+
+
+@app.post("/captures/{sid}/chunks/{seq}")
+async def capture_chunk(sid: str, seq: int, request: Request):
+    """Persist one recorded chunk (raw blob body). Idempotent per seq; order-independent."""
+    if not _valid_sid(sid):
+        raise HTTPException(status_code=400, detail="Invalid capture id")
+    if seq < 0:
+        raise HTTPException(status_code=400, detail="Invalid seq")
+    meta = _read_capture_meta(sid)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Unknown capture")
+    data = await request.body()
+    if len(data) > CAPTURE_MAX_CHUNK_BYTES:
+        raise HTTPException(status_code=413, detail="Chunk too large")
+    chunk_path = _capture_dir(sid) / "chunks" / f"{seq:06d}.part"
+    is_new = not chunk_path.exists()
+    prev = 0 if is_new else chunk_path.stat().st_size
+    if meta.get("bytes", 0) - prev + len(data) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="Capture exceeds maximum size")
+    chunk_path.parent.mkdir(parents=True, exist_ok=True)
+    chunk_path.write_bytes(data)
+    meta["bytes"] = max(0, meta.get("bytes", 0) - prev + len(data))
+    if is_new:
+        meta["chunk_count"] = meta.get("chunk_count", 0) + 1
+    meta["last_seq"] = max(meta.get("last_seq", -1), seq)
+    meta["updated_at"] = datetime.now(timezone.utc).timestamp()
+    _write_capture_meta(sid, meta)
+    return {"ok": True, "seq": seq, "bytes": meta["bytes"]}
+
+
+class CaptureStopRequest(BaseModel):
+    durationLabel: Optional[str] = None
+    fileName: Optional[str] = None
+
+
+@app.post("/captures/{sid}/stop")
+async def capture_stop(sid: str, body: CaptureStopRequest):
+    if not _valid_sid(sid):
+        raise HTTPException(status_code=400, detail="Invalid capture id")
+    meta = _read_capture_meta(sid)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Unknown capture")
+    meta["stopped"] = True
+    if body.durationLabel:
+        meta["durationLabel"] = body.durationLabel
+    if body.fileName:
+        meta["fileName"] = body.fileName
+    meta["updated_at"] = datetime.now(timezone.utc).timestamp()
+    _write_capture_meta(sid, meta)
+    return {"ok": True}
+
+
+@app.get("/captures")
+async def capture_list():
+    """List pending captures with recoverable data (newest first)."""
+    out = []
+    if _captures_root().exists():
+        for d in _captures_root().iterdir():
+            if not d.is_dir():
+                continue
+            meta = _read_capture_meta(d.name)
+            if not meta or meta.get("chunk_count", 0) <= 0:
+                continue
+            out.append({
+                "sid": meta["sid"],
+                "startedAt": meta.get("startedAt"),
+                "stopped": meta.get("stopped", False),
+                "bytes": meta.get("bytes", 0),
+                "chunk_count": meta.get("chunk_count", 0),
+                "mimeType": meta.get("mimeType", "audio/webm"),
+                "durationLabel": meta.get("durationLabel"),
+                "fileName": meta.get("fileName"),
+            })
+    out.sort(key=lambda c: c.get("startedAt") or 0, reverse=True)
+    return out
+
+
+class CaptureAdoptRequest(BaseModel):
+    title: Optional[str] = None
+
+
+@app.post("/captures/{sid}/adopt")
+async def capture_adopt(sid: str, body: CaptureAdoptRequest):
+    """Assemble a streamed capture's chunks into a new meeting and process it."""
+    if not _valid_sid(sid):
+        raise HTTPException(status_code=400, detail="Invalid capture id")
+    meta = _read_capture_meta(sid)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Unknown capture")
+    chunk_dir = _capture_dir(sid) / "chunks"
+    # Zero-padded names sort in seq order — same assembly as the client's Blob(chunks).
+    parts = sorted(chunk_dir.glob("*.part")) if chunk_dir.exists() else []
+    if not parts:
+        raise HTTPException(status_code=404, detail="Capture has no data")
+
+    mime = meta.get("mimeType", "audio/webm")
+    ext = ".ogg" if "ogg" in mime else ".m4a" if "mp4" in mime else ".webm"
+    new_id = str(uuid.uuid4())[:8]
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    MEETINGS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = str(MEETINGS_DIR / f"_upload_{new_id}{ext}")
+
+    def _assemble():
+        with open(tmp_path, "wb") as out:
+            for p in parts:
+                out.write(p.read_bytes())
+
+    await asyncio.to_thread(_assemble)
+
+    title = (body.title or "").strip() or f"Recovered recording ({date_str})"
+    meeting = {
+        "id": new_id,
+        "date": date_str,
+        "title": title,
+        "status": MeetingStatus.queued,
+        "original_path": tmp_path,
+        "original_filename": meta.get("fileName") or f"capture_{sid}{ext}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "recovered_from_capture": sid,
+        "progress_percent": 0,
+        "progress_detail": "Queued",
+    }
+    meetings[new_id] = meeting
+    _save_index()
+
+    logger.info(f"[{new_id}] Adopted streamed capture {sid} ({len(parts)} chunks, {meta.get('bytes', 0)} bytes)")
+
+    task = asyncio.create_task(process_meeting(new_id))
+    meeting["_task"] = task
+
+    # Bytes are safely copied into _upload_* now — drop the staging dir.
+    shutil.rmtree(_capture_dir(sid), ignore_errors=True)
+
+    return JSONResponse(
+        content={"meeting_id": new_id, "status": "queued", "title": title},
+        status_code=202,
+    )
+
+
+@app.delete("/captures/{sid}")
+async def capture_delete(sid: str):
+    if not _valid_sid(sid):
+        raise HTTPException(status_code=400, detail="Invalid capture id")
+    shutil.rmtree(_capture_dir(sid), ignore_errors=True)
+    return {"ok": True}
 
 
 class ReprocessRequest(BaseModel):

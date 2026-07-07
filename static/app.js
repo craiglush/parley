@@ -244,6 +244,103 @@ async function capImportLegacyBackup() {
   } catch (e) { /* best-effort migration */ }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming shadow backup — mirror each recorded chunk to the server AS it
+// records, so a copy survives even if this device dies before upload. Purely
+// additive and best-effort: it never blocks the recorder or the IndexedDB
+// autosave, and does nothing when disabled or the server is unreachable.
+// See docs/superpowers/specs/2026-07-07-streaming-capture-design.md.
+// ---------------------------------------------------------------------------
+function streamBackupEnabled() {
+  return localStorage.getItem('captureStreamBackup') !== 'off';   // default on
+}
+
+const capStream = { sid: null, seq: 0, queue: [], sending: false, fails: 0, quietUntil: 0, announced: false, startMeta: null };
+
+// Begin a new capture. sid matches the local autosave session id, so the server
+// copy and the local copy share one identity (dedup + delete-by-sid). The actual
+// "announce" POST is deferred to the sender so it is guaranteed to complete
+// BEFORE any chunk is sent (chunk seq 0 carries the webm header — it must land
+// first and must never be dropped).
+function capStreamStart(sid, meta) {
+  Object.assign(capStream, { sid: null, seq: 0, queue: [], sending: false, fails: 0, quietUntil: 0, announced: false, startMeta: null });
+  if (!streamBackupEnabled()) return;
+  capStream.sid = sid;
+  capStream.startMeta = { sid, mimeType: meta.mimeType, source: meta.source, startedAt: meta.startedAt };
+}
+
+function capStreamEnqueue(blob) {
+  if (!capStream.sid) return;
+  capStream.queue.push({ seq: capStream.seq++, blob });
+  capStreamPump();
+}
+
+// Single-flight sender: announces the capture (once), then drains the queue in
+// strict seq order. On any transient failure it backs off and KEEPS the chunk
+// queued — only a 413 (a chunk/capture that can never fit) is dropped — so a
+// slow announce or a brief outage can never discard the header chunk.
+async function capStreamPump() {
+  if (capStream.sending || !capStream.sid) return;
+  if (Date.now() < capStream.quietUntil) { capStreamScheduleRetry(); return; }
+  capStream.sending = true;
+  try {
+    if (!capStream.announced) {
+      const r = await fetch(`${API}/captures`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(capStream.startMeta),
+      });
+      if (!r.ok) throw new Error('announce HTTP ' + r.status);
+      capStream.announced = true;
+    }
+    while (capStream.queue.length) {
+      const { seq, blob } = capStream.queue[0];
+      const resp = await fetch(`${API}/captures/${capStream.sid}/chunks/${seq}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: blob,
+      });
+      if (resp.ok) { capStream.queue.shift(); continue; }
+      if (resp.status === 413) { capStream.queue.shift(); continue; }  // never fits — safe to skip
+      throw new Error('chunk HTTP ' + resp.status);   // 404 race / 5xx / etc: retry, don't drop
+    }
+    capStream.fails = 0;
+  } catch (_) {
+    capStream.fails++;
+    capStream.quietUntil = Date.now() + (capStream.fails >= 5 ? 60000 : Math.min(1000 * 2 ** capStream.fails, 30000));
+  } finally {
+    capStream.sending = false;
+  }
+  if (capStream.sid && capStream.queue.length) capStreamScheduleRetry();
+}
+
+let _capStreamTimer = null;
+function capStreamScheduleRetry() {
+  if (_capStreamTimer) return;
+  const wait = Math.max(250, capStream.quietUntil - Date.now());
+  _capStreamTimer = setTimeout(() => { _capStreamTimer = null; capStreamPump(); }, wait);
+}
+
+// Flush best-effort, then mark the server capture stopped.
+async function capStreamStop(extra) {
+  const sid = capStream.sid;
+  if (!sid) return;
+  await capStreamPump();
+  try {
+    await fetch(`${API}/captures/${sid}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ durationLabel: extra && extra.durationLabel, fileName: extra && extra.fileName }),
+    });
+  } catch (_) { /* best-effort */ }
+}
+
+// Drop the server-side copy (after a successful normal upload or a discard).
+function capStreamDelete(sid) {
+  if (!sid) return;
+  fetch(`${API}/captures/${sid}`, { method: 'DELETE' }).catch(() => {});
+}
+
 const recordBtn = $('recordBtn');
 const recordArea = $('recordArea');
 const recordLabel = $('recordLabel');
@@ -278,6 +375,7 @@ recordBtn.addEventListener('click', async () => {
   } else if (selectedFile) {
     if (!confirm('Discard your unsaved recording and start a new one?')) return;
     capClear(stagedSessionId);
+    capStreamDelete(stagedSessionId);   // drop the server shadow copy too
     stagedSessionId = null;
     selectedFile = null;
     fileInput.value = '';
@@ -559,12 +657,16 @@ function setupRecorderFromStream(stream, usingLoopback, loopbackName) {
     mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
 
     // Begin autosaving this recording to IndexedDB (survives navigation/reload).
-    capStartSession({ mimeType: mimeType || 'audio/webm', source: recordSource, startedAt: Date.now() });
+    const capMeta = { mimeType: mimeType || 'audio/webm', source: recordSource, startedAt: Date.now() };
+    capStartSession(capMeta);
+    // Also mirror this recording to the server as it records (best-effort shadow backup).
+    capStreamStart(capSessionId, capMeta);
 
     mediaRecorder.ondataavailable = e => {
       if (e.data.size > 0) {
         recordedChunks.push(e.data);
-        capAppendChunk(e.data);   // best-effort persist
+        capAppendChunk(e.data);   // best-effort persist (local)
+        capStreamEnqueue(e.data); // best-effort mirror (server)
       }
     };
 
@@ -718,6 +820,7 @@ function onRecordingStopped() {
   selectFile(file);
   stagedFromRecording = true;
   capMarkStopped({ durationLabel: recordTimer.textContent, fileName });
+  capStreamStop({ durationLabel: recordTimer.textContent, fileName });   // flush + mark server copy stopped
   stagedSessionId = capSessionId;   // the staged file is backed by this session
   capSessionId = null;              // recording finished — nothing being written now
 
@@ -840,6 +943,7 @@ $('removeFile').addEventListener('click', () => {
     // This is an un-uploaded recording — removing it destroys the only copy.
     if (!confirm('Permanently discard this recording? It has not been uploaded.')) return;
     capClear(stagedSessionId);
+    capStreamDelete(stagedSessionId);   // drop the server shadow copy too
     stagedSessionId = null;
   }
   selectedFile = null;
@@ -896,8 +1000,9 @@ uploadBtn.addEventListener('click', async () => {
         stagedFromRecording = false;
         stagedSilent = false;
         hideCaptureWarning();
-        // Persisted server-side now — drop this session's autosave.
+        // Persisted server-side now — drop this session's autosave + shadow copy.
         capClear(stagedSessionId);
+        capStreamDelete(stagedSessionId);
         stagedSessionId = null;
         setTimeout(() => {
           selectedFile = null;
@@ -3149,6 +3254,11 @@ function markSettingsDirty() {
 }
 
 Object.values(promptFields).forEach(ta => ta.addEventListener('input', markSettingsDirty));
+// Client-only capture preference (localStorage) — saved instantly, not via the
+// server settings form, so it doesn't participate in the unsaved-changes flow.
+$('settingsStreamBackup').addEventListener('change', (e) => {
+  localStorage.setItem('captureStreamBackup', e.target.checked ? 'on' : 'off');
+});
 $('settingsModel').addEventListener('input', markSettingsDirty);
 $('settingsTemp').addEventListener('input', () => {
   $('tempDisplay').textContent = parseFloat($('settingsTemp').value).toFixed(2);
@@ -3310,6 +3420,7 @@ async function openSettings() {
 }
 
 function populateSettingsForm(settings, defaults) {
+  $('settingsStreamBackup').checked = streamBackupEnabled();
   $('settingsModel').value = settings.ollama_model || '';
   $('settingsTemp').value = settings.temperature || 0.3;
   $('tempDisplay').textContent = parseFloat(settings.temperature || 0.3).toFixed(2);
@@ -3355,11 +3466,18 @@ function closeSettings() {
 }
 
 // --- Recovery of autosaved recordings from previous sessions ---
-function renderRecoveryList(pendings) {
+function renderRecoveryList(pendings, serverCaptures) {
   const el = $('captureRecovery');
   if (!el) return;
   el.textContent = '';   // DOM-built (no innerHTML) — content includes derived metadata
-  if (!pendings.length) { el.style.display = 'none'; return; }
+
+  // Server captures whose sid is already covered by a local session are the
+  // same recording — prefer the local copy (has the actual bytes + Download).
+  const localSids = new Set(pendings.map(p => p.meta.k));
+  const serverOnly = (serverCaptures || []).filter(c => !localSids.has(c.sid));
+
+  const total = pendings.length + serverOnly.length;
+  if (!total) { el.style.display = 'none'; return; }
 
   const hideIfEmpty = () => {
     if (!el.querySelector('.cap-recovery-row')) el.style.display = 'none';
@@ -3367,9 +3485,9 @@ function renderRecoveryList(pendings) {
 
   const heading = document.createElement('div');
   heading.className = 'cap-recovery-heading';
-  heading.textContent = pendings.length === 1
-    ? '⚠️ Unsaved recording recovered — upload, download, or discard it:'
-    : `⚠️ ${pendings.length} unsaved recordings recovered — upload, download, or discard them:`;
+  heading.textContent = total === 1
+    ? '⚠️ Unsaved recording recovered — restore or discard it:'
+    : `⚠️ ${total} unsaved recordings recovered — restore or discard them:`;
   el.appendChild(heading);
 
   for (const { meta, blob } of pendings) {
@@ -3427,6 +3545,65 @@ function renderRecoveryList(pendings) {
     row.appendChild(discardBtn);
     el.appendChild(row);
   }
+
+  // Server-only captures: streamed here (possibly from another device that
+  // never uploaded) but with no local blob. Recover by adopting on the server.
+  for (const c of serverOnly) {
+    const when = c.startedAt ? new Date(c.startedAt).toLocaleString() : 'a previous session';
+    const dur = c.durationLabel ? ` (${c.durationLabel})` : '';
+    const sizeKb = Math.round((c.bytes || 0) / 1024);
+
+    const row = document.createElement('div');
+    row.className = 'cap-recovery-row';
+
+    const msg = document.createElement('span');
+    msg.className = 'cap-recovery-msg';
+    msg.textContent = `☁️ server copy — ${when}${dur} — ${sizeKb} KB`;
+
+    const recoverBtn = document.createElement('button');
+    recoverBtn.className = 'cap-recovery-btn';
+    recoverBtn.textContent = 'Recover on server';
+    recoverBtn.addEventListener('click', async () => {
+      recoverBtn.disabled = true;
+      try {
+        const resp = await fetch(`${API}/captures/${c.sid}/adopt`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (resp.status === 202) {
+          row.remove();
+          hideIfEmpty();
+          startPolling();
+          refreshMeetings();
+          alert(`Recovered as a new meeting: "${data.title}"`);
+        } else {
+          recoverBtn.disabled = false;
+          alert('Recover failed: ' + (data.detail || resp.statusText));
+        }
+      } catch (err) {
+        recoverBtn.disabled = false;
+        alert('Recover failed: ' + err.message);
+      }
+    });
+
+    const discardBtn = document.createElement('button');
+    discardBtn.className = 'cap-recovery-btn cap-recovery-discard';
+    discardBtn.textContent = 'Discard';
+    discardBtn.addEventListener('click', () => {
+      if (!confirm('Permanently discard this server-side recording?')) return;
+      capStreamDelete(c.sid);
+      row.remove();
+      hideIfEmpty();
+    });
+
+    row.appendChild(msg);
+    row.appendChild(recoverBtn);
+    row.appendChild(discardBtn);
+    el.appendChild(row);
+  }
+
   el.style.display = 'flex';
 }
 
@@ -3435,7 +3612,10 @@ async function checkPendingRecording() {
     // Ask the browser to shield this origin's storage from automatic eviction.
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     await capImportLegacyBackup();
-    renderRecoveryList(await capLoadAllPending());
+    const local = await capLoadAllPending();
+    let server = [];
+    try { server = await fetch(`${API}/captures`).then(r => r.ok ? r.json() : []); } catch (_) {}
+    renderRecoveryList(local, server);
   } catch (e) { /* recovery is best-effort */ }
 }
 checkPendingRecording();

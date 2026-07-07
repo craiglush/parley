@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v11-trim-multisession';
+const CACHE_NAME = 'meetings-v12-streaming-backup';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.

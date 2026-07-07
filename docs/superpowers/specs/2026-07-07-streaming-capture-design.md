@@ -1,7 +1,7 @@
 # Streaming capture failsafe (server shadow backup) — design
 
 **Date:** 2026-07-07
-**Status:** Proposed
+**Status:** Implemented (2026-07-08)
 
 ## Problem
 
