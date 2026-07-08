@@ -1295,7 +1295,100 @@ async def step_cleanup_transcript(
 # ---------------------------------------------------------------------------
 
 
-async def step_identify_speakers(transcript_text: str, segments: list[dict]) -> dict:
+def reconcile_speaker_tags(
+    markers: list[dict],
+    segments: list[dict],
+    roster: list[dict] | None = None,
+    lag: float = 2.0,
+) -> dict:
+    """Map human 'who is talking' markers to diarized SPEAKER_XX clusters.
+
+    markers: [{"t": recorded_seconds, "name": str}] (name only; never a label).
+    segments: diarized [{"start","end","speaker"}].
+    roster: optional [{"name","company","title"}] used only to enrich display_name.
+    Human-tagged clusters get confidence "manual"; untagged clusters are left for
+    the LLM step. Returns {"speaker_map", "speaker_info"} in the standard shape.
+    """
+    if not markers or not segments:
+        return {"speaker_map": {}, "speaker_info": {}}
+
+    roster_lookup = {}
+    for r in (roster or []):
+        nm = (r.get("name") or "").strip()
+        if nm:
+            roster_lookup[nm.lower()] = {
+                "company": (r.get("company") or "").strip(),
+                "title": (r.get("title") or "").strip(),
+            }
+
+    # votes[label][name] = total overlap seconds credited to that (cluster, name).
+    votes: dict[str, dict[str, float]] = {}
+    for m in markers:
+        name = (m.get("name") or "").strip()
+        if not name or name.lower() in ("unknown", "none", "null"):
+            continue
+        try:
+            t = float(m.get("t"))
+        except (TypeError, ValueError):
+            continue
+        w_start, w_end = t - lag, t + lag
+        # Credit each cluster by how much of [w_start, w_end] its segments cover.
+        per_label: dict[str, float] = {}
+        for seg in segments:
+            label = seg.get("speaker", "UNKNOWN")
+            if label == "UNKNOWN":
+                continue
+            ov = min(w_end, seg.get("end", 0.0)) - max(w_start, seg.get("start", 0.0))
+            if ov > 0:
+                per_label[label] = per_label.get(label, 0.0) + ov
+        best_label = None
+        best_overlap = 0.0
+        for label, ov in per_label.items():
+            if ov > best_overlap:
+                best_overlap, best_label = ov, label
+        if best_label is None:
+            continue  # marker in silence / outside all segments -> dropped
+        votes.setdefault(best_label, {})
+        votes[best_label][name] = votes[best_label].get(name, 0.0) + best_overlap
+
+    speaker_map: dict[str, str] = {}
+    speaker_info: dict[str, dict] = {}
+    for label, name_votes in votes.items():
+        # Majority by total overlap weight.
+        max_weight = max(name_votes.values())
+        winners = [n for n in name_votes if name_votes[n] == max_weight]
+        if len(winners) > 1:
+            # Genuine tie — cannot confidently pick. Leave the cluster unresolved
+            # so the LLM step / post-meeting editing handles it (spec: never guess silently).
+            continue
+        name = winners[0]
+        extra = roster_lookup.get(name.lower(), {})
+        title = extra.get("title", "")
+        company = extra.get("company", "")
+        parts = [p for p in (title, company) if p]
+        display_name = f"{name} ({', '.join(parts)})" if parts else name
+        speaker_map[label] = name
+        speaker_info[label] = {
+            "name": name,
+            "title": title,
+            "company": company,
+            "display_name": display_name,
+            "confidence": "manual",
+            "auto_detected": False,
+        }
+
+    return {"speaker_map": speaker_map, "speaker_info": speaker_info}
+
+
+def merge_speaker_identifications(tag_ident: dict, llm_ident: dict) -> dict:
+    """Combine human-tag identification with the LLM's. Human tags win per label."""
+    speaker_map = {**llm_ident.get("speaker_map", {}), **tag_ident.get("speaker_map", {})}
+    speaker_info = {**llm_ident.get("speaker_info", {}), **tag_ident.get("speaker_info", {})}
+    return {"speaker_map": speaker_map, "speaker_info": speaker_info}
+
+
+async def step_identify_speakers(transcript_text: str, segments: list[dict],
+                                 expected_participants: str = "") -> dict:
     """Use Ollama to identify real speaker names, titles, and companies from transcript content."""
     settings = load_settings()
     model = settings.get("ollama_model", OLLAMA_MODEL)
@@ -1320,7 +1413,7 @@ async def step_identify_speakers(transcript_text: str, segments: list[dict]) -> 
     ).replace(
         "{json_example}", json_example
     ).replace(
-        "{expected_participants}", ""
+        "{expected_participants}", expected_participants or ""
     )
 
     try:
@@ -1725,7 +1818,24 @@ async def process_meeting(meeting_id: str):
         _update_progress(meeting, 60, "Identifying speakers...")
 
         t0 = time.monotonic()
-        identification = await step_identify_speakers(transcript_text, segments)
+
+        # Human live-tag reconciliation (empty if the meeting wasn't tagged live).
+        markers = meeting.get("speaker_tags") or []
+        roster = meeting.get("speaker_roster") or []
+        tag_ident = reconcile_speaker_tags(markers, segments, roster)
+
+        # Diarized labels present in this transcript.
+        all_labels = sorted({s.get("speaker", "UNKNOWN") for s in segments} - {"UNKNOWN"})
+        resolved = set(tag_ident["speaker_map"])
+        # Skip the LLM call entirely if every cluster was tagged live.
+        if all_labels and resolved >= set(all_labels):
+            llm_ident = {"speaker_map": {}, "speaker_info": {}}
+            logger.info(f"[{meeting_id}] All {len(all_labels)} speakers resolved from live tags; skipping LLM ID")
+        else:
+            expected = ", ".join(sorted({(r.get("name") or "").strip() for r in roster} - {""}))
+            llm_ident = await step_identify_speakers(transcript_text, segments, expected)
+
+        identification = merge_speaker_identifications(tag_ident, llm_ident)
         speaker_map = identification.get("speaker_map", {})
         speaker_info = identification.get("speaker_info", {})
 
@@ -1969,6 +2079,8 @@ async def upload_meeting(
     min_speakers: Optional[int] = Form(default=None),
     max_speakers: Optional[int] = Form(default=None),
     meeting_context: Optional[str] = Form(default=None),
+    speaker_tags: Optional[str] = Form(default=None),
+    speaker_roster: Optional[str] = Form(default=None),
 ):
     """Upload an audio/video file for meeting processing."""
     # Validate file extension
@@ -2000,6 +2112,18 @@ async def upload_meeting(
     with open(tmp_path, "wb") as f:
         f.write(content)
 
+    def _parse_json_list(raw):
+        if not raw:
+            return []
+        try:
+            val = json.loads(raw)
+            return val if isinstance(val, list) else []
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+    parsed_tags = _parse_json_list(speaker_tags)
+    parsed_roster = _parse_json_list(speaker_roster)
+
     meeting = {
         "id": meeting_id,
         "date": date_str,
@@ -2011,6 +2135,8 @@ async def upload_meeting(
         "min_speakers": min_speakers,
         "max_speakers": max_speakers,
         "meeting_context": meeting_context,
+        "speaker_tags": parsed_tags,
+        "speaker_roster": parsed_roster,
         "progress_percent": 0,
         "progress_detail": "Queued",
     }
@@ -2032,6 +2158,31 @@ async def upload_meeting(
 # ---------------------------------------------------------------------------
 # Grouped Views
 # ---------------------------------------------------------------------------
+
+
+@app.get("/people")
+async def list_people():
+    """Distinct speakers seen across meetings, for live-roster autocomplete.
+
+    Most-recent meeting wins for each person's company/title.
+    """
+    # Sort meetings oldest->newest so later writes overwrite earlier ones.
+    ordered = sorted(meetings.values(), key=lambda m: (m.get("date") or "", m.get("created_at") or ""))
+    people: dict[str, dict] = {}
+    for m in ordered:
+        info = m.get("speaker_info") or {}
+        for entry in info.values():
+            if not isinstance(entry, dict):
+                continue
+            name = (entry.get("name") or "").strip()
+            if not name or name.upper().startswith("SPEAKER_"):
+                continue
+            people[name.lower()] = {
+                "name": name,
+                "company": (entry.get("company") or "").strip(),
+                "title": (entry.get("title") or "").strip(),
+            }
+    return sorted(people.values(), key=lambda p: p["name"].lower())
 
 
 def _compact_meeting_summary(mid: str, m: dict) -> dict:
@@ -3858,6 +4009,35 @@ async def capture_stop(sid: str, body: CaptureStopRequest):
     return {"ok": True}
 
 
+class CaptureTagsRequest(BaseModel):
+    markers: list[dict] = []
+    roster: list[dict] = []
+    title: Optional[str] = None
+    context: Optional[str] = None
+
+
+@app.post("/captures/{sid}/tags")
+async def capture_tags(sid: str, body: CaptureTagsRequest):
+    """Persist live speaker tags/roster/title/context onto a capture's meta.
+
+    Idempotent: the client re-sends the full current set, so we overwrite.
+    """
+    if not _valid_sid(sid):
+        raise HTTPException(status_code=400, detail="Invalid capture id")
+    meta = _read_capture_meta(sid)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Unknown capture")
+    meta["speaker_tags"] = body.markers or []
+    meta["speaker_roster"] = body.roster or []
+    if body.title is not None:
+        meta["title"] = body.title
+    if body.context is not None:
+        meta["context"] = body.context
+    meta["updated_at"] = datetime.now(timezone.utc).timestamp()
+    _write_capture_meta(sid, meta)
+    return {"ok": True, "tag_count": len(meta["speaker_tags"])}
+
+
 @app.get("/captures")
 async def capture_list():
     """List pending captures with recoverable data (newest first)."""
@@ -3915,7 +4095,7 @@ async def capture_adopt(sid: str, body: CaptureAdoptRequest):
 
     await asyncio.to_thread(_assemble)
 
-    title = (body.title or "").strip() or f"Recovered recording ({date_str})"
+    title = (body.title or "").strip() or (meta.get("title") or "").strip() or f"Recovered recording ({date_str})"
     meeting = {
         "id": new_id,
         "date": date_str,
@@ -3925,6 +4105,9 @@ async def capture_adopt(sid: str, body: CaptureAdoptRequest):
         "original_filename": meta.get("fileName") or f"capture_{sid}{ext}",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "recovered_from_capture": sid,
+        "speaker_tags": meta.get("speaker_tags") or [],
+        "speaker_roster": meta.get("speaker_roster") or [],
+        "meeting_context": meta.get("context") or None,
         "progress_percent": 0,
         "progress_detail": "Queued",
     }

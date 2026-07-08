@@ -49,7 +49,7 @@
     }
   });
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=12">
+<link rel="stylesheet" href="/static/styles.css?v=13">
 </head>
 <body>
 
@@ -120,6 +120,18 @@
   <!-- Audio Viz Row (shown during recording) -->
   <div class="cb-viz-row">
     <div class="audio-viz" id="audioViz"></div>
+    <div id="liveSpeakers" class="live-speakers" hidden>
+      <div class="live-speakers-head">
+        <span class="live-speakers-title">Who's talking</span>
+        <span id="liveTagHint" class="live-tag-hint">Tap a name when they speak</span>
+      </div>
+      <div id="liveSpeakerChips" class="live-speaker-chips"></div>
+      <div class="live-speaker-add-row">
+        <input id="liveSpeakerAdd" class="live-speaker-add" type="text"
+               list="liveSpeakerList" placeholder="Add attendee…" autocomplete="off" />
+        <datalist id="liveSpeakerList"></datalist>
+      </div>
+    </div>
     <div class="loopback-active-indicator" id="loopbackActiveIndicator" style="display:none"></div>
   </div>
 
@@ -848,7 +860,7 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=12"></script>
+<script src="/static/app.js?v=14"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js');

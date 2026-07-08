@@ -160,6 +160,24 @@ async function capMarkStopped(extra) {
   } catch (e) { /* best-effort */ }
 }
 
+// Persist the current live-tag roster/markers onto the active session's meta
+// record, so they survive a reload/crash exactly like the audio chunks do.
+async function capSaveTags(sid, roster, markers) {
+  if (!sid) return;
+  try {
+    const db = await capOpenDB();
+    const meta = await new Promise((res) => {
+      const tx = db.transaction(['meta'], 'readonly');
+      const r = tx.objectStore('meta').get(sid);
+      r.onsuccess = () => res(r.result); r.onerror = () => res(null);
+    });
+    if (!meta) return;
+    await capTx(db, 'readwrite', ['meta'], tx => {
+      tx.objectStore('meta').put({ ...meta, roster, markers });
+    });
+  } catch (e) { /* best-effort */ }
+}
+
 // Remove ONE saved session (after its successful upload or explicit discard).
 async function capClear(sid) {
   if (!sid) return;
@@ -340,6 +358,148 @@ function capStreamDelete(sid) {
   if (!sid) return;
   fetch(`${API}/captures/${sid}`, { method: 'DELETE' }).catch(() => {});
 }
+
+// Recorded-elapsed seconds — the same timeline as transcript segment start/end
+// (pause time excluded). Mirrors updateRecordTimer's basis.
+function recordedElapsedSeconds() {
+  if (!recordingStartTime) return 0;
+  const paused = pausedDuration + (pauseStartTime ? Date.now() - pauseStartTime : 0);
+  return Math.max(0, (Date.now() - recordingStartTime - paused) / 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Live speaker tagging — capture WHO is talking during the call. Markers are
+// timestamped in recorded-elapsed seconds and reconciled to diarized clusters
+// server-side after processing. Purely additive; no tags == today's behavior.
+// Names are always rendered via textContent (never innerHTML) — XSS-safe.
+// ---------------------------------------------------------------------------
+const liveTags = {
+  roster: [],        // [{name, company, title}]
+  markers: [],       // [{t, name}]
+  activeName: null,  // last-tapped (active-speaker highlight)
+  _suggestions: [],
+  el: null, chipsEl: null, addEl: null, listEl: null,
+
+  reset() {
+    this.roster = []; this.markers = []; this.activeName = null;
+    if (this.chipsEl) this.chipsEl.innerHTML = '';   // static clear
+  },
+
+  start() {
+    this.el = document.getElementById('liveSpeakers');
+    this.chipsEl = document.getElementById('liveSpeakerChips');
+    this.addEl = document.getElementById('liveSpeakerAdd');
+    this.listEl = document.getElementById('liveSpeakerList');
+    if (!this.el) return;
+    this.reset();
+    this.el.hidden = false;
+    this._loadSuggestions();          // populate datalist from GET /people (Task 8)
+    this.addEl.onkeydown = (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        this.addPerson(this.addEl.value);
+        this.addEl.value = '';
+      }
+    };
+    this.render();
+  },
+
+  stop() {
+    if (this.el) this.el.hidden = true;
+    this._flush();                    // final push to server (Task 8)
+  },
+
+  addPerson(name) {
+    name = (name || '').trim();
+    if (!name) return null;
+    let p = this.roster.find(r => r.name.toLowerCase() === name.toLowerCase());
+    if (!p) {
+      const known = (this._suggestions || []).find(s => s.name.toLowerCase() === name.toLowerCase());
+      p = { name, company: known ? known.company : '', title: known ? known.title : '' };
+      this.roster.push(p);
+      this.render();
+      this._flush();
+    }
+    return p;
+  },
+
+  removePerson(name) {
+    this.roster = this.roster.filter(r => r.name !== name);
+    this.markers = this.markers.filter(m => m.name !== name);
+    if (this.activeName === name) this.activeName = null;
+    this.render();
+    this._flush();
+  },
+
+  tag(name) {
+    const p = this.addPerson(name);
+    if (!p) return;
+    this.markers.push({ t: Math.round(recordedElapsedSeconds() * 10) / 10, name: p.name });
+    this.activeName = p.name;         // persist highlight for active-speaker mode
+    this.render();
+    this._flush();
+  },
+
+  render() {
+    if (!this.chipsEl) return;
+    this.chipsEl.innerHTML = '';      // static clear; children rebuilt below
+    for (const p of this.roster) {
+      const count = this.markers.filter(m => m.name === p.name).length;
+      const chip = document.createElement('div');
+      chip.className = 'live-speaker-chip' + (this.activeName === p.name ? ' active' : '');
+      chip.onclick = (e) => { if (!e.target.classList.contains('chip-remove')) this.tag(p.name); };
+      // Static markup only (no user data interpolated); the name is set via
+      // textContent immediately after — verified-safe DOM construction.
+      chip.innerHTML =
+        `<span class="chip-name"></span>` +
+        (count ? `<span class="chip-count">${count}</span>` : '') +
+        `<span class="chip-remove" title="Remove">×</span>`;
+      chip.querySelector('.chip-name').textContent = p.name;   // user value -> textContent
+      chip.querySelector('.chip-remove').onclick = () => this.removePerson(p.name);
+      this.chipsEl.appendChild(chip);
+    }
+  },
+
+  async _loadSuggestions() {
+    try {
+      const r = await fetch(`${API}/people`);
+      this._suggestions = r.ok ? await r.json() : [];
+    } catch (_) { this._suggestions = []; }
+    if (this.listEl) {
+      this.listEl.innerHTML = '';     // static clear
+      for (const s of (this._suggestions || [])) {
+        const opt = document.createElement('option');
+        opt.value = s.name;           // user value -> property, not HTML
+        this.listEl.appendChild(opt);
+      }
+    }
+  },
+
+  // Best-effort mirror of the current tags to the server capture (survives
+  // device death → adopt). Debounced; never blocks the UI.
+  _flush() {
+    if (!capSessionId) return;
+    clearTimeout(this._flushTimer);
+    this._flushTimer = setTimeout(() => {
+      // Local save always happens — this is what lets tags survive a
+      // reload/crash even when server streaming backup is switched off.
+      capSaveTags(capSessionId, this.roster.slice(), this.markers.slice());
+      if (!streamBackupEnabled()) return;
+      const titleEl = document.getElementById('meetingTitle');
+      const ctxEl = document.getElementById('meetingContext');
+      fetch(`${API}/captures/${capSessionId}/tags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          markers: this.markers,
+          roster: this.roster,
+          title: titleEl ? titleEl.value.trim() : '',
+          context: ctxEl ? ctxEl.value.trim() : '',
+        }),
+      }).catch(() => {});
+    }, 400);
+  },
+};
 
 const recordBtn = $('recordBtn');
 const recordArea = $('recordArea');
@@ -661,6 +821,7 @@ function setupRecorderFromStream(stream, usingLoopback, loopbackName) {
     capStartSession(capMeta);
     // Also mirror this recording to the server as it records (best-effort shadow backup).
     capStreamStart(capSessionId, capMeta);
+    liveTags.start();
 
     mediaRecorder.ondataavailable = e => {
       if (e.data.size > 0) {
@@ -807,6 +968,7 @@ function onRecordingStopped() {
   $('loopbackGearBtn').style.display = '';
   document.querySelector('.rec-dot').style.animationPlayState = '';
   hideCaptureWarning();
+  liveTags.stop();
 
   if (!recordedChunks.length) return;
 
@@ -981,6 +1143,18 @@ uploadBtn.addEventListener('click', async () => {
   const context = $('meetingContext').value.trim();
   if (context) form.append('meeting_context', context);
 
+  // Live speaker tags (only present when the file came from a tagged recording).
+  if (stagedSessionId && liveTags.markers.length) {
+    form.append('speaker_tags', JSON.stringify(liveTags.markers));
+    form.append('speaker_roster', JSON.stringify(liveTags.roster));
+    // Prefill #speakers from roster size if the user left it blank. Only set
+    // max — leave min unset so pyannote can auto-detect the minimum (avoids
+    // force-splitting a real speaker if a pre-added attendee never speaks).
+    if (!$('numSpeakers').value && liveTags.roster.length) {
+      form.set('max_speakers', String(liveTags.roster.length));
+    }
+  }
+
   try {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `${API}/meetings/upload`);
@@ -1013,6 +1187,7 @@ uploadBtn.addEventListener('click', async () => {
           $('meetingTitle').value = '';
           $('numSpeakers').value = '';
           $('meetingContext').value = '';
+          liveTags.reset();
           $('progressFill').style.width = '0%';
         }, 2000);
         refreshMeetings();
@@ -3513,6 +3688,8 @@ function renderRecoveryList(pendings, serverCaptures) {
       selectFile(new File([blob], name, { type: mt }));
       stagedFromRecording = true;   // keep it protected until uploaded
       stagedSessionId = sid;
+      liveTags.roster = Array.isArray(meta.roster) ? meta.roster : [];
+      liveTags.markers = Array.isArray(meta.markers) ? meta.markers : [];
       row.remove();
       hideIfEmpty();
     });

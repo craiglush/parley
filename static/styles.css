@@ -2455,3 +2455,30 @@ body {
 }
 .trim-error { color: var(--red); font-size: 12px; }
 .trim-actions { display: flex; justify-content: flex-end; }
+
+
+/* Live speaker tagging panel (inside the capture banner) */
+.live-speakers { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border, #333); }
+.live-speakers[hidden] { display: none; }
+.live-speakers-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.live-speakers-title { font-weight: 600; font-size: 0.85rem; }
+.live-tag-hint { font-size: 0.72rem; opacity: 0.6; }
+.live-speaker-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.live-speaker-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 14px; cursor: pointer;
+  border: 1px solid var(--accent, #4a9eff); background: transparent;
+  color: var(--text, #eee); font-size: 0.82rem; transition: background 0.12s, transform 0.06s;
+}
+.live-speaker-chip:hover { background: rgba(74,158,255,0.12); }
+.live-speaker-chip:active { transform: scale(0.96); }
+.live-speaker-chip.active { background: var(--accent, #4a9eff); color: #fff; }
+.live-speaker-chip .chip-count { font-size: 0.7rem; opacity: 0.7; }
+.live-speaker-chip .chip-remove { opacity: 0.55; font-weight: 700; padding: 0 2px; }
+.live-speaker-chip .chip-remove:hover { opacity: 1; color: var(--red, #ff5c5c); }
+.live-speaker-add-row { margin-top: 6px; }
+.live-speaker-add {
+  width: 100%; max-width: 220px; padding: 5px 8px; font-size: 0.82rem;
+  border-radius: 8px; border: 1px solid var(--border, #333);
+  background: var(--input-bg, #1a1a1a); color: var(--text, #eee);
+}
