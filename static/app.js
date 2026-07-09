@@ -178,6 +178,35 @@ async function capSaveTags(sid, roster, markers) {
   } catch (e) { /* best-effort */ }
 }
 
+// Set (or clear) the auto-upload `queued` flag on a session's meta record, using
+// the same read-modify-write path as capSaveTags. When queueing (queued=true) we
+// also persist the just-submitted title/speakers/context so the background flush
+// reproduces the exact payload the user hit Upload with (meta already stores the
+// live-tag roster/markers via capSaveTags). Best-effort; never throws.
+async function capSetQueued(sid, queued, session) {
+  if (!sid) return;
+  try {
+    const db = await capOpenDB();
+    const meta = await new Promise((res) => {
+      const tx = db.transaction(['meta'], 'readonly');
+      const r = tx.objectStore('meta').get(sid);
+      r.onsuccess = () => res(r.result); r.onerror = () => res(null);
+    });
+    if (!meta) return;
+    const next = { ...meta, queued: !!queued };
+    if (queued && session) {
+      if (session.title != null) next.title = session.title;
+      if (session.speakers != null) next.speakers = session.speakers;
+      if (session.context != null) next.context = session.context;
+      if (Array.isArray(session.markers)) next.markers = session.markers;
+      if (Array.isArray(session.roster)) next.roster = session.roster;
+    }
+    await capTx(db, 'readwrite', ['meta'], tx => {
+      tx.objectStore('meta').put(next);
+    });
+  } catch (e) { /* best-effort */ }
+}
+
 // Remove ONE saved session (after its successful upload or explicit discard).
 async function capClear(sid) {
   if (!sid) return;
@@ -1116,6 +1145,178 @@ $('removeFile').addEventListener('click', () => {
   stagedSilent = false;
 });
 
+// ---------------------------------------------------------------------------
+// Offline upload queue — the interactive Upload and the background flush share
+// ONE upload code path (buildUploadForm + uploadSession). A session auto-uploads
+// ONLY if the user explicitly hit Upload and it failed for a NETWORK reason
+// (gated on the persisted meta.queued flag). Crash-recovered-but-never-submitted
+// drafts stay in the manual recover/discard list. See
+// docs/superpowers/specs/2026-07-09-offline-upload-queue-design.md.
+// ---------------------------------------------------------------------------
+
+// Assemble the multipart body shared by the interactive upload and the queue
+// flush, so both produce an IDENTICAL payload. `session` carries the audio blob
+// plus persisted meta; optional title/speakers/context/markers/roster override
+// the meta fallbacks (the interactive path passes the live form values, the
+// queue path relies on what was persisted at queue time via capSetQueued).
+function buildUploadForm(session) {
+  const meta = session.meta || {};
+  const blob = session.blob;
+  const mt = meta.mimeType || (blob && blob.type) || 'audio/webm';
+  const name = meta.fileName || 'recording.webm';
+  const file = (blob instanceof File) ? blob : new File([blob], name, { type: mt });
+
+  const form = new FormData();
+  form.append('file', file);
+
+  // Capture session id → server-side upload idempotency: a retry after a lost
+  // 202, or a second context flushing the same queued session, dedups to one
+  // meeting instead of creating duplicates. Absent for disk-picked files.
+  if (session.sid) form.append('sid', session.sid);
+
+  const title = String(session.title != null ? session.title : (meta.title || '')).trim();
+  if (title) form.append('title', title);
+
+  const speakers = String(session.speakers != null ? session.speakers : (meta.speakers || ''));
+  if (speakers) {
+    form.append('min_speakers', speakers);
+    form.append('max_speakers', speakers);
+  }
+
+  const context = String(session.context != null ? session.context : (meta.context || '')).trim();
+  if (context) form.append('meeting_context', context);
+
+  // Live speaker tags (only present when the file came from a tagged recording).
+  const markers = Array.isArray(session.markers) ? session.markers
+                : Array.isArray(meta.markers) ? meta.markers : [];
+  const roster = Array.isArray(session.roster) ? session.roster
+               : Array.isArray(meta.roster) ? meta.roster : [];
+  if (markers.length) {
+    form.append('speaker_tags', JSON.stringify(markers));
+    form.append('speaker_roster', JSON.stringify(roster));
+    // Prefill #speakers from roster size if the user left it blank. Only set
+    // max — leave min unset so pyannote can auto-detect the minimum (avoids
+    // force-splitting a real speaker if a pre-added attendee never speaks).
+    if (!speakers && roster.length) {
+      form.set('max_speakers', String(roster.length));
+    }
+  }
+  return form;
+}
+
+// Perform ONE upload attempt for a captured session. Wraps the XHR in a promise
+// so the interactive path keeps its progress bar (via session.onProgress) and
+// the queue path can await it. Resolves:
+//   { ok:true, meetingId }                  on 202
+//   { ok:false, kind:'validation', detail } on 400/413 (permanent — user must fix)
+//   { ok:false, kind:'network' }            on connection failure/timeout/5xx/redirect
+// Side effect: on a network result it flags meta.queued=true (persist for the
+// flush loop); on a validation result it clears meta.queued. Success cleanup is
+// left to the callers (they own the staged UI / recovery-list state).
+async function uploadSession(session) {
+  const sid = session.sid;
+  const form = buildUploadForm(session);
+  const result = await new Promise((resolve) => {
+    let settled = false;
+    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', `${API}/meetings/upload`);
+      if (session.onProgress) {
+        xhr.upload.addEventListener('progress', e => {
+          if (e.lengthComputable) session.onProgress(Math.round((e.loaded / e.total) * 100));
+        });
+      }
+      xhr.onload = () => {
+        if (xhr.status === 202) {
+          let meetingId = null;
+          try { meetingId = JSON.parse(xhr.responseText).meeting_id; } catch (_) {}
+          done({ ok: true, meetingId });
+        } else if (xhr.status === 400 || xhr.status === 413) {
+          let detail = `Upload rejected (${xhr.status})`;
+          try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
+          done({ ok: false, kind: 'validation', detail });
+        } else {
+          // 5xx / unexpected status / auth redirect: retryable, treat as network.
+          done({ ok: false, kind: 'network' });
+        }
+      };
+      xhr.onerror = () => done({ ok: false, kind: 'network' });
+      xhr.ontimeout = () => done({ ok: false, kind: 'network' });
+      xhr.send(form);
+    } catch (_) {
+      done({ ok: false, kind: 'network' });
+    }
+  });
+
+  if (!result.ok && result.kind === 'network') {
+    await capSetQueued(sid, true, session);       // arm auto-retry (idempotent)
+  } else if (!result.ok && result.kind === 'validation') {
+    await capSetQueued(sid, false);               // permanent: never auto-retry
+  }
+  return result;
+}
+
+// Sessions successfully uploaded during THIS page's lifetime. Belt-and-braces
+// against a silently-failed capClear (the IndexedDB delete swallows its errors):
+// even if the local delete never commits, we never re-POST a sid we already got a
+// 202 for, so a later periodic tick can't turn one recording into two meetings.
+// (Reset on reload; true exactly-once across reloads would need a server-side
+// idempotency key on the sid — noted as a follow-up in the design doc.)
+const uploadedSids = new Set();
+
+// Run `fn` under a device-wide exclusive lock so only ONE app context flushes at
+// a time. The installed PWA window and a browser tab share the same IndexedDB, so
+// a per-page boolean can't stop two contexts racing the same queued session into
+// duplicate meetings. `ifAvailable` means a second context skips its pass rather
+// than queueing behind the first. Falls back to a per-page flag where the Web
+// Locks API is unavailable (non-secure context / older engines).
+let flushing = false;
+function withFlushLock(fn) {
+  if (navigator.locks && navigator.locks.request) {
+    return navigator.locks.request('meeting-upload-flush', { ifAvailable: true }, (lock) => {
+      if (!lock) return undefined;        // another context already holds the flush lock
+      return fn();
+    });
+  }
+  if (flushing) return Promise.resolve();
+  flushing = true;
+  return Promise.resolve().then(fn).finally(() => { flushing = false; });
+}
+
+// Sequentially upload every queued session (meta.queued===true), newest-first.
+// Serialized across every app context by withFlushLock so overlapping triggers
+// (online event + periodic tick + a second tab) can't create duplicate meetings.
+// A network result keeps the session queued and STOPS the pass (no point hammering
+// while still offline); a validation result clears queued and hands the session
+// back to the manual list. After each success the recovery UI is refreshed.
+async function flushUploadQueue() {
+  return withFlushLock(async () => {
+    try {
+      const pending = await capLoadAllPending();                 // [{meta, blob}], excludes active recording
+      const queued = selectQueuedSessions(pending.map(p => p.meta), capSessionId, uploadedSids);
+      for (const meta of queued) {
+        const entry = pending.find(p => p.meta.k === meta.k);
+        if (!entry) continue;
+        const result = await uploadSession({ blob: entry.blob, meta, sid: meta.k, fromQueue: true });
+        if (result.ok) {
+          uploadedSids.add(meta.k);        // mark BEFORE the delete so a failed delete can't cause a re-upload
+          await capClear(meta.k);          // await so the delete commits before we re-read the list
+          capStreamDelete(meta.k);
+          refreshMeetings();
+          startPolling();
+          await checkPendingRecording();   // refresh the recovery/queue list live
+        } else if (result.kind === 'network') {
+          break;                            // still offline — stop, retry later
+        } else {
+          // validation: uploadSession cleared queued; leave it for the manual list.
+          await checkPendingRecording();
+        }
+      }
+    } catch (e) { /* best-effort */ }
+  });
+}
+
 uploadBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
 
@@ -1128,93 +1329,80 @@ uploadBtn.addEventListener('click', async () => {
   const progress = $('uploadProgress');
   progress.classList.add('visible');
 
-  const form = new FormData();
-  form.append('file', selectedFile);
+  // Assemble the session from the live form. The queue path reproduces the same
+  // payload from persisted meta (capSetQueued stores title/speakers/context/tags).
+  const tagged = !!(stagedSessionId && liveTags.markers.length);
+  const session = {
+    blob: selectedFile,
+    meta: { mimeType: selectedFile.type, fileName: selectedFile.name },
+    sid: stagedSessionId,
+    title: $('meetingTitle').value.trim(),
+    speakers: $('numSpeakers').value,
+    context: $('meetingContext').value.trim(),
+    markers: tagged ? liveTags.markers.slice() : [],
+    roster: tagged ? liveTags.roster.slice() : [],
+    onProgress: (pct) => {
+      $('progressFill').style.width = pct + '%';
+      $('progressText').textContent = pct < 100 ? `Uploading... ${pct}%` : 'Processing started...';
+    },
+  };
 
-  const title = $('meetingTitle').value.trim();
-  if (title) form.append('title', title);
+  const result = await uploadSession(session);
 
-  const speakers = $('numSpeakers').value;
-  if (speakers) {
-    form.append('min_speakers', speakers);
-    form.append('max_speakers', speakers);
-  }
-
-  const context = $('meetingContext').value.trim();
-  if (context) form.append('meeting_context', context);
-
-  // Live speaker tags (only present when the file came from a tagged recording).
-  if (stagedSessionId && liveTags.markers.length) {
-    form.append('speaker_tags', JSON.stringify(liveTags.markers));
-    form.append('speaker_roster', JSON.stringify(liveTags.roster));
-    // Prefill #speakers from roster size if the user left it blank. Only set
-    // max — leave min unset so pyannote can auto-detect the minimum (avoids
-    // force-splitting a real speaker if a pre-added attendee never speaks).
-    if (!$('numSpeakers').value && liveTags.roster.length) {
-      form.set('max_speakers', String(liveTags.roster.length));
-    }
-  }
-
-  try {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${API}/meetings/upload`);
-
-    xhr.upload.addEventListener('progress', e => {
-      if (e.lengthComputable) {
-        const pct = Math.round((e.loaded / e.total) * 100);
-        $('progressFill').style.width = pct + '%';
-        $('progressText').textContent = pct < 100 ? `Uploading... ${pct}%` : 'Processing started...';
-      }
-    });
-
-    xhr.onload = () => {
-      if (xhr.status === 202) {
-        const data = JSON.parse(xhr.responseText);
-        $('progressText').textContent = `Queued! Meeting ID: ${data.meeting_id}`;
-        stagedFromRecording = false;
-        stagedSilent = false;
-        hideCaptureWarning();
-        // Persisted server-side now — drop this session's autosave + shadow copy.
-        capClear(stagedSessionId);
-        capStreamDelete(stagedSessionId);
-        stagedSessionId = null;
-        setTimeout(() => {
-          selectedFile = null;
-          fileInput.value = '';
-          uploadFields.classList.remove('visible');
-          progress.classList.remove('visible');
-          uploadBtn.disabled = false;
-          $('meetingTitle').value = '';
-          $('numSpeakers').value = '';
-          $('meetingContext').value = '';
-          liveTags.reset();
-          $('progressFill').style.width = '0%';
-        }, 2000);
-        refreshMeetings();
-        startPolling();
-      } else if (xhr.status === 400 || xhr.status === 413) {
-        // Validation error
-        try {
-          const errData = JSON.parse(xhr.responseText);
-          $('progressText').textContent = errData.detail || 'Upload rejected';
-        } catch (_) {
-          $('progressText').textContent = `Upload rejected (${xhr.status})`;
-        }
-        uploadBtn.disabled = false;
-      } else {
-        $('progressText').textContent = 'Upload failed: ' + xhr.statusText;
-        uploadBtn.disabled = false;
-      }
-    };
-
-    xhr.onerror = () => {
-      $('progressText').textContent = 'Upload error. Check connection.';
+  if (result.ok) {
+    $('progressText').textContent = `Queued! Meeting ID: ${result.meetingId}`;
+    // Persisted server-side now — drop this session's autosave + shadow copy + any silent warning.
+    stagedFromRecording = false;
+    stagedSilent = false;
+    hideCaptureWarning();
+    if (stagedSessionId) uploadedSids.add(stagedSessionId);  // a failed local delete must not trigger a flush re-upload
+    capClear(stagedSessionId);
+    capStreamDelete(stagedSessionId);
+    stagedSessionId = null;
+    setTimeout(() => {
+      selectedFile = null;
+      fileInput.value = '';
+      uploadFields.classList.remove('visible');
+      progress.classList.remove('visible');
       uploadBtn.disabled = false;
-    };
-
-    xhr.send(form);
-  } catch (err) {
-    $('progressText').textContent = 'Error: ' + err.message;
+      $('meetingTitle').value = '';
+      $('numSpeakers').value = '';
+      $('meetingContext').value = '';
+      liveTags.reset();
+      $('progressFill').style.width = '0%';
+    }, 2000);
+    refreshMeetings();
+    startPolling();
+  } else if (result.kind === 'validation') {
+    // Permanent rejection — behave as today; uploadSession already cleared queued.
+    $('progressText').textContent = result.detail || 'Upload rejected';
+    uploadBtn.disabled = false;
+  } else if (stagedSessionId) {
+    // Network failure on a recording: uploadSession has flagged it queued and it
+    // is safe in IndexedDB. Clear the staging box; the flush loop uploads it
+    // automatically once connectivity returns.
+    $('progressText').textContent = 'Offline — queued, will upload automatically when connected';
+    stagedFromRecording = false;
+    stagedSilent = false;
+    hideCaptureWarning();
+    stagedSessionId = null;
+    selectedFile = null;
+    fileInput.value = '';
+    liveTags.reset();
+    setTimeout(() => {
+      uploadFields.classList.remove('visible');
+      progress.classList.remove('visible');
+      uploadBtn.disabled = false;
+      $('meetingTitle').value = '';
+      $('numSpeakers').value = '';
+      $('meetingContext').value = '';
+      $('progressFill').style.width = '0%';
+    }, 2500);
+    checkPendingRecording();   // surface the queued row in the recovery list
+  } else {
+    // A file picked from disk isn't autosaved, so it can't be queued — keep it
+    // in the box for a manual retry, exactly as before.
+    $('progressText').textContent = 'Upload error. Check connection.';
     uploadBtn.disabled = false;
   }
 });
@@ -3674,6 +3862,40 @@ function renderRecoveryList(pendings, serverCaptures) {
     const ext = mt.includes('ogg') ? '.ogg' : mt.includes('mp4') ? '.m4a' : '.webm';
     const name = meta.fileName || `recovered_${new Date(meta.startedAt || Date.now()).toISOString().slice(0,10)}${ext}`;
 
+    // Queued sessions auto-upload — render them distinctly from never-submitted
+    // recovered drafts. The user explicitly hit Upload on these and it failed for
+    // a network reason; the flush loop retries them automatically.
+    if (meta.queued) {
+      const row = document.createElement('div');
+      row.className = 'cap-recovery-row';
+
+      const msg = document.createElement('span');
+      msg.className = 'cap-recovery-msg';
+      msg.textContent = `📤 Queued — uploads automatically when connected — ${when}${dur} — ${sizeKb} KB`;
+
+      const uploadNowBtn = document.createElement('button');
+      uploadNowBtn.className = 'cap-recovery-btn';
+      uploadNowBtn.textContent = 'Upload now';
+      uploadNowBtn.addEventListener('click', () => { flushUploadQueue(); });
+
+      const discardBtn = document.createElement('button');
+      discardBtn.className = 'cap-recovery-btn cap-recovery-discard';
+      discardBtn.textContent = 'Discard';
+      discardBtn.addEventListener('click', () => {
+        if (!confirm('Permanently discard this queued recording? It has not been uploaded.')) return;
+        capClear(sid);
+        capStreamDelete(sid);   // drop the server shadow copy too
+        row.remove();
+        hideIfEmpty();
+      });
+
+      row.appendChild(msg);
+      row.appendChild(uploadNowBtn);
+      row.appendChild(discardBtn);
+      el.appendChild(row);
+      continue;
+    }
+
     const row = document.createElement('div');
     row.className = 'cap-recovery-row';
 
@@ -3794,8 +4016,16 @@ async function checkPendingRecording() {
     try { server = await fetch(`${API}/captures`).then(r => r.ok ? r.json() : []); } catch (_) {}
     renderRecoveryList(local, server);
   } catch (e) { /* recovery is best-effort */ }
+  // Auto-flush any session the user already submitted that failed for a network
+  // reason. Fire-and-forget; the `flushing` guard makes re-entry a no-op (this
+  // is also called from inside the flush loop to refresh the list live).
+  flushUploadQueue();
 }
 checkPendingRecording();
+// Retry the offline upload queue when connectivity returns and on a slow timer
+// (covers browser-online-but-server-unreachable: box rebooting, VPN/Authelia).
+window.addEventListener('online', flushUploadQueue);
+setInterval(() => { if (navigator.onLine) flushUploadQueue(); }, 60000);
 
 // ---------------------------------------------------------------------------
 // Unsaved-recording guards: warn before leaving / navigating away while a

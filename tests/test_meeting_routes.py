@@ -320,6 +320,71 @@ def test_upload_validation_and_enqueue(tmp_path, monkeypatch):
     assert body["meeting_id"] in app.meetings
 
 
+# --------------------------------------------------------------------------- upload idempotency (sid dedup)
+
+def _upload_noop(app, monkeypatch):
+    async def _noop(meeting_id):
+        return None
+    monkeypatch.setattr(app, "process_meeting", _noop)
+
+
+def test_upload_with_sid_stores_source_sid(tmp_path, monkeypatch):
+    client, app, _ = _client(tmp_path, monkeypatch)
+    _upload_noop(app, monkeypatch)
+
+    r = client.post("/meetings/upload",
+                    files={"file": ("rec.wav", b"RIFFxxxxWAVE", "audio/wav")},
+                    data={"sid": "cap-abc-12345678"})
+    assert r.status_code == 202, r.text
+    mid = r.json()["meeting_id"]
+    assert app.meetings[mid]["source_sid"] == "cap-abc-12345678"
+
+
+def test_upload_same_sid_is_idempotent(tmp_path, monkeypatch):
+    client, app, _ = _client(tmp_path, monkeypatch)
+    _upload_noop(app, monkeypatch)
+
+    first = client.post("/meetings/upload",
+                        files={"file": ("rec.wav", b"RIFFxxxxWAVE", "audio/wav")},
+                        data={"sid": "cap-abc-12345678"})
+    assert first.status_code == 202, first.text
+    mid1 = first.json()["meeting_id"]
+
+    # Re-POST the SAME sid (e.g. a second tab flushing, or a lost-202 retry).
+    second = client.post("/meetings/upload",
+                         files={"file": ("rec.wav", b"RIFFxxxxWAVE", "audio/wav")},
+                         data={"sid": "cap-abc-12345678"})
+    assert second.status_code == 202, second.text
+    # Same meeting id returned, and NO duplicate created.
+    assert second.json()["meeting_id"] == mid1
+    assert len([m for m in app.meetings.values() if m.get("source_sid") == "cap-abc-12345678"]) == 1
+    assert len(app.meetings) == 1
+
+
+def test_upload_without_sid_not_deduped(tmp_path, monkeypatch):
+    client, app, _ = _client(tmp_path, monkeypatch)
+    _upload_noop(app, monkeypatch)
+
+    a = client.post("/meetings/upload", files={"file": ("rec.wav", b"RIFFxxxxWAVE", "audio/wav")})
+    b = client.post("/meetings/upload", files={"file": ("rec.wav", b"RIFFxxxxWAVE", "audio/wav")})
+    assert a.status_code == 202 and b.status_code == 202
+    assert a.json()["meeting_id"] != b.json()["meeting_id"]
+    assert len(app.meetings) == 2
+
+
+def test_upload_invalid_sid_still_uploads_without_dedup(tmp_path, monkeypatch):
+    client, app, _ = _client(tmp_path, monkeypatch)
+    _upload_noop(app, monkeypatch)
+
+    # A malformed sid must not reject the upload and must not be used for dedup.
+    r = client.post("/meetings/upload",
+                    files={"file": ("rec.wav", b"RIFFxxxxWAVE", "audio/wav")},
+                    data={"sid": "bad sid!"})
+    assert r.status_code == 202, r.text
+    mid = r.json()["meeting_id"]
+    assert app.meetings[mid].get("source_sid") is None
+
+
 # --------------------------------------------------------------------------- insight_id path-traversal guard
 
 def test_insight_id_validation(tmp_path, monkeypatch):

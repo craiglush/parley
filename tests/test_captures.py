@@ -139,6 +139,35 @@ def test_adopt_never_stopped_capture(tmp_path, monkeypatch):
     assert r.json()["title"].startswith("Recovered recording")
 
 
+def test_adopt_stores_source_sid(tmp_path, monkeypatch):
+    """Adopt records source_sid so a later local-blob flush upload dedups against it."""
+    client, app, _ = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(app, "process_meeting", lambda mid: _acoro())
+    client.post("/captures", json={"sid": SID})
+    _post_chunk(client, SID, 0, b"partial")
+    r = client.post(f"/captures/{SID}/adopt", json={})
+    assert r.status_code == 202, r.text
+    assert app.meetings[r.json()["meeting_id"]]["source_sid"] == SID
+
+
+def test_adopt_dedups_against_prior_upload(tmp_path, monkeypatch):
+    """If the local blob already uploaded this sid, adopting the server copy must
+    not create a second meeting — it returns the existing one."""
+    client, app, _ = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(app, "process_meeting", lambda mid: _acoro())
+    app.meetings["existing1"] = {
+        "id": "existing1", "date": "2026-07-09", "title": "Already uploaded",
+        "status": app.MeetingStatus.queued, "source_sid": SID,
+    }
+    client.post("/captures", json={"sid": SID})
+    _post_chunk(client, SID, 0, b"partial")
+    r = client.post(f"/captures/{SID}/adopt", json={})
+    assert r.status_code == 202, r.text
+    assert r.json()["meeting_id"] == "existing1"
+    assert len(app.meetings) == 1                      # no duplicate
+    assert not (tmp_path / "_captures" / SID).exists()  # redundant staging cleaned up
+
+
 def test_adopt_empty_404(tmp_path, monkeypatch):
     client, app, _ = _client(tmp_path, monkeypatch)
     client.post("/captures", json={"sid": SID})

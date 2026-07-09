@@ -2081,6 +2081,7 @@ async def upload_meeting(
     meeting_context: Optional[str] = Form(default=None),
     speaker_tags: Optional[str] = Form(default=None),
     speaker_roster: Optional[str] = Form(default=None),
+    sid: Optional[str] = Form(default=None),
 ):
     """Upload an audio/video file for meeting processing."""
     # Validate file extension
@@ -2102,6 +2103,23 @@ async def upload_meeting(
                 "detail": f"File too large ({len(content) / (1024*1024):.1f} MB). Maximum: {MAX_UPLOAD_SIZE / (1024*1024):.0f} MB"
             },
         )
+
+    # Idempotency: if this capture session was already turned into a meeting —
+    # a second tab flushing the offline queue, or a retry after a lost 202 —
+    # return that meeting instead of creating a duplicate (a duplicate would
+    # spawn a second GPU transcription job). The scan below and the insert
+    # further down run with no `await` between them, so two concurrent uploads
+    # of the same sid can't both slip past this check. A malformed sid is
+    # ignored (not used for dedup, not stored) rather than rejected.
+    valid_sid = sid if _valid_sid(sid) else None
+    if valid_sid:
+        for existing_id, m in meetings.items():
+            if m.get("source_sid") == valid_sid:
+                logger.info(f"[{existing_id}] Duplicate upload for capture {valid_sid} — returning existing meeting")
+                return JSONResponse(
+                    content={"meeting_id": existing_id, "status": "queued"},
+                    status_code=202,
+                )
 
     meeting_id = str(uuid.uuid4())[:8]
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2137,6 +2155,7 @@ async def upload_meeting(
         "meeting_context": meeting_context,
         "speaker_tags": parsed_tags,
         "speaker_roster": parsed_roster,
+        "source_sid": valid_sid,        # for upload idempotency (None when absent/invalid)
         "progress_percent": 0,
         "progress_detail": "Queued",
     }
@@ -4081,6 +4100,18 @@ async def capture_adopt(sid: str, body: CaptureAdoptRequest):
     if not parts:
         raise HTTPException(status_code=404, detail="Capture has no data")
 
+    # Idempotency across recovery paths: if the local blob already uploaded this
+    # capture (a meeting carries source_sid == sid), don't create a second meeting —
+    # return the existing one and drop the now-redundant staging dir.
+    for existing_id, m in meetings.items():
+        if m.get("source_sid") == sid:
+            shutil.rmtree(_capture_dir(sid), ignore_errors=True)
+            logger.info(f"[{existing_id}] Adopt for already-uploaded capture {sid} — returning existing meeting")
+            return JSONResponse(
+                content={"meeting_id": existing_id, "title": m.get("title"), "status": "queued"},
+                status_code=202,
+            )
+
     mime = meta.get("mimeType", "audio/webm")
     ext = ".ogg" if "ogg" in mime else ".m4a" if "mp4" in mime else ".webm"
     new_id = str(uuid.uuid4())[:8]
@@ -4105,6 +4136,8 @@ async def capture_adopt(sid: str, body: CaptureAdoptRequest):
         "original_filename": meta.get("fileName") or f"capture_{sid}{ext}",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "recovered_from_capture": sid,
+        "source_sid": sid,              # upload idempotency: a later blob-flush upload dedups against this
+
         "speaker_tags": meta.get("speaker_tags") or [],
         "speaker_roster": meta.get("speaker_roster") or [],
         "meeting_context": meta.get("context") or None,

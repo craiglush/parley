@@ -1,10 +1,11 @@
-const CACHE_NAME = 'meetings-v13-speaker-tagging';
+const CACHE_NAME = 'meetings-v14-offline-queue';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.
 const SHELL_ASSETS = [
   '/',
   '/static/styles.css',
+  '/static/queue-logic.js',
   '/static/app.js',
   '/static/floating-chat.js',
   '/static/notes-tasks.css',
