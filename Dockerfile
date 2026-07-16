@@ -13,6 +13,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
+COPY integrations/ ./integrations/
 COPY static/ ./static/
 
 EXPOSE 8000

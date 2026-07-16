@@ -26,7 +26,7 @@ def _validate_artifact_id(value: str, kind: str = "id") -> None:
 def _atomic_write(path: Path, content: str):
     """Write content to a file atomically via a temp file + rename."""
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(content)
+    tmp_path.write_text(content, encoding="utf-8")
     tmp_path.replace(path)
 
 

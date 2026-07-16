@@ -2400,6 +2400,43 @@ body {
   }
 }
 
+/* In-meeting Notes (collapsible; writes a real vault note via NotesSync) */
+.capture-notes {
+  margin: 0 24px 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.capture-notes-head { display: flex; align-items: baseline; gap: 10px; }
+.capture-notes-toggle {
+  background: none; border: none; padding: 0;
+  color: var(--text-primary); font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.capture-notes-chevron { display: inline-block; width: 1em; }
+.capture-notes-status {
+  color: var(--text-muted); font-size: 12px; flex: 1 1 auto; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.capture-notes-body { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.capture-notes-body[hidden] { display: none; }
+.capture-notes-text {
+  width: 100%; resize: vertical; min-height: 72px;
+  padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-primary, transparent); color: var(--text-primary);
+  font-size: 13px; line-height: 1.5; font-family: inherit;
+}
+.capture-notes-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.capture-notes-attach {
+  padding: 5px 12px; border: 1px solid var(--border); background: transparent;
+  color: var(--text-secondary); border-radius: var(--radius-sm);
+  font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.capture-notes-attach:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.capture-notes-attach:disabled { opacity: 0.5; cursor: not-allowed; }
+.capture-notes-hint { color: var(--text-muted); font-size: 12px; }
+
 /* --- Unsaved-recording recovery banner (lists every autosaved session) --- */
 .capture-recovery {
   display: flex;
@@ -2482,3 +2519,74 @@ body {
   border-radius: 8px; border: 1px solid var(--border, #333);
   background: var(--input-bg, #1a1a1a); color: var(--text, #eee);
 }
+
+/* ── Pencil-icon inline editing (edit-everything) ─────────────────────── */
+.pencil-btn {
+  background: none; border: none; cursor: pointer; color: var(--text-muted);
+  font-size: 13px; padding: 2px 4px; margin-left: 6px; opacity: 0;
+  transition: opacity 0.15s; vertical-align: middle;
+}
+h2:hover .pencil-btn, .summary-section h3:hover .pencil-btn,
+.summary-section li:hover .pencil-btn, .action-item:hover .pencil-btn,
+.speaker-chip:hover .pencil-btn { opacity: 1; }
+.pencil-btn:hover { color: var(--accent); }
+/* Touch devices have no hover — keep pencils faintly visible */
+@media (hover: none) { .pencil-btn { opacity: 0.6; } }
+.speaker-chip .pencil-btn { margin-left: 2px; font-size: 11px; }
+
+.inline-edit-input {
+  width: 100%; font: inherit; color: var(--text-primary);
+  background: var(--bg-input); border: 1px solid var(--accent);
+  border-radius: 6px; padding: 6px 8px; margin: 2px 0; box-sizing: border-box;
+}
+textarea.inline-edit-input { resize: vertical; min-height: 60px; }
+.inline-edit-label { display: block; font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+.inline-edit-actions { display: flex; gap: 6px; margin-top: 4px; }
+
+/* Segment text edit — sits beside .seg-annotate-btn (right: 4px) */
+.seg-edit-btn {
+  position: absolute; right: 26px; top: 50%; transform: translateY(-50%);
+  opacity: 0; transition: opacity 0.15s; background: none; border: none;
+  cursor: pointer; font-size: 14px; color: var(--text-muted); padding: 2px 4px;
+}
+.transcript-segment:hover .seg-edit-btn { opacity: 1; }
+.seg-edit-btn:hover { color: var(--accent); }
+@media (hover: none) { .seg-edit-btn, .seg-annotate-btn { opacity: 0.5; } }
+
+/* "Re-run analysis" banner at the top of the transcript tab */
+.reanalysis-banner {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 12px; margin-bottom: 12px; border-radius: 8px;
+  border: 1px solid var(--yellow); background: var(--yellow-dim);
+  font-size: 13px;
+}
+.reanalysis-note { color: var(--text-muted); font-size: 12px; }
+
+/* Company tag chip (meeting detail header) */
+.company-chip {
+  display: inline-flex; align-items: center;
+  padding: 1px 10px; border-radius: 10px; cursor: pointer;
+  font-size: 12px; white-space: nowrap; max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.company-chip.confirmed {
+  color: var(--accent); background: var(--accent-dim);
+  border: 1px solid transparent;
+}
+.company-chip.suggested {
+  color: var(--text-muted); background: transparent;
+  border: 1px dashed var(--border);
+}
+.company-chip.empty {
+  color: var(--text-muted); background: transparent;
+  border: 1px solid transparent; opacity: 0.7;
+}
+.company-chip.empty:hover, .company-chip.suggested:hover {
+  border-color: var(--accent); color: var(--accent);
+}
+.company-chip-confirm {
+  background: none; border: 1px solid var(--border); border-radius: 10px;
+  color: var(--green, #3fb950); cursor: pointer; font-size: 12px;
+  padding: 0 6px; line-height: 18px; margin-left: 4px;
+}
+.company-chip-confirm:hover { border-color: var(--green, #3fb950); }

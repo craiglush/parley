@@ -52,7 +52,7 @@
     }
   });
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=13">
+<link rel="stylesheet" href="/static/styles.css?v=16">
 </head>
 <body>
 
@@ -140,6 +140,29 @@
 
   <!-- Recovery banner (hidden by default; lists every autosaved recording found on load) -->
   <div class="capture-recovery" id="captureRecovery" style="display:none"></div>
+
+  <!-- In-meeting Notes: collapsible panel writing a REAL vault note via
+       window.NotesSync. Shown by app.js when recording starts or a local
+       session is recovered; hidden + cleared after upload, remove, or
+       offline-queueing. Never shown for disk-picked files or when NotesSync
+       is absent. All user-derived text is set via textContent (XSS rule). -->
+  <div class="capture-notes" id="captureNotes" style="display:none">
+    <div class="capture-notes-head">
+      <button class="capture-notes-toggle" id="captureNotesToggle" type="button" aria-expanded="false">
+        <span class="capture-notes-chevron">&#9656;</span> Notes
+      </button>
+      <span class="capture-notes-status" id="captureNoteStatus"></span>
+    </div>
+    <div class="capture-notes-body" id="captureNotesBody" hidden>
+      <textarea id="captureNotesText" class="capture-notes-text" rows="4"
+                placeholder="Type meeting notes&hellip; saved straight to your vault"></textarea>
+      <div class="capture-notes-foot">
+        <button class="capture-notes-attach" id="captureNotesAttach" type="button">&#128206; Attach</button>
+        <input type="file" id="captureNotesFile" hidden>
+        <span class="capture-notes-hint" id="captureNotesHint">Attachments need a connection &mdash; notes save offline.</span>
+      </div>
+    </div>
+  </div>
 
   <!-- Live no-audio / silent-capture warning -->
   <div class="capture-warning" id="captureWarning" style="display:none"></div>
@@ -265,6 +288,9 @@
         <option value="complete">Complete</option>
         <option value="error">Error</option>
       </select>
+      <select id="meetingCompanyFilter" style="flex:1">
+        <option value="">All companies</option>
+      </select>
       <input type="text" id="meetingTitleFilter" placeholder="Filter title..." style="flex:1">
     </div>
   </div>
@@ -292,6 +318,7 @@
             <span id="detailDate"></span>
             <span id="detailDuration"></span>
             <span id="detailStatus"></span>
+            <span id="detailCompany"></span>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:8px">
@@ -470,6 +497,7 @@
           <span id="detailDateMobile"></span>
           <span id="detailDurationMobile"></span>
           <span id="detailStatusMobile"></span>
+          <span id="detailCompanyMobile"></span>
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:8px">
@@ -616,6 +644,10 @@
         <div class="settings-placeholders">
           <span class="placeholder-tag">{meeting_context}</span>
         </div>
+        <label style="display:block;margin-bottom:8px">
+          <input type="checkbox" id="settingsRemoveFiller">
+          Remove filler words (um, uh, er…) from transcripts
+        </label>
         <textarea class="settings-textarea" id="promptCleanup" rows="8"></textarea>
         <button class="settings-reset-prompt-btn" data-prompt="cleanup_system">Reset to Default</button>
       </div>
@@ -865,8 +897,9 @@
   </div>
 </div>
 
+<script src="/static/capture-notes-logic.js?v=1"></script>
 <script src="/static/queue-logic.js?v=1"></script>
-<script src="/static/app.js?v=15"></script>
+<script src="/static/app.js?v=19"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js');

@@ -8,6 +8,16 @@ Pattern mirrors tests/test_notes_api.py: bare TestClient(app.app) (so FastAPI
 startup events do NOT fire and never clobber the seeded `meetings` dict), with
 MEETINGS_DIR / SETTINGS_PATH / meetings / get_qdrant / get_embedder monkeypatched.
 No live Ollama / WhisperX / Qdrant.
+
+get_qdrant / get_embedder are patched on BOTH app and vector: reindex-triggering
+routes (patch_meeting, summary/segment edits, speaker merge/reassign, reprocess)
+call _reindex_meeting_safe -> store_in_qdrant, which resolves get_qdrant() /
+get_embedder() in vector's own module namespace (vector.py:126-129) — an
+app-only patch leaves that half hitting real Qdrant/Ollama. This harness is
+reused (via `from tests.test_meeting_routes import _client`) by
+test_filler_removal.py, test_meeting_context.py, test_captures.py,
+test_captures_tags.py, and test_company_tag.py, so fixing it here fixes all of
+them.
 """
 
 import json
@@ -54,12 +64,17 @@ class _FakeQdrant:
 
 def _client(tmp_path, monkeypatch):
     import app
+    import vector
     monkeypatch.setattr(app, "MEETINGS_DIR", tmp_path)
     monkeypatch.setattr(app, "SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr(app, "meetings", {})            # fresh, auto-reverts
     fake_q = _FakeQdrant()
     monkeypatch.setattr(app, "get_qdrant", lambda: fake_q)
     monkeypatch.setattr(app, "get_embedder", lambda: _FakeEmbedder())
+    # store_in_qdrant resolves these in vector's own namespace (vector.py:126-129)
+    # — patch there too, else reindex-triggering tests hit real Qdrant/Ollama.
+    monkeypatch.setattr(vector, "get_qdrant", lambda: fake_q)
+    monkeypatch.setattr(vector, "get_embedder", lambda: _FakeEmbedder())
     return TestClient(app.app), app, fake_q
 
 

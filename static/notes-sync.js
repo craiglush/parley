@@ -258,7 +258,15 @@
             if (d.action !== 'remap' || !d.serverId) throw netError();
             rec.content_hash = rec.content_hash || L.contentHash(rec.title || '', rec.body || '');
             return mRemap(entry.id, { id: rec.id, record: rec, baseHash: rec.content_hash, dirty: false, pendingOp: null, localUpdated: 0 })
-              .then(() => { if (hooks.onRemap) hooks.onRemap(entry.id, rec.id); });
+              .then(() => {
+                if (hooks.onRemap) hooks.onRemap(entry.id, rec.id);
+                // Additive, hook-independent signal for the capture UI (app.js):
+                // window-LOCAL — only the flushing context's listeners fire, but
+                // IndexedDB is shared, so that context's capRewriteNoteId
+                // rewrites the capture meta for every context.
+                window.dispatchEvent(new CustomEvent('notes-sync:remap',
+                  { detail: { tempId: entry.id, serverId: rec.id } }));
+              });
           }));
         } else if (op === 'edit') {
           p = jsonFetch('/api/notes/' + encodeURIComponent(entry.id), 'PUT', {

@@ -54,3 +54,23 @@ def test_adopt_carries_tags(tmp_path, monkeypatch):
     assert m["speaker_roster"][0]["company"] == "Acme"
     assert m["meeting_context"] == "Planning"
     assert m["title"] == "Weekly sync"
+
+
+def test_tags_note_id_stored_and_survives_tag_only_reposts(tmp_path, monkeypatch):
+    """note_id is mirrored onto the capture meta ONLY when present in the body:
+    the frequent tag-only re-posts from liveTags._flush must never wipe it."""
+    client, app, _ = _client(tmp_path, monkeypatch)
+    assert _announce(client).status_code == 201
+    r = client.post(f"/captures/{SID}/tags", json={
+        "markers": [], "roster": [], "note_id": "n_1a2b3c4d5e6f",
+    })
+    assert r.status_code == 200, r.text
+    assert app._read_capture_meta(SID)["note_id"] == "n_1a2b3c4d5e6f"
+    # tag-only re-post: no note_id key at all
+    r = client.post(f"/captures/{SID}/tags", json={
+        "markers": [{"t": 1.0, "name": "Alex"}], "roster": [],
+    })
+    assert r.status_code == 200
+    meta = app._read_capture_meta(SID)
+    assert meta["note_id"] == "n_1a2b3c4d5e6f"
+    assert len(meta["speaker_tags"]) == 1   # roster/markers overwrite semantics unchanged

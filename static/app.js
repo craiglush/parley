@@ -111,6 +111,24 @@ let capSessionId = null;
 // staged file came from disk instead of the recorder/recovery).
 let stagedSessionId = null;
 
+// --- In-meeting notes (capture panel) state ---
+// The note is a REAL vault note in the NotesSync mirror from the first
+// keystroke; this state only binds the current recording to it. Reset by
+// setupRecorderFromStream (new recording — unconditional, belt-and-braces),
+// upload success, the remove/discard handler, and the offline-queued branch.
+// Resetting NEVER touches the data: the queued session's meta keeps its
+// note_id and the note itself stays in the vault/mirror.
+let captureNoteId = null;          // temp (n_local_…) or real (n_…) note id
+let captureNoteCreate = null;      // in-flight createNote promise (single-flight guard)
+let captureNoteTitleAuto = false;  // created with the bare "Meeting — notes" fallback
+let captureNoteSaveTimer = null;   // debounce timer for NotesSync.updateNote
+// In-flight capRewriteNoteId promises pushed by the notes-sync:remap listener.
+// uploadSession awaits these AFTER NotesSync.flush() (the awaited barrier):
+// the CustomEvent dispatch is synchronous but the listener's IDB
+// read-modify-write is async, so flush() resolving alone proves nothing about
+// when the meta rewrite commits.
+const captureNoteRemapPending = [];
+
 // All chunk keys for one session: [sid] <= key <= [sid, <anything>].
 function capSessionRange(sid) {
   return IDBKeyRange.bound([sid], [sid, []]);
@@ -200,10 +218,63 @@ async function capSetQueued(sid, queued, session) {
       if (session.context != null) next.context = session.context;
       if (Array.isArray(session.markers)) next.markers = session.markers;
       if (Array.isArray(session.roster)) next.roster = session.roster;
+      if (session.note_id != null) next.note_id = session.note_id;
     }
     await capTx(db, 'readwrite', ['meta'], tx => {
       tx.objectStore('meta').put(next);
     });
+  } catch (e) { /* best-effort */ }
+}
+
+// Read one session's meta record (null on any failure). Used by the
+// capture-notes temp-id resolve/retry paths.
+async function capGetMeta(sid) {
+  if (!sid) return null;
+  try {
+    const db = await capOpenDB();
+    return await new Promise((res) => {
+      const tx = db.transaction(['meta'], 'readonly');
+      const r = tx.objectStore('meta').get(sid);
+      r.onsuccess = () => res(r.result || null); r.onerror = () => res(null);
+    });
+  } catch (_) { return null; }
+}
+
+// Persist the in-meeting note id onto a session's meta record — the same
+// read-modify-write shape as capSaveTags, so the note→meeting association
+// survives reload, crash, and the offline queue for free. Best-effort.
+async function capSetNoteId(sid, noteId) {
+  if (!sid) return;
+  try {
+    const db = await capOpenDB();
+    const meta = await capGetMeta(sid);
+    if (!meta) return;
+    await capTx(db, 'readwrite', ['meta'], tx => {
+      tx.objectStore('meta').put({ ...meta, note_id: noteId });
+    });
+  } catch (e) { /* best-effort */ }
+}
+
+// After a NotesSync create-flush remap (temp id → server id), rewrite EVERY
+// capture meta record still holding the temp id — covers queued sessions from
+// earlier recordings, not just the active one. The remap listener parks the
+// returned promise in captureNoteRemapPending so uploadSession can await the
+// rewrite commit before re-reading the meta.
+async function capRewriteNoteId(tempId, serverId) {
+  try {
+    const db = await capOpenDB();
+    const metas = await new Promise((res) => {
+      const tx = db.transaction(['meta'], 'readonly');
+      const r = tx.objectStore('meta').getAll();
+      r.onsuccess = () => res(r.result || []); r.onerror = () => res([]);
+    });
+    for (const meta of metas) {
+      if (meta.note_id === tempId) {
+        await capTx(db, 'readwrite', ['meta'], tx => {
+          tx.objectStore('meta').put({ ...meta, note_id: serverId });
+        });
+      }
+    }
   } catch (e) { /* best-effort */ }
 }
 
@@ -516,6 +587,9 @@ const liveTags = {
       if (!streamBackupEnabled()) return;
       const titleEl = document.getElementById('meetingTitle');
       const ctxEl = document.getElementById('meetingContext');
+      // TEMP-ID RULE: only a REAL note id ever leaves the device. A temp id is
+      // meaningless to the server; the remap listener re-posts once it's real.
+      const noteId = (captureNoteId && !isTempNoteId(captureNoteId)) ? captureNoteId : null;
       fetch(`${API}/captures/${capSessionId}/tags`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -524,11 +598,274 @@ const liveTags = {
           roster: this.roster,
           title: titleEl ? titleEl.value.trim() : '',
           context: ctxEl ? ctxEl.value.trim() : '',
+          ...(noteId ? { note_id: noteId } : {}),
         }),
       }).catch(() => {});
     }, 400);
   },
 };
+
+// Re-post the tags mirror with the now-real note id so the SERVER capture meta
+// learns it (dead-device adopt linking depends on this — a server-only capture
+// has no local meta left). Explicit sid: works for the staged session too,
+// where capSessionId is already null. capture_tags stores note_id
+// only-when-present, so this can never wipe roster/title state.
+function capturePostTagsMirror(sid, noteId) {
+  if (!sid || !streamBackupEnabled()) return;
+  const titleEl = document.getElementById('meetingTitle');
+  const ctxEl = document.getElementById('meetingContext');
+  fetch(`${API}/captures/${sid}/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      markers: liveTags.markers,
+      roster: liveTags.roster,
+      title: titleEl ? titleEl.value.trim() : '',
+      context: ctxEl ? ctxEl.value.trim() : '',
+      note_id: noteId,
+    }),
+  }).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// In-meeting Notes — collapsible panel in the recording area writing a REAL
+// vault note through window.NotesSync (batch-1 offline mirror) from the first
+// keystroke. The note id rides the capture session meta (note_id) so upload /
+// offline queue / adopt can link note → meeting server-side. NotesSync is
+// feature-detected lazily at event time (it loads via defer, after app.js);
+// when absent the section never renders — zero behavior change elsewhere.
+// Names/titles rendered via textContent only (the live-tag chips XSS rule).
+// ---------------------------------------------------------------------------
+const captureNotes = {
+  el: null, toggleEl: null, chevronEl: null, statusEl: null, bodyEl: null,
+  textEl: null, attachBtn: null, fileEl: null, hintEl: null,
+  _title: '',   // title the note was created with / retitled to (status line)
+
+  _bind() {
+    if (this.el) return true;
+    this.el = document.getElementById('captureNotes');
+    if (!this.el) return false;
+    this.toggleEl = document.getElementById('captureNotesToggle');
+    this.chevronEl = this.el.querySelector('.capture-notes-chevron');
+    this.statusEl = document.getElementById('captureNoteStatus');
+    this.bodyEl = document.getElementById('captureNotesBody');
+    this.textEl = document.getElementById('captureNotesText');
+    this.attachBtn = document.getElementById('captureNotesAttach');
+    this.fileEl = document.getElementById('captureNotesFile');
+    this.hintEl = document.getElementById('captureNotesHint');
+    this.toggleEl.addEventListener('click', () => this.setOpen(this.bodyEl.hidden));
+    this.textEl.addEventListener('input', () => this._onInput());
+    this.attachBtn.addEventListener('click', () => this._onAttachClick());
+    this.fileEl.addEventListener('change', () => this._onFilePicked());
+    window.addEventListener('online', () => this._updateAttachState());
+    window.addEventListener('offline', () => this._updateAttachState());
+    return true;
+  },
+
+  // Collapsed/expanded persists in localStorage — the streamBackupEnabled
+  // pattern (default OPEN; only an explicit 'off' collapses).
+  setOpen(open) {
+    this.bodyEl.hidden = !open;
+    this.toggleEl.setAttribute('aria-expanded', String(open));
+    if (this.chevronEl) this.chevronEl.textContent = open ? '▾' : '▸';
+    try { localStorage.setItem('captureNotesOpen', open ? 'on' : 'off'); } catch (_) {}
+  },
+
+  // Show for a new recording or a recovered session. Never shown for
+  // disk-picked files (no capture session) or when NotesSync is absent.
+  show() {
+    if (!window.NotesSync || !this._bind()) return;
+    this.el.style.display = '';
+    let open = true;
+    try { open = localStorage.getItem('captureNotesOpen') !== 'off'; } catch (_) {}
+    this.setOpen(open);
+    this._updateAttachState();
+  },
+
+  // Hide + clear ALL panel/UI state. NEVER touches the vault note or the
+  // session meta — a queued session keeps its note_id, and discarding a
+  // recording never deletes the note (it is a real vault note).
+  reset() {
+    captureNoteId = null;
+    captureNoteCreate = null;
+    captureNoteTitleAuto = false;
+    clearTimeout(captureNoteSaveTimer);
+    captureNoteSaveTimer = null;
+    this._title = '';
+    if (!this._bind()) return;
+    this.el.style.display = 'none';
+    this.textEl.value = '';
+    this.statusEl.textContent = '';
+    this.hintEl.textContent = 'Attachments need a connection — notes save offline.';
+  },
+
+  // Recovery: a local session was staged via selectFile() — which never calls
+  // setupRecorderFromStream — so this is the second show trigger. Rebinds
+  // meta.note_id and repopulates the textarea from the mirror; without it,
+  // typing after a recovery would silently create a SECOND note.
+  async restoreForSession(meta) {
+    if (!window.NotesSync) return;
+    this.reset();
+    this.show();
+    if (!this.el) return;
+    if (meta && meta.note_id) {
+      captureNoteId = meta.note_id;
+      captureNoteTitleAuto = false;   // a recovered note keeps its creation title
+      try {
+        const rec = await NotesSync.readNote(captureNoteId);
+        if (rec) { this.textEl.value = rec.body || ''; this._title = rec.title || ''; }
+      } catch (_) { /* body restore is best-effort; the id binding is what matters */ }
+      this._updateStatus();
+    }
+  },
+
+  _updateStatus() {
+    if (!this.statusEl) return;
+    if (!captureNoteId) { this.statusEl.textContent = ''; return; }
+    this.statusEl.textContent = isTempNoteId(captureNoteId)
+      ? 'Saved locally · syncs when online'
+      : 'Saved · ' + (this._title || 'note');
+  },
+
+  _hint(msg) { if (this.hintEl) this.hintEl.textContent = msg; },
+
+  _updateAttachState() {
+    if (!this.attachBtn) return;
+    this.attachBtn.disabled = !navigator.onLine;
+    if (!navigator.onLine) this._hint('Attachments need a connection — notes save offline.');
+  },
+
+  _onInput() {
+    if (!window.NotesSync) return;
+    if (!captureNoteId && !captureNoteCreate) {
+      // FIRST KEYSTROKE: create the real vault note (temp id offline; the
+      // batch-1 flush remaps to a server id seconds later when online).
+      // Single-flight: fast typing can't double-create.
+      const title = $('meetingTitle') ? $('meetingTitle').value : '';
+      const context = $('meetingContext') ? $('meetingContext').value : '';
+      captureNoteTitleAuto = !String(title).trim() && !String(context).trim();
+      this._title = captureNoteTitle(title, context, new Date().toISOString());
+      captureNoteCreate = NotesSync.createNote({
+        title: this._title, folder: 'Meetings', type: 'note', body: this.textEl.value,
+      }).then((rec) => {
+        captureNoteId = rec.id;
+        captureNoteCreate = null;
+        // Persist the association like roster/title/context do.
+        capSetNoteId(capSessionId || stagedSessionId, rec.id);
+        this._updateStatus();
+        this._saveSoon();   // pick up anything typed while the create was in flight
+      }).catch((e) => {
+        // Best-effort next to the recording (capAppendChunk doctrine): the
+        // capture is untouched; the next keystroke retries the create.
+        captureNoteCreate = null;
+        console.warn('capture note create failed:', e);
+        this._hint('Note save failed — will retry as you type');
+      });
+      return;
+    }
+    this._saveSoon();
+  },
+
+  _saveSoon() {
+    clearTimeout(captureNoteSaveTimer);
+    captureNoteSaveTimer = setTimeout(() => this._saveNow(), 600);
+  },
+
+  async _saveNow() {
+    if (!captureNoteId || !window.NotesSync) return;
+    const body = this.textEl.value;
+    try {
+      await NotesSync.updateNote(captureNoteId, { body });
+    } catch (err) {
+      // "note not in mirror" on a TEMP id: another context (installed PWA vs
+      // browser tab) won the notes-sync flush lock and remapped it — the
+      // notes-sync:remap CustomEvent is window-local, so we never heard it.
+      // IDB IS shared: the flushing context's capRewriteNoteId already
+      // rewrote the capture meta. Re-read it, adopt the real id, retry ONCE.
+      if (isTempNoteId(captureNoteId)) {
+        const meta = await capGetMeta(capSessionId || stagedSessionId);
+        if (meta && meta.note_id && meta.note_id !== captureNoteId) {
+          captureNoteId = meta.note_id;
+          this._updateStatus();
+          try { await NotesSync.updateNote(captureNoteId, { body }); return; } catch (_) {}
+        }
+      }
+      console.warn('capture note save failed:', err);
+      this._hint('Note save failed — will retry as you type');
+      return;
+    }
+    this._updateStatus();
+  },
+
+  async _onAttachClick() {
+    if (!window.NotesSync) return;
+    // No note yet? Create one first (empty body is fine) via the same
+    // single-flight path the first keystroke uses.
+    if (!captureNoteId) {
+      if (!captureNoteCreate) this._onInput();
+      try { await captureNoteCreate; } catch (_) {}
+      if (!captureNoteId) return;
+    }
+    // Attachments are ONLINE-ONLY (spec non-goal): the endpoint needs a real
+    // note id. Still temp → flush + await the parked remap rewrites, re-check.
+    if (isTempNoteId(captureNoteId)) {
+      try {
+        await NotesSync.flush();
+        await Promise.all(captureNoteRemapPending.splice(0));
+      } catch (_) { /* re-check below decides */ }
+    }
+    if (isTempNoteId(captureNoteId) || !navigator.onLine) {
+      this._hint('Attachments need a connection — notes save offline.');
+      return;
+    }
+    this.fileEl.click();
+  },
+
+  async _onFilePicked() {
+    const file = this.fileEl.files && this.fileEl.files[0];
+    this.fileEl.value = '';
+    if (!file || !captureNoteId || isTempNoteId(captureNoteId)) return;
+    const form = new FormData();
+    form.append('file', file);
+    this._hint('Uploading attachment…');
+    try {
+      const resp = await fetch(`${API}/api/notes/${encodeURIComponent(captureNoteId)}/attachments`, {
+        method: 'POST', body: form,
+      });
+      if (resp.status === 413) { this._hint('Attachment too large'); return; }
+      if (!resp.ok) { this._hint(`Attachment upload failed (${resp.status})`); return; }
+      const data = await resp.json();
+      // Append the embed markdown to the TEXTAREA — the debounced updateNote
+      // persists it, keeping the note BODY the source of truth for attachment
+      // association (Phase A/C parse body references, not a sidecar).
+      const sep = this.textEl.value && !this.textEl.value.endsWith('\n') ? '\n' : '';
+      this.textEl.value += sep + data.embed + '\n';
+      this._hint('Attached ' + (data.filename || file.name));
+      this._saveSoon();
+    } catch (_) {
+      this._hint('Attachment upload failed — check connection');
+    }
+  },
+};
+
+// NotesSync flushed a created note: temp id → real server id (only the
+// flushing context hears this — the event is window-local). Swap the in-memory
+// pointer, rewrite EVERY persisted capture meta holding the temp id, then
+// re-post the tags mirror so the SERVER capture meta learns the real id. The
+// capRewriteNoteId promise is parked in captureNoteRemapPending: uploadSession
+// awaits the parked promises (its awaited barrier) before re-reading the meta,
+// because the dispatch is synchronous but this rewrite is async.
+window.addEventListener('notes-sync:remap', (e) => {
+  const { tempId, serverId } = (e && e.detail) || {};
+  if (!tempId || !serverId) return;
+  if (captureNoteId === tempId) captureNoteId = serverId;
+  const p = capRewriteNoteId(tempId, serverId).then(() => {
+    const sid = capSessionId || stagedSessionId;
+    if (sid && captureNoteId === serverId) capturePostTagsMirror(sid, serverId);
+    captureNotes._updateStatus();
+  });
+  captureNoteRemapPending.push(p);
+});
 
 const recordBtn = $('recordBtn');
 const recordArea = $('recordArea');
@@ -840,6 +1177,12 @@ function setupRecorderFromStream(stream, usingLoopback, loopbackName) {
     stagedSilent = false;
     hideCaptureWarning();
 
+    // In-meeting notes: UNCONDITIONALLY reset any stale panel state from an
+    // earlier path (belt-and-braces — no prior path may leak into a new
+    // recording), then show the section for this recording.
+    captureNotes.reset();
+    captureNotes.show();
+
     const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4']
       .find(m => MediaRecorder.isTypeSupported(m)) || '';
 
@@ -1143,6 +1486,7 @@ $('removeFile').addEventListener('click', () => {
   hideCaptureWarning();
   stagedFromRecording = false;
   stagedSilent = false;
+  captureNotes.reset();
 });
 
 // ---------------------------------------------------------------------------
@@ -1201,6 +1545,12 @@ function buildUploadForm(session) {
       form.set('max_speakers', String(roster.length));
     }
   }
+  // In-meeting note link. TEMP-ID RULE (client-side, new with this feature):
+  // temp n_local_ ids are never sent — uploadSession's awaited barrier resolves
+  // them first or the field is omitted. The server additionally ignores
+  // unknown/malformed ids (that half mirrors the malformed-sid precedent).
+  const noteId = session.note_id != null ? session.note_id : meta.note_id;
+  if (noteId && !isTempNoteId(noteId)) form.append('note_id', noteId);
   return form;
 }
 
@@ -1215,6 +1565,25 @@ function buildUploadForm(session) {
 // left to the callers (they own the staged UI / recovery-list state).
 async function uploadSession(session) {
   const sid = session.sid;
+  // Resolve a still-temp note id BEFORE building the form (queued sessions
+  // replay persisted meta that may predate the note's flush). AWAITED BARRIER,
+  // not a race: flush() resolves without waiting for its notes-sync:remap
+  // listeners, so the second await — the parked capRewriteNoteId promises —
+  // is what guarantees the listener's async IDB rewrite has committed before
+  // the meta re-read. LAST-RESORT GUARD: if the id is STILL temp after the
+  // barrier (the note flush failed), buildUploadForm omits note_id but the
+  // queued meta keeps it, so a later retry — or the server's sid-dedup
+  // link-repair path — can still make the link. The meeting (GPU work) is
+  // never held hostage to a note link.
+  const effNoteId = session.note_id != null ? session.note_id : (session.meta || {}).note_id;
+  if (effNoteId && isTempNoteId(effNoteId) && window.NotesSync && sid) {
+    try {
+      await NotesSync.flush();
+      await Promise.all(captureNoteRemapPending.splice(0));
+      const fresh = await capGetMeta(sid);
+      if (fresh && fresh.note_id) session.note_id = fresh.note_id;
+    } catch (_) { /* best-effort; the form builder omits temp ids */ }
+  }
   const form = buildUploadForm(session);
   const result = await new Promise((resolve) => {
     let settled = false;
@@ -1329,6 +1698,25 @@ uploadBtn.addEventListener('click', async () => {
   const progress = $('uploadProgress');
   progress.classList.add('visible');
 
+  // In-meeting note: retitle ONCE if it was created with the bare fallback and
+  // the user has since filled the title/context (a mirror op — works offline).
+  // Frontmatter title only; the vault filename keeps its creation-time slug.
+  // After this the title is never touched again.
+  if (captureNoteId && captureNoteTitleAuto && window.NotesSync) {
+    const t = $('meetingTitle').value.trim();
+    const c = $('meetingContext').value.trim();
+    if (t || c) {
+      const newTitle = captureNoteTitle(t, c, new Date().toISOString());
+      try {
+        await NotesSync.updateNote(captureNoteId, { title: newTitle });
+        captureNotes._title = newTitle;
+      } catch (_) { /* best-effort */ }
+      captureNoteTitleAuto = false;   // retitled once — never touched again
+      // (left true when title/context are still blank, so a validation-failure
+      // retry where the user then fills the title can still retitle once)
+    }
+  }
+
   // Assemble the session from the live form. The queue path reproduces the same
   // payload from persisted meta (capSetQueued stores title/speakers/context/tags).
   const tagged = !!(stagedSessionId && liveTags.markers.length);
@@ -1336,6 +1724,7 @@ uploadBtn.addEventListener('click', async () => {
     blob: selectedFile,
     meta: { mimeType: selectedFile.type, fileName: selectedFile.name },
     sid: stagedSessionId,
+    note_id: captureNoteId,
     title: $('meetingTitle').value.trim(),
     speakers: $('numSpeakers').value,
     context: $('meetingContext').value.trim(),
@@ -1369,6 +1758,7 @@ uploadBtn.addEventListener('click', async () => {
       $('numSpeakers').value = '';
       $('meetingContext').value = '';
       liveTags.reset();
+      captureNotes.reset();
       $('progressFill').style.width = '0%';
     }, 2000);
     refreshMeetings();
@@ -1389,6 +1779,11 @@ uploadBtn.addEventListener('click', async () => {
     selectedFile = null;
     fileInput.value = '';
     liveTags.reset();
+    // Third form-clear path: without this, back-to-back offline meetings would
+    // append meeting B's notes to meeting A's note. UI-only — the queued
+    // session's meta keeps note_id (persisted by capSetQueued inside
+    // uploadSession BEFORE this branch ran) and the note stays in the mirror.
+    captureNotes.reset();
     setTimeout(() => {
       uploadFields.classList.remove('visible');
       progress.classList.remove('visible');
@@ -1455,6 +1850,7 @@ async function refreshGroupedView() {
     const flatResp = await fetch(`${API}/meetings`);
     const flatData = await flatResp.json();
     allMeetingsCache = flatData;
+    rebuildCompanyFilter(flatData);
     const inProgress = flatData.some(m => !['complete', 'error'].includes(m.status));
     if (inProgress) startPolling(); else stopPolling();
   } catch (err) {
@@ -1477,6 +1873,7 @@ function renderGroupedList(data) {
   // Apply client-side filters
   const statusFilter = $('meetingStatusFilter').value;
   const titleFilter = $('meetingTitleFilter').value.trim().toLowerCase();
+  const companyFilter = $('meetingCompanyFilter').value.toLowerCase();
 
   let html = '';
   groups.forEach((group, gi) => {
@@ -1485,6 +1882,7 @@ function renderGroupedList(data) {
     // Filter within group
     if (statusFilter) meetings = meetings.filter(m => m.status === statusFilter);
     if (titleFilter) meetings = meetings.filter(m => (m.title || '').toLowerCase().includes(titleFilter));
+    if (companyFilter) meetings = meetings.filter(m => (m.company || '').toLowerCase() === companyFilter);
 
     if (!meetings.length) return;
 
@@ -1520,6 +1918,36 @@ function renderGroupedList(data) {
   container.innerHTML = html || '<div class="empty-state" style="padding:24px">No meetings match your filters.</div>';
 }
 
+function rebuildCompanyFilter(meetings) {
+  // Distinct confirmed companies -> dropdown options. Selection survives the
+  // 3s polling rebuild. Values are the server-normalized display forms;
+  // matching is case-insensitive exact (same rule as GET /meetings?company=).
+  const sel = $('meetingCompanyFilter');
+  if (!sel) return;
+  const current = sel.value;
+  const seen = new Map();               // lowercase key -> first-seen display form
+  (meetings || []).forEach(m => {
+    const c = (m.company || '').trim();
+    if (c && !seen.has(c.toLowerCase())) seen.set(c.toLowerCase(), c);
+  });
+  const names = [...seen.values()].sort((a, b) => a.localeCompare(b));
+
+  sel.innerHTML = '';
+  const optAll = document.createElement('option');
+  optAll.value = '';
+  optAll.textContent = 'All companies';
+  sel.appendChild(optAll);
+
+  for (const c of names) {
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.textContent = c;
+    sel.appendChild(opt);
+  }
+
+  if (current && seen.has(current.toLowerCase())) sel.value = current;
+}
+
 function toggleGroup(index) {
   const el = $('groupMeetings' + index);
   const chevron = $('groupChevron' + index);
@@ -1548,6 +1976,7 @@ function formatStatus(s) {
 
 // Meeting list filter events
 $('meetingStatusFilter').addEventListener('change', refreshGroupedView);
+$('meetingCompanyFilter').addEventListener('change', refreshGroupedView);
 $('meetingTitleFilter').addEventListener('input', () => {
   clearTimeout(titleFilterDebounce);
   titleFilterDebounce = setTimeout(() => {
@@ -1601,12 +2030,44 @@ async function openMeeting(id) {
   }
 }
 
+// Title + pencil (PATCH /meetings/{id}); editor seeds from the raw status.title
+// (textContent — never innerHTML — so the value round-trips unescaped).
+function setDetailTitle(titleEl, id, title, editable) {
+  if (!titleEl) return;
+  titleEl.innerHTML = '<span class="detail-title-text"></span>';  // static markup only
+  const span = titleEl.querySelector('.detail-title-text');
+  span.textContent = title;
+  if (!editable) return;
+  const btn = document.createElement('button');
+  btn.className = 'pencil-btn';
+  btn.title = 'Edit title';
+  btn.innerHTML = '&#9999;';
+  btn.addEventListener('click', () => {
+    inlineEdit(span, {
+      value: span.textContent,
+      onSave: async (v) => {
+        const resp = await fetch(`${API}/meetings/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: v }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.detail || resp.statusText);
+        span.textContent = data.title;
+        refreshGroupedView();   // sidebar list shows the new title
+      },
+    });
+  });
+  titleEl.appendChild(btn);
+}
+
 async function populateDetail(id, mobile) {
   const prefix = mobile ? 'Mobile' : '';
   const titleEl = $('detailTitle' + prefix);
   const dateEl = $('detailDate' + prefix);
   const durationEl = $('detailDuration' + prefix);
   const statusEl = $('detailStatus' + prefix);
+  const companyEl = $('detailCompany' + prefix);
   const transcriptEl = $('transcriptContent' + prefix);
   const summaryEl = $('summaryContent' + prefix);
   const notesEl = $('notesContent' + prefix);
@@ -1647,10 +2108,12 @@ async function populateDetail(id, mobile) {
   try {
     const statusResp = await fetch(`${API}/meetings/${id}/status`);
     const status = await statusResp.json();
-    if (titleEl) titleEl.textContent = status.title || 'Meeting';
+    setDetailTitle(titleEl, id, status.title || 'Meeting', status.status === 'complete');
+    transcriptEditedSinceAnalysis = !!status.transcript_edited;  // Re-run banner survives reloads
     if (dateEl) dateEl.textContent = status.date || '';
     if (durationEl) durationEl.textContent = status.duration_formatted || '';
     if (statusEl) statusEl.innerHTML = `<span class="status-badge status-${status.status}">${formatStatus(status.status)}</span>`;
+    if (companyEl) renderCompanyChip(companyEl, id, status);
 
     if (status.status === 'error') {
       const msg = `<div style="text-align:center;padding:40px;color:var(--red)"><p>Error: ${escHtml(status.error || 'Unknown error')}</p></div>`;
@@ -1715,6 +2178,80 @@ async function populateDetail(id, mobile) {
   if (downloadsEl) downloadsEl.style.display = 'flex';
 }
 
+// --- Company tag chip (detail header) ---
+
+function renderCompanyChip(el, meetingId, status) {
+  // Three states (spec): confirmed = solid chip; suggested = dashed chip
+  // "<name> ?" plus a confirm button; neither = muted "+ Company". Hidden
+  // until the meeting is complete. Suggestions are never persisted server-
+  // side — only an explicit PATCH confirms one.
+  el.innerHTML = '';   // safe: constant empty string (clear before re-render)
+  if (status.status !== 'complete') { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const confirmed = status.company || null;
+  const suggested = status.company_suggestion || null;
+  const chip = document.createElement('span');
+  if (confirmed) {
+    chip.className = 'company-chip confirmed';
+    chip.textContent = confirmed;
+    chip.title = 'Company — click to edit';
+    chip.onclick = () => editCompany(meetingId, confirmed);
+    el.appendChild(chip);
+  } else if (suggested) {
+    chip.className = 'company-chip suggested';
+    chip.textContent = suggested + ' ?';
+    chip.title = 'Suggested company — click to edit';
+    chip.onclick = () => editCompany(meetingId, suggested);
+    el.appendChild(chip);
+    const ok = document.createElement('button');
+    ok.className = 'company-chip-confirm';
+    ok.textContent = '✓';
+    ok.title = 'Confirm suggested company';
+    ok.onclick = () => patchCompany(meetingId, suggested);
+    el.appendChild(ok);
+  } else {
+    chip.className = 'company-chip empty';
+    chip.textContent = '+ Company';
+    chip.title = 'Set company';
+    chip.onclick = () => editCompany(meetingId, '');
+    el.appendChild(chip);
+  }
+}
+
+function editCompany(meetingId, current) {
+  // prompt() is the established pattern for small header-adjacent edits
+  // (speaker merge/reassign). Empty input clears; Cancel does nothing.
+  const input = prompt('Company', current || '');
+  if (input === null) return;
+  patchCompany(meetingId, input.trim());
+}
+
+async function patchCompany(meetingId, value) {
+  try {
+    const resp = await fetch(`${API}/meetings/${meetingId}/company`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company: value || null }),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+    // Re-render the chip from the response; a CLEAR needs the lazily-computed
+    // suggestion back, which only the status endpoint carries.
+    let state = { status: 'complete', company: data.company, company_suggestion: null };
+    if (!data.company) {
+      state = await (await fetch(`${API}/meetings/${meetingId}/status`)).json();
+    }
+    ['detailCompany', 'detailCompanyMobile'].forEach(id => {
+      const el = $(id);
+      if (el) renderCompanyChip(el, meetingId, state);
+    });
+    refreshGroupedView();   // list + filter payloads pick up the new value
+  } catch (err) {
+    console.error('Company update failed:', err);
+    alert('Failed to update company: ' + err.message);
+  }
+}
+
 async function loadTranscript(id) {
   try {
     const resp = await fetch(`${API}/meetings/${id}/transcript`);
@@ -1752,6 +2289,7 @@ async function loadSummary(id) {
   try {
     const resp = await fetch(`${API}/meetings/${id}/summary`);
     const data = await resp.json();
+    currentSummaryMeetingId = id;
     renderSummary(data);
   } catch (err) {
     const errHtml = `<div style="color:var(--red)">Failed to load summary: ${escHtml(err.message)}</div>`;
@@ -2332,6 +2870,86 @@ function showTagInput(btn, meetingId, type) {
   input.addEventListener('blur', add);
 }
 
+// --- Inline edit (pencil-icon editing; all four edit surfaces use this) ---
+let currentSummaryData = null;       // raw /summary response — editors seed from
+                                     // this, never from displayed speaker-mapped text
+let currentSummaryMeetingId = null;
+let transcriptEditedSinceAnalysis = false;  // drives the "Re-run analysis" banner
+
+// Swaps el's content for input(s)/textarea(s). Enter commits (Ctrl/Cmd+Enter in
+// textareas), Esc or Cancel restores the original content. opts is either
+// {value, multiline?, onSave(str)} or {fields: [{name,label,value,multiline?}],
+// onSave(valuesByName)}. onSave may return a Promise; on rejection the original
+// content is restored and the error alerted. On success the caller re-renders.
+// innerHTML is safe here: static template text only (no interpolated dynamic
+// values); the restore path re-assigns the element's own previously-rendered
+// markup (prevHtml), which was itself produced by escHtml()-wrapped renderers.
+function inlineEdit(el, opts) {
+  if (!el || el.dataset.editing === '1') return;
+  el.dataset.editing = '1';
+  const fields = opts.fields ||
+    [{ name: 'value', label: null, value: opts.value || '', multiline: !!opts.multiline }];
+  const prevHtml = el.innerHTML;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'inline-edit';
+  const editors = {};
+  for (const f of fields) {
+    if (f.label) {
+      const lab = document.createElement('label');
+      lab.className = 'inline-edit-label';
+      lab.textContent = f.label;
+      wrap.appendChild(lab);
+    }
+    const editor = document.createElement(f.multiline ? 'textarea' : 'input');
+    editor.className = 'inline-edit-input';
+    editor.value = f.value || '';
+    if (f.multiline) editor.rows = Math.min(10, Math.max(3, String(f.value || '').split('\n').length + 1));
+    wrap.appendChild(editor);
+    editors[f.name] = editor;
+  }
+  const actions = document.createElement('div');
+  actions.className = 'inline-edit-actions';
+  // Safe: static markup only, no interpolated values.
+  actions.innerHTML = '<button type="button" class="action-btn ie-save">Save</button>' +
+                      '<button type="button" class="action-btn ie-cancel">Cancel</button>';
+  wrap.appendChild(actions);
+
+  el.innerHTML = '';
+  el.appendChild(wrap);
+  const first = editors[fields[0].name];
+  first.focus();
+  if (first.tagName === 'INPUT') first.select();
+
+  // Safe: prevHtml is this element's own previously-rendered markup (produced by
+  // an escHtml()-wrapped renderer elsewhere), not attacker-controlled input.
+  const cancel = () => { el.innerHTML = prevHtml; delete el.dataset.editing; };
+  const commit = async () => {
+    actions.querySelector('.ie-save').disabled = true;
+    try {
+      if (opts.fields) {
+        const values = {};
+        for (const [name, ed] of Object.entries(editors)) values[name] = ed.value;
+        await opts.onSave(values);
+      } else {
+        await opts.onSave(editors.value.value);
+      }
+      delete el.dataset.editing;   // success: the caller re-renders this surface
+    } catch (err) {
+      cancel();
+      alert('Save failed: ' + (err && err.message ? err.message : err));
+    }
+  };
+  actions.querySelector('.ie-save').addEventListener('click', commit);
+  actions.querySelector('.ie-cancel').addEventListener('click', cancel);
+  wrap.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    if (e.key === 'Enter' && (e.target.tagName === 'INPUT' || e.ctrlKey || e.metaKey)) {
+      e.preventDefault(); commit();
+    }
+  });
+}
+
 function applySpeakerMapToText(text) {
   let result = text;
   for (const [original, renamed] of Object.entries(currentSpeakerMap)) {
@@ -2341,14 +2959,15 @@ function applySpeakerMapToText(text) {
 }
 
 function renderSummary(s) {
+  currentSummaryData = s;   // raw values — inline editors seed from these
   let html = '';
 
   // Summary (new) or Executive Summary (legacy)
   const summaryText = s.summary || s.executive_summary;
   if (summaryText) {
     html += `<div class="summary-section">
-      <h3>Summary</h3>
-      <p>${escHtml(applySpeakerMapToText(summaryText))}</p>
+      <h3>Summary <button class="pencil-btn" title="Edit summary" onclick="editSummaryText(this)">&#9999;</button></h3>
+      <p class="summary-text">${escHtml(applySpeakerMapToText(summaryText))}</p>
     </div>`;
   }
 
@@ -2366,7 +2985,7 @@ function renderSummary(s) {
   // Action Items (new: task/who/deadline or legacy: description/assigned_to)
   if (s.action_items && s.action_items.length) {
     html += `<div class="summary-section"><h3>Action Items</h3><ul>`;
-    for (const a of s.action_items) {
+    s.action_items.forEach((a, i) => {
       const priorityClass = `priority-${a.priority || 'medium'}`;
       const task = a.task || a.description || '';
       const who = applySpeakerMapToText(a.who || a.assigned_to || 'Unassigned');
@@ -2380,20 +2999,22 @@ function renderSummary(s) {
             &middot; Priority: <span class="${priorityClass}">${a.priority || 'medium'}</span>${deadline}
           </div>
         </div>
+        <button class="pencil-btn" title="Edit task" onclick="editActionItem(this, ${i})">&#9999;</button>
       </div></li>`;
-    }
+    });
     html += `</ul></div>`;
   }
 
   // Decisions
   if (s.decisions && s.decisions.length) {
     html += `<div class="summary-section"><h3>Decisions</h3><ul>`;
-    for (const d of s.decisions) {
+    s.decisions.forEach((d, i) => {
       html += `<li>
         <strong>${escHtml(applySpeakerMapToText(d.decision || ''))}</strong>
+        <button class="pencil-btn" title="Edit decision" onclick="editDecision(this, ${i})">&#9999;</button>
         <div class="decision-context">${escHtml(applySpeakerMapToText(d.context || ''))}</div>
       </li>`;
-    }
+    });
     html += `</ul></div>`;
   }
 
@@ -2401,27 +3022,27 @@ function renderSummary(s) {
   const questions = s.open_questions || s.questions_raised;
   if (questions && questions.length) {
     html += `<div class="summary-section"><h3>Open Questions</h3><ul>`;
-    for (const q of questions) {
+    questions.forEach((q, i) => {
       const badge = q.answered
         ? '<span style="color:var(--green)">[Answered]</span>'
         : '<span style="color:var(--yellow)">[Open]</span>';
       const askedBy = q.asked_by ? ` <span style="color:var(--text-muted)">(${escHtml(applySpeakerMapToText(q.asked_by))})</span>` : '';
-      html += `<li>${escHtml(applySpeakerMapToText(q.question || ''))}${askedBy} ${badge}</li>`;
-    }
+      html += `<li>${escHtml(applySpeakerMapToText(q.question || ''))}${askedBy} ${badge} <button class="pencil-btn" title="Edit question" onclick="editOpenQuestion(this, ${i})">&#9999;</button></li>`;
+    });
     html += `</ul></div>`;
   }
 
   // Concerns & Risks (new from Pass D)
   if (s.concerns && s.concerns.length) {
     html += `<div class="summary-section"><h3>Concerns & Risks</h3><ul>`;
-    for (const c of s.concerns) {
+    s.concerns.forEach((c, i) => {
       const raisedBy = c.raised_by ? ` <span style="color:var(--text-muted)">(${escHtml(applySpeakerMapToText(c.raised_by))})</span>` : '';
       const resolvedBadge = c.resolved
         ? '<span style="color:var(--green)">[Resolved]</span>'
         : '<span style="color:var(--yellow)">[Open]</span>';
       const notes = c.notes ? `<div style="color:var(--text-secondary);font-size:13px;margin-top:2px">${escHtml(applySpeakerMapToText(c.notes))}</div>` : '';
-      html += `<li>${escHtml(applySpeakerMapToText(c.concern || ''))}${raisedBy} ${resolvedBadge}${notes}</li>`;
-    }
+      html += `<li>${escHtml(applySpeakerMapToText(c.concern || ''))}${raisedBy} ${resolvedBadge} <button class="pencil-btn" title="Edit concern" onclick="editConcern(this, ${i})">&#9999;</button>${notes}</li>`;
+    });
     html += `</ul></div>`;
   }
 
@@ -2457,6 +3078,86 @@ function renderSummary(s) {
 
   const summaryHtml = html || '<div class="empty-state">No summary data.</div>';
   [$('summaryContent'), $('summaryContentMobile')].filter(Boolean).forEach(el => el.innerHTML = summaryHtml);
+}
+
+// --- Summary field editing (PUT /meetings/{id}/summary/{field}) ---
+// Editors seed from currentSummaryData (raw stored values), never from the
+// displayed applySpeakerMapToText(...) output, so speaker-label mapping never
+// gets baked into stored text. Server returns the updated summary; re-render.
+async function saveSummaryField(field, value) {
+  const resp = await fetch(`${API}/meetings/${currentSummaryMeetingId}/summary/${field}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.detail || resp.statusText);
+  renderSummary(data);
+}
+
+// Replace item i (in a copy) of the field's canonical-or-legacy array and PUT it.
+function replaceSummaryItem(field, i, updated) {
+  const arr = (field === 'open_questions')
+    ? (currentSummaryData.open_questions || currentSummaryData.questions_raised || [])
+    : (currentSummaryData[field] || []);
+  const copy = arr.map((it, idx) => (idx === i ? updated : it));
+  return saveSummaryField(field, copy);
+}
+
+function editSummaryText(btn) {
+  const p = btn.closest('.summary-section').querySelector('.summary-text');
+  const raw = currentSummaryData.summary || currentSummaryData.executive_summary || '';
+  inlineEdit(p, { value: raw, multiline: true,
+                  onSave: (v) => saveSummaryField('summary', v) });
+}
+
+function editActionItem(btn, i) {
+  const el = btn.closest('.action-item');
+  const item = currentSummaryData.action_items[i];
+  inlineEdit(el, {
+    value: item.task || item.description || '', multiline: true,
+    onSave: (v) => {
+      const updated = { ...item, task: v };
+      delete updated.description;   // canonical field wins everywhere it's read
+      return replaceSummaryItem('action_items', i, updated);
+    },
+  });
+}
+
+function editDecision(btn, i) {
+  const el = btn.closest('li');
+  const d = currentSummaryData.decisions[i];
+  inlineEdit(el, {
+    fields: [
+      { name: 'decision', label: 'Decision', value: d.decision || '' },
+      { name: 'context', label: 'Context', value: d.context || '', multiline: true },
+    ],
+    onSave: (v) => replaceSummaryItem('decisions', i,
+      { ...d, decision: v.decision, context: v.context }),
+  });
+}
+
+function editConcern(btn, i) {
+  const el = btn.closest('li');
+  const c = currentSummaryData.concerns[i];
+  inlineEdit(el, {
+    fields: [
+      { name: 'concern', label: 'Concern', value: c.concern || '', multiline: true },
+      { name: 'notes', label: 'Notes', value: c.notes || '', multiline: true },
+    ],
+    onSave: (v) => replaceSummaryItem('concerns', i,
+      { ...c, concern: v.concern, notes: v.notes }),
+  });
+}
+
+function editOpenQuestion(btn, i) {
+  const el = btn.closest('li');
+  const arr = currentSummaryData.open_questions || currentSummaryData.questions_raised || [];
+  const q = arr[i];
+  inlineEdit(el, {
+    value: q.question || '',
+    onSave: (v) => replaceSummaryItem('open_questions', i, { ...q, question: v }),
+  });
 }
 
 // Close detail
@@ -2784,9 +3485,10 @@ function renderSpeakerMapBar(segments, meetingId) {
     if (info && info.company) detailParts.push(info.company);
     const detailText = detailParts.length ? `<span class="speaker-chip-detail">(${escHtml(detailParts.join(', '))})</span>` : '';
     const nameText = info ? info.name : (currentSpeakerMap[sp] || '');
-    return `<span class="speaker-chip ${colorClass}" data-original="${escHtml(sp)}" onclick="editSpeakerName(this, '${escHtml(sp)}', '${meetingId}')">
+    return `<span class="speaker-chip ${colorClass}" data-original="${escHtml(sp)}" title="Edit name, company, title" onclick="editSpeakerName(this, '${escHtml(sp)}', '${meetingId}')">
       <span class="speaker-chip-label">${escHtml(sp)}:</span>
       <span class="speaker-chip-name">${escHtml(nameText || 'click to rename')}${detailText}${autoStar}</span>
+      <span class="pencil-btn" aria-hidden="true">&#9999;</span>
     </span>`;
   }).join('');
 
@@ -3008,6 +3710,13 @@ function renderTranscriptWithMap(originalSegments, meetingId) {
   const mapped = applyMapToSegments(originalSegments);
   const speakerMapBarHtml = renderSpeakerMapBar(originalSegments, meetingId);
 
+  const bannerHtml = transcriptEditedSinceAnalysis
+    ? `<div class="reanalysis-banner">Transcript edited since the last analysis —
+        <button class="action-btn" onclick="reprocessStep('${meetingId}', 'summarize')">Re-run analysis</button>
+        <span class="reanalysis-note">(regenerates the summary; replaces any manual summary edits)</span>
+      </div>`
+    : '';
+
   const speakerColorMap = {};
   let speakerIdx = 0;
 
@@ -3032,12 +3741,13 @@ function renderTranscriptWithMap(originalSegments, meetingId) {
       <span class="seg-time">${time}</span>
       <span class="seg-speaker ${colorClass}">${escHtml(speaker)}${badge}</span>
       <span class="seg-text">${escHtml(seg.text)}</span>
+      <button class="seg-edit-btn" onclick="event.stopPropagation();editSegmentText(this, ${segIdx}, '${meetingId}')" title="Edit text">&#9999;</button>
       <button class="seg-annotate-btn" onclick="event.stopPropagation();showAnnotationForm(${segIdx}, ${seg.start}, '${meetingId}')" title="Annotate">&#9998;</button>
     </div>`;
   }
 
   // Full HTML for mobile (no virtual scroll) and small transcripts
-  const fullSegmentsHtml = speakerMapBarHtml + mapped.map((seg, i) =>
+  const fullSegmentsHtml = bannerHtml + speakerMapBarHtml + mapped.map((seg, i) =>
     renderSegmentHtml(seg, originalSegments[i], i)
   ).join('');
 
@@ -3050,7 +3760,7 @@ function renderTranscriptWithMap(originalSegments, meetingId) {
   if (!desktopEl) return;
 
   if (mapped.length > VIRTUAL_SCROLL_THRESHOLD) {
-    desktopEl.innerHTML = speakerMapBarHtml;
+    desktopEl.innerHTML = bannerHtml + speakerMapBarHtml;
 
     const segContainer = document.createElement('div');
     desktopEl.appendChild(segContainer);
@@ -3092,11 +3802,50 @@ function renderTranscriptWithMap(originalSegments, meetingId) {
   }
 }
 
+// Segment text edit (PUT /meetings/{id}/segments/{idx}). Seeds from
+// currentOriginalSegments (raw) and sends that same value as expected_text —
+// a stale editor gets a 409 and we refresh instead of clobbering.
+function editSegmentText(btn, segIdx, meetingId) {
+  const segEl = btn.closest('.transcript-segment');
+  const textEl = segEl && segEl.querySelector('.seg-text');
+  const orig = currentOriginalSegments[segIdx];
+  if (!textEl || !orig) return;
+  const original = orig.text || '';
+  inlineEdit(textEl, {
+    value: original, multiline: true,
+    onSave: async (v) => {
+      const resp = await fetch(`${API}/meetings/${meetingId}/segments/${segIdx}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: v, expected_text: original }),
+      });
+      if (resp.status === 409) {
+        alert('Segment changed — refreshing the transcript.');
+        loadTranscript(meetingId);
+        return;
+      }
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || resp.statusText);
+      currentOriginalSegments[segIdx].text = data.text;
+      transcriptEditedSinceAnalysis = true;   // show the Re-run analysis banner
+      renderTranscriptWithMap(currentOriginalSegments, meetingId);  // virtual-scroll safe
+    },
+  });
+}
+
 // --- Utilities ---
 function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s || '';
-  return d.innerHTML;
+  // textContent->innerHTML round-trip escapes &, <, > but NOT quotes (they're
+  // only special in attribute-value context, not text-node serialization).
+  // Escape them too so escHtml() output is safe to interpolate into HTML
+  // attribute values (e.g. data-original="${escHtml(sp)}") and single-quoted
+  // inline-handler string literals, not just text-node contexts — closes the
+  // attr-breakout class at app.js's speaker-chip / speaker-edit-popover
+  // templates. Safe in text-node contexts too: innerHTML text nodes decode
+  // entities, so a stray &quot;/&#39; still renders as a literal quote.
+  return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function formatBytes(b) {
@@ -3623,6 +4372,7 @@ $('settingsStreamBackup').addEventListener('change', (e) => {
   localStorage.setItem('captureStreamBackup', e.target.checked ? 'on' : 'off');
 });
 $('settingsModel').addEventListener('input', markSettingsDirty);
+$('settingsRemoveFiller').addEventListener('change', markSettingsDirty);
 $('settingsTemp').addEventListener('input', () => {
   $('tempDisplay').textContent = parseFloat($('settingsTemp').value).toFixed(2);
   markSettingsDirty();
@@ -3719,6 +4469,7 @@ $('settingsSave').addEventListener('click', async () => {
     prompts: {},
     ollama_model: $('settingsModel').value.trim(),
     temperature: parseFloat($('settingsTemp').value),
+    remove_filler: $('settingsRemoveFiller').checked,
     chat: {
       endpoint: $('chatEndpoint').value,
       model: $('chatModel').value.trim(),
@@ -3787,6 +4538,8 @@ function populateSettingsForm(settings, defaults) {
   $('settingsModel').value = settings.ollama_model || '';
   $('settingsTemp').value = settings.temperature || 0.3;
   $('tempDisplay').textContent = parseFloat(settings.temperature || 0.3).toFixed(2);
+  // default-ON semantics: a missing key (pre-feature server) renders checked
+  $('settingsRemoveFiller').checked = settings.remove_filler !== false;
 
   for (const [key, ta] of Object.entries(promptFields)) {
     ta.value = (settings.prompts && settings.prompts[key]) || '';
@@ -3912,6 +4665,7 @@ function renderRecoveryList(pendings, serverCaptures) {
       stagedSessionId = sid;
       liveTags.roster = Array.isArray(meta.roster) ? meta.roster : [];
       liveTags.markers = Array.isArray(meta.markers) ? meta.markers : [];
+      captureNotes.restoreForSession(meta);   // async, best-effort
       row.remove();
       hideIfEmpty();
     });

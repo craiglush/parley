@@ -13,6 +13,7 @@ const SHELL_ASSETS = [
   '/static/notes-sync.js',
   '/static/notes-tasks.js',
   '/static/notes-analysis-logic.js',
+  '/static/capture-notes-logic.js',
   '/static/vendor/codemirror.bundle.js',
   '/static/icons/favicon.svg',
   '/static/icons/favicon-32.png',

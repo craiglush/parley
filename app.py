@@ -12,18 +12,20 @@ import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -50,6 +52,7 @@ import notes_vectors
 import extract
 import tasks_store
 import emailer
+from integrations import a360
 # Phase-4 modularization: pure LLM helpers live in llm.py. Re-bound here so
 # existing app.py references (and tests that do `app._strip_think`) still work.
 from llm import (
@@ -110,6 +113,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 OPENWEBUI_URL = os.getenv("OPENWEBUI_URL", "http://open-webui:8080")
 OPENWEBUI_API_KEY = os.getenv("OPENWEBUI_API_KEY", "")
+A360_API_TOKEN = os.getenv("A360_API_TOKEN", "")  # bearer for the a360 pull API; "" = disabled (secure default)
 MEETINGS_DIR = Path(os.getenv("MEETINGS_DIR", "/data/meetings"))
 COLLECTION_NAME = "meetings"
 NOTES_COLLECTION = notes_vectors.NOTES_COLLECTION  # separate "notes" Qdrant collection
@@ -350,6 +354,24 @@ DEFAULT_PROMPTS = {
     ),
 }
 
+# Appended to the cleanup preamble AT PROMPT-BUILD TIME when the remove_filler
+# setting is ON. Never written into a saved template: user prompt templates are
+# served verbatim (load_settings), so this composes with customized preambles
+# and vanishes entirely when the toggle is OFF. The final rule exists because
+# _parse_cleanup_response discards empty lines and then fails the whole batch on
+# a count mismatch — the LLM must never delete a line, only the pre-pass can.
+FILLER_DIRECTIVE = (
+    "\n"
+    "Filler removal (active — this overrides the earlier instruction to leave filler as-is):\n"
+    "- Remove remaining disfluencies: um, uh, er, ah, hmm, stutters, false starts,\n"
+    "  and immediate word repetitions (\"we we should\" -> \"we should\").\n"
+    "- Remove semantically empty filler phrases — \"you know\", \"like\", \"sort of\",\n"
+    "  \"kind of\", \"I mean\", \"basically\" — ONLY where they carry no meaning.\n"
+    "  Keep them when meaningful (\"I like this plan\", \"sort of a hybrid approach\").\n"
+    "- Never paraphrase, shorten, or tighten real content; keep the speaker's wording.\n"
+    "- Never return an empty line: if a line is nothing but filler, return it unchanged."
+)
+
 # JSON Schemas for Ollama structured outputs (`format`). These MUST mirror the
 # JSON shapes the prompt templates ask for (and that summary.json / the frontend
 # consume) — Ollama ENFORCES `format`, so a wrong shape silently flattens output.
@@ -500,6 +522,7 @@ DEFAULT_SETTINGS = {
     "prompts": dict(DEFAULT_PROMPTS),
     "ollama_model": OLLAMA_MODEL,
     "temperature": 0.3,
+    "remove_filler": True,
     "chat": {
         "endpoint": "ollama",  # "ollama", "openwebui", or "custom"
         "custom_url": "",
@@ -529,7 +552,7 @@ def load_settings() -> dict:
     settings = json.loads(json.dumps(DEFAULT_SETTINGS))  # deep copy
     if SETTINGS_PATH.exists():
         try:
-            saved = json.loads(SETTINGS_PATH.read_text())
+            saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             # Merge prompts (keep saved values, fill missing with defaults).
             # A blank saved value falls back to the built-in default so the analysis
             # pipeline (and the settings UI) never run on an empty prompt.
@@ -542,6 +565,8 @@ def load_settings() -> dict:
                 settings["ollama_model"] = saved["ollama_model"]
             if "temperature" in saved:
                 settings["temperature"] = saved["temperature"]
+            if isinstance(saved.get("remove_filler"), bool):
+                settings["remove_filler"] = saved["remove_filler"]
             # Merge chat settings
             if "chat" in saved and isinstance(saved["chat"], dict):
                 for key in DEFAULT_SETTINGS["chat"]:
@@ -746,6 +771,71 @@ def _meeting_dir(meeting: dict) -> Path:
     return path
 
 
+def _norm_company(s: str) -> str:
+    """Canonical display form for a company string: trim + collapse internal
+    whitespace. Comparison keys are _norm_company(s).casefold()."""
+    return " ".join((s or "").split())
+
+
+def suggest_company(meeting: dict) -> Optional[str]:
+    """Deterministic, pure, cheap (two small dict scans) company suggestion.
+
+    1. Attendee majority wins when speaker-company data exists: skip
+       speaker_info entries whose name is empty or a SPEAKER_* placeholder
+       (the list_people filter), count non-empty companies by casefolded
+       comparison key; the strictly highest count wins.
+    2. Tie-break (deterministic): a tied key equal to the comparison key of
+       tags.entities.companies[0] wins; otherwise the casefold-alphabetically
+       smallest tied key. Display form = first-seen normalized original
+       casing (dict insertion order — stable per meeting).
+    3. Fallback: normalized tags.entities.companies[0] when non-empty.
+    4. Otherwise None.
+
+    NEVER persisted — computed lazily wherever a meeting without a confirmed
+    company is read. That is also the migration story for legacy meetings:
+    m.get("company") is falsy, the suggestion is computed on open, and
+    index.json is never rewritten in bulk."""
+    counts: dict[str, int] = {}
+    display: dict[str, str] = {}
+    for entry in (meeting.get("speaker_info") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("name") or "").strip()
+        if not name or name.upper().startswith("SPEAKER_"):
+            continue
+        company = _norm_company(entry.get("company") or "")
+        if not company:
+            continue
+        key = company.casefold()
+        counts[key] = counts.get(key, 0) + 1
+        display.setdefault(key, company)
+
+    entities = (meeting.get("tags") or {}).get("entities") or {}
+    companies = entities.get("companies") or []
+    first_entity = _norm_company(str(companies[0])) if companies else ""
+
+    if counts:
+        top = max(counts.values())
+        tied = sorted(k for k, c in counts.items() if c == top)
+        if len(tied) == 1:
+            return display[tied[0]]
+        if first_entity and first_entity.casefold() in tied:
+            return display[first_entity.casefold()]
+        return display[tied[0]]
+
+    return first_entity or None
+
+
+def _a360_completion_payload(meeting: dict) -> dict:
+    """The dict process_meeting hands to a360.post_meeting_completed: every
+    meeting key except the unserializable _task handle, stamped with
+    company_suggestion under the SAME gate as the status endpoint — a payload
+    never pairs a confirmed company with a competing suggestion. This matters
+    for retry/trim/adopt re-completions of an already-confirmed meeting:
+    those push company set, company_suggestion null."""
+    return {**{k: v for k, v in meeting.items() if k != "_task"},
+            "company_suggestion": (suggest_company(meeting)
+                                   if not meeting.get("company") else None)}
 
 
 def _save_index():
@@ -768,7 +858,7 @@ def _load_index():
     index_path = MEETINGS_DIR / "index.json"
     if index_path.exists():
         try:
-            data = json.loads(index_path.read_text())
+            data = json.loads(index_path.read_text(encoding="utf-8"))
             for mid, m in data.items():
                 meetings[mid] = m
                 # Load tags from disk if not in index
@@ -776,7 +866,7 @@ def _load_index():
                     tags_path = Path(m["output_dir"]) / "tags.json"
                     if tags_path.exists():
                         try:
-                            m["tags"] = json.loads(tags_path.read_text())
+                            m["tags"] = json.loads(tags_path.read_text(encoding="utf-8"))
                         except Exception:
                             pass
                 # Migrate: ensure links field exists
@@ -793,6 +883,66 @@ def _update_progress(meeting: dict, percent: int, detail: str):
     _save_index()
 
 
+# ---------------------------------------------------------------------------
+# Vector re-indexing (edit-everything: every text edit re-embeds the meeting)
+# ---------------------------------------------------------------------------
+
+_reindex_locks: dict[str, threading.Lock] = {}
+_reindex_locks_guard = threading.Lock()
+
+
+def _lock_for(meeting_id: str) -> threading.Lock:
+    """Per-meeting lock serializing Qdrant delete->upsert pairs (reindex jobs
+    and delete_meeting) so overlapping jobs can't interleave and leave
+    duplicate points, and a queued reindex can't resurrect a deleted meeting."""
+    with _reindex_locks_guard:
+        lock = _reindex_locks.get(meeting_id)
+        if lock is None:
+            lock = threading.Lock()
+            _reindex_locks[meeting_id] = lock
+        return lock
+
+
+def _reindex_meeting_safe(meeting_id: str) -> None:
+    """Fire-and-forget: delete this meeting's Qdrant points and re-store them
+    from the on-disk transcript.json / summary.json (files are the source of
+    truth for all text edits). Never blocks the HTTP response; failures are
+    non-fatal — the files stay correct and the next edit/reprocess reindexes
+    everything again (full delete -> re-store, so it self-heals).
+
+    NOTE: calls the app-namespace get_qdrant() / store_in_qdrant on purpose
+    (never vector.-qualified) so test monkeypatches on app.* intercept them.
+    """
+    m = meetings.get(meeting_id)
+    if not m:
+        return
+    out_dir = Path(m.get("output_dir") or "")
+
+    def work():
+        try:
+            with _lock_for(meeting_id):
+                if meeting_id not in meetings:
+                    return  # deleted while queued — never resurrect points
+                get_qdrant().delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=Filter(
+                        must=[FieldCondition(key="meeting_id",
+                                             match=MatchValue(value=meeting_id))]
+                    ),
+                )
+                segments = []
+                tp = out_dir / "transcript.json"
+                if tp.exists():
+                    segments = json.loads(tp.read_text(encoding="utf-8")).get("segments", [])
+                summary = {}
+                sp = out_dir / "summary.json"
+                if sp.exists():
+                    summary = json.loads(sp.read_text(encoding="utf-8"))
+                store_in_qdrant(meeting_id, m, segments, summary)
+        except Exception as e:
+            logger.warning(f"[{meeting_id}] Vector reindex failed (non-fatal): {e}")
+
+    _run_bg(work)
 
 
 # ---------------------------------------------------------------------------
@@ -1104,7 +1254,7 @@ def _enhance_state() -> dict:
     p = _enhance_state_path()
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            return json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             return {}
     return {}
@@ -1222,7 +1372,7 @@ async def _resolve_note_extractions(note_id: str) -> list[dict]:
         ex = None
         if side_path.exists():
             try:
-                raw = await loop.run_in_executor(None, side_path.read_text)
+                raw = await loop.run_in_executor(None, lambda: side_path.read_text(encoding="utf-8"))
                 ex = json.loads(raw)
             except Exception:
                 ex = None
@@ -1403,6 +1553,69 @@ def build_transcript_markdown(segments: list[dict], meeting: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+# --- Deterministic filler pre-pass (Layer 1 of the remove_filler toggle) ---
+# Standalone disfluency tokens plus natural elongations: um/umm, uh/uhh,
+# er/err/erm, ah/ahh, hmm/hmmm, mm/mmm. The [\w'-] guards make matches
+# word-boundary safe AND hyphen/apostrophe safe: "umbrella", "summer",
+# "ahead", "ermine" are untouched, and the affirmations "uh-huh" / "mm-hmm"
+# are deliberately preserved (they carry meaning: agreement). Accepted
+# tradeoff (spec): the rare verb "err" is stripped.
+_FILLER_RE = re.compile(r"(?<![\w'-])(?:um+|uh+|er+m?|ah+|hm+|mm+)(?![\w'-])",
+                        re.IGNORECASE)
+
+
+def strip_fillers(text: str) -> str:
+    """Strip standalone filler tokens from one segment text. Pure.
+
+    Repair order (spec): remove tokens -> collapse comma runs -> drop space
+    before punctuation -> strip leading whitespace/commas/periods/semicolons ->
+    collapse whitespace runs -> recapitalize if a leading filler was removed.
+    """
+    out = _FILLER_RE.sub("", text)
+    if out == text:
+        return text
+    removed_at_start = _FILLER_RE.match(text.lstrip()) is not None
+    out = re.sub(r"(?:,\s*)+,", ",", out)        # ", , " -> ", "   ",," -> ","
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)   # "word ," -> "word,"
+    out = re.sub(r"^[\s,.;]+", "", out)          # ", so we..." -> "so we..."
+    out = re.sub(r"\s{2,}", " ", out).strip()
+    if removed_at_start:
+        for i, ch in enumerate(out):
+            if ch.isalpha():
+                out = out[:i] + ch.upper() + out[i + 1:]
+                break
+    return out
+
+
+def apply_filler_prepass(segments: list[dict]) -> tuple[list[dict], int]:
+    """Regex pre-pass over cleanup input segments. Pure; input list untouched.
+
+    Returns (new_segments, changed) where changed counts modified PLUS dropped
+    segments. A segment whose stripped text has no alphanumeric character was
+    pure filler (e.g. a lone "Um.") and is DROPPED — timestamps and speaker
+    label go with it, exactly as if STT had never emitted it. This is the only
+    mechanism that can remove such a segment: _parse_cleanup_response requires
+    exactly one non-empty line per input segment, so the LLM cannot delete one.
+    Safety guard: if EVERY segment would drop (pathological input), return the
+    input unchanged with count 0 — never produce an empty transcript.
+    """
+    out: list[dict] = []
+    changed = 0
+    for seg in segments:
+        text = seg.get("text") or ""
+        new_text = strip_fillers(text)
+        if not re.search(r"[A-Za-z0-9]", new_text):
+            changed += 1  # pure filler: drop
+            continue
+        if new_text != text:
+            changed += 1
+        out.append({**seg, "text": new_text})
+    if not out:
+        logger.warning("Filler pre-pass would drop every segment; leaving transcript unchanged")
+        return segments, 0
+    return out, changed
+
+
 def _build_cleanup_prompt(
     batch_segments: list[dict],
     context_before: list[dict],
@@ -1415,7 +1628,11 @@ def _build_cleanup_prompt(
 
     parts = []
     # Editable system preamble (instructions/rules)
-    parts.append(system_preamble.replace("{meeting_context}", meeting_context or ""))
+    preamble = system_preamble.replace("{meeting_context}", meeting_context or "")
+    if settings.get("remove_filler", True):
+        # Build-time directive — never persisted into the saved template.
+        preamble += FILLER_DIRECTIVE
+    parts.append(preamble)
     parts.append("")
 
     if meeting_context:
@@ -1471,6 +1688,14 @@ def _parse_cleanup_response(raw: str, expected_count: int) -> Optional[list[str]
     return [results[i] for i in range(expected_count)]
 
 
+def _segment_texts_differ(before: list[dict], after: list[dict]) -> bool:
+    """True when cleanup changed anything — text edits OR dropped segments.
+    zip() alone truncates to the shorter list, so a drop-only filler pre-pass
+    run would otherwise report zero changes and skip the transcript rewrite."""
+    return len(before) != len(after) or any(
+        a["text"] != b["text"] for a, b in zip(before, after))
+
+
 async def step_cleanup_transcript(
     segments: list[dict],
     meeting_context: Optional[str] = None,
@@ -1481,6 +1706,12 @@ async def step_cleanup_transcript(
     settings = load_settings()
     model = settings.get("ollama_model", OLLAMA_MODEL)
     temperature = settings.get("temperature", 0.3)
+
+    if settings.get("remove_filler", True):
+        # Layer 1: deterministic strip before any LLM batch. May DROP
+        # pure-filler segments, so the returned list can be SHORTER than the
+        # input (callers compare length-aware; see _segment_texts_differ).
+        segments, _prepass_changes = apply_filler_prepass(segments)
 
     cleaned_segments = copy.deepcopy(segments)
     total_batches = (len(segments) + batch_size - 1) // batch_size
@@ -1886,7 +2117,7 @@ def _get_search_context(meeting_id: str, timestamp: float) -> list[dict]:
         return []
 
     try:
-        data = json.loads(transcript_path.read_text())
+        data = json.loads(transcript_path.read_text(encoding="utf-8"))
         segments = data.get("segments", [])
     except Exception:
         return []
@@ -1987,6 +2218,21 @@ async def process_meeting(meeting_id: str):
         cleanup_settings = load_settings()
         cleanup_model = cleanup_settings.get("ollama_model", OLLAMA_MODEL)
         cleanup_temperature = cleanup_settings.get("temperature", 0.3)
+
+        # Layer 1: deterministic filler pre-pass (raw_segments were deep-copied
+        # above, so raw_transcript.json keeps the unstripped STT output).
+        if cleanup_settings.get("remove_filler", True):
+            segments, prepass_changes = apply_filler_prepass(segments)
+            if prepass_changes > 0:
+                # Bookkeeping BEFORE the LLM try-block: its catch-all swallows a
+                # total LLM failure, and stripped `segments` must never pair with
+                # an unstripped transcript_text, a stale segment_count, or
+                # "cleaned": false (speaker ID / summary / Qdrant read these).
+                transcript_text = build_transcript_text(segments)
+                meeting["segment_count"] = len(segments)
+                meeting["transcript_cleaned"] = True
+                logger.info(f"[{meeting_id}] Filler pre-pass: {prepass_changes} segments modified or dropped")
+
         try:
             batch_size = 15
             total_cleanup_batches = (len(segments) + batch_size - 1) // batch_size
@@ -2111,7 +2357,11 @@ async def process_meeting(meeting_id: str):
         context = await asyncio.get_event_loop().run_in_executor(
             None, _gather_meeting_context, meeting_id)
         summary = await step_summarize(transcript_text, duration, progress_callback=_summarize_progress, context=context)
-        if "title" in summary and summary["title"] != "Meeting":
+        if meeting.get("title_edited"):
+            # Manual rename wins over the LLM title; keep summary.json's title
+            # key (written below) consistent with the preserved record title.
+            summary["title"] = meeting.get("title", summary.get("title"))
+        elif "title" in summary and summary["title"] != "Meeting":
             meeting["title"] = summary["title"]
         step_timings["summarization"] = round(time.monotonic() - t0, 1)
         logger.info(f"[{meeting_id}] Multi-pass analysis complete, took {step_timings['summarization']}s")
@@ -2235,6 +2485,17 @@ async def process_meeting(meeting_id: str):
         except Exception as e:
             logger.warning(f"[{meeting_id}] Summary email failed (non-fatal): {e}")
 
+        # Push to a360 if configured (fire-and-forget via _run_bg; guarded
+        # no-op otherwise — never blocks or fails the pipeline). retry/trim/
+        # adopt re-completions inherit this because they all funnel back
+        # through process_meeting; single-step reprocess does not fire it.
+        def _a360_push(m=meeting):
+            try:
+                a360.post_meeting_completed(_a360_completion_payload(m))
+            except Exception as e:
+                logger.warning(f"a360 push failed (non-fatal): {e}")
+        _run_bg(_a360_push)
+
     except Exception as e:
         meeting["status"] = MeetingStatus.error
         meeting["error"] = str(e)
@@ -2315,6 +2576,36 @@ async def api_info():
     }
 
 
+async def _link_note_to_meeting(note_id: Optional[str], meeting_id: str) -> None:
+    """Best-effort: add meeting_id to a vault note's linked_meetings frontmatter.
+
+    Called by upload_meeting / capture_adopt right after the meeting insert and
+    on their sid-dedup early-return paths (repairing a link whose first attempt
+    predated the note's flush). Idempotent — link_meeting is a membership add,
+    so retries/races can never double-link.
+
+    Runs ON THE THREADPOOL, not inline: link_meeting -> find_path -> get_index
+    can trigger a synchronous full index rebuild (seconds over the bind mount),
+    and upload_meeting is the hot path offline-queue flushes and mobile
+    reconnects hit — an inline call could stall the event loop and block every
+    concurrent request (api_link_meeting stays inline: small, user-initiated).
+
+    Never raises — the upload/adopt must never fail on linking. No format
+    validation beyond a 64-char length cap: the id is only ever an index key
+    (find_path never joins it into a filesystem path), so malformed and temp
+    (n_local_*) ids simply miss the lookup — the ignored-malformed-sid rule.
+    """
+    if not note_id or len(note_id) > 64:
+        return
+    try:
+        rec = await asyncio.to_thread(
+            notes_store.link_meeting, notes_store.NOTES_DIR, note_id, meeting_id, True)
+        if rec is None:
+            logger.warning(f"[{meeting_id}] note link skipped — unknown note_id {note_id!r}")
+    except Exception as e:
+        logger.warning(f"[{meeting_id}] note link failed (non-fatal): {e}")
+
+
 @app.post("/meetings/upload")
 async def upload_meeting(
     file: UploadFile = File(...),
@@ -2325,6 +2616,7 @@ async def upload_meeting(
     speaker_tags: Optional[str] = Form(default=None),
     speaker_roster: Optional[str] = Form(default=None),
     sid: Optional[str] = Form(default=None),
+    note_id: Optional[str] = Form(default=None),
 ):
     """Upload an audio/video file for meeting processing."""
     # Validate file extension
@@ -2359,6 +2651,10 @@ async def upload_meeting(
         for existing_id, m in meetings.items():
             if m.get("source_sid") == valid_sid:
                 logger.info(f"[{existing_id}] Duplicate upload for capture {valid_sid} — returning existing meeting")
+                # Dedup-path link repair: the first attempt may have uploaded
+                # before the note flushed (no note_id then); this retry carries
+                # the real id. Idempotent — link_meeting checks membership.
+                await _link_note_to_meeting(note_id, existing_id)
                 return JSONResponse(
                     content={"meeting_id": existing_id, "status": "queued"},
                     status_code=202,
@@ -2406,6 +2702,11 @@ async def upload_meeting(
     _save_index()
 
     logger.info(f"[{meeting_id}] Meeting uploaded: {file.filename} ({len(content) / (1024*1024):.1f} MB)")
+
+    # Link the in-meeting note BEFORE processing is scheduled, so the link
+    # exists before Phase C's _gather_meeting_context could ever look
+    # (belt-and-braces on top of transcription taking minutes anyway).
+    await _link_note_to_meeting(note_id, meeting_id)
 
     # Start processing in background
     task = asyncio.create_task(process_meeting(meeting_id))
@@ -2456,6 +2757,7 @@ def _compact_meeting_summary(mid: str, m: dict) -> dict:
         "status": m.get("status"),
         "duration_formatted": m.get("duration_formatted"),
         "tags": m.get("tags", {}),
+        "company": m.get("company"),
     }
 
 
@@ -2623,8 +2925,10 @@ async def list_meetings(
     category: Optional[str] = Query(default=None),
     tag: Optional[str] = Query(default=None),
     speaker: Optional[str] = Query(default=None),
+    company: Optional[str] = Query(default=None),
 ):
     """List all meetings with their status, with optional filtering."""
+    company_key = _norm_company(company).casefold() if company else None
     result = []
     for mid, m in sorted(meetings.items(), key=lambda x: x[1].get("created_at", ""), reverse=True):
         # Apply filters
@@ -2668,6 +2972,13 @@ async def list_meetings(
             if not any(speaker_lower in name for name in speaker_names):
                 continue
 
+        # Company filter: case-insensitive normalized EXACT match against the
+        # CONFIRMED company only — suggestion-only meetings never match.
+        if company_key is not None:
+            mine = m.get("company")
+            if not mine or _norm_company(mine).casefold() != company_key:
+                continue
+
         result.append({
             "id": mid,
             "date": m.get("date"),
@@ -2679,6 +2990,7 @@ async def list_meetings(
             "progress_detail": m.get("progress_detail", ""),
             "step_timings": m.get("step_timings"),
             "tags": m.get("tags", {}),
+            "company": m.get("company"),
         })
     return result
 
@@ -2699,6 +3011,14 @@ async def meeting_status(meeting_id: str):
         "progress_detail": m.get("progress_detail", ""),
         "step_timings": m.get("step_timings"),
         "transcript_cleaned": m.get("transcript_cleaned", False),
+        "transcript_edited": m.get("transcript_edited", False),
+        # Company tag: confirmed value (persisted) or None; the suggestion is
+        # computed lazily and ONLY when no confirmed company exists (a response
+        # never pairs both) — this is also the legacy-meeting migration path.
+        # NOTE: a sibling feature may have added `transcript_edited` here — insert
+        # after whatever the final entry is; do not replace the dict.
+        "company": m.get("company"),
+        "company_suggestion": (None if m.get("company") else suggest_company(m)),
     }
     if m.get("status") == MeetingStatus.error:
         result["error"] = m.get("error")
@@ -2718,7 +3038,7 @@ async def meeting_transcript(meeting_id: str):
     out_dir = Path(m.get("output_dir", ""))
     transcript_path = out_dir / "transcript.json"
     if transcript_path.exists():
-        return json.loads(transcript_path.read_text())
+        return json.loads(transcript_path.read_text(encoding="utf-8"))
 
     raise HTTPException(status_code=404, detail="Transcript file not found")
 
@@ -2735,9 +3055,192 @@ async def meeting_summary(meeting_id: str):
     out_dir = Path(m.get("output_dir", ""))
     summary_path = out_dir / "summary.json"
     if summary_path.exists():
-        return json.loads(summary_path.read_text())
+        return json.loads(summary_path.read_text(encoding="utf-8"))
 
     raise HTTPException(status_code=404, detail="Summary file not found")
+
+
+class MeetingPatch(BaseModel):
+    title: str
+
+
+@app.patch("/meetings/{meeting_id}")
+async def patch_meeting(meeting_id: str, body: MeetingPatch):
+    """Rename a completed meeting. Sets title_edited so LLM re-summarization
+    never clobbers the manual title; mirrors the title into summary.json (the
+    source of summary.md's H1) BEFORE regenerating the markdown exports; then
+    re-embeds — every Qdrant payload stamps the title. The on-disk folder name
+    is a creation-time slug and is deliberately NOT renamed (output_dir is the
+    stable pointer everything holds)."""
+    if meeting_id not in meetings:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    m = meetings[meeting_id]
+    if m.get("status") != MeetingStatus.complete:
+        raise HTTPException(status_code=409, detail=f"Meeting not ready (status: {m.get('status')})")
+
+    title = (body.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title cannot be empty")
+
+    m["title"] = title
+    m["title_edited"] = True
+
+    out_dir = Path(m.get("output_dir", ""))
+
+    # 1) Rewrite summary.json's own title key FIRST — build_summary_markdown
+    # takes its H1 from summary.get("title"), not from the meeting record.
+    summary_path = out_dir / "summary.json"
+    summary_data = None
+    if summary_path.exists():
+        try:
+            summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
+            summary_data["title"] = title
+            _atomic_write(summary_path, json.dumps(summary_data, indent=2))
+            if isinstance(m.get("summary"), dict):
+                m["summary"]["title"] = title
+        except Exception as e:
+            logger.warning(f"[{meeting_id}] summary.json title rewrite failed (non-fatal): {e}")
+            summary_data = None
+
+    # 2) Regenerate the derived markdown files that embed the title.
+    transcript_path = out_dir / "transcript.json"
+    if transcript_path.exists():
+        try:
+            segments = json.loads(transcript_path.read_text(encoding="utf-8")).get("segments", [])
+            _atomic_write(out_dir / "transcript.md", build_transcript_markdown(segments, m))
+        except Exception as e:
+            logger.warning(f"[{meeting_id}] transcript.md regeneration failed (non-fatal): {e}")
+    if summary_data is not None:
+        _atomic_write(out_dir / "summary.md", build_summary_markdown(summary_data, m))
+
+    _save_index()
+    _reindex_meeting_safe(meeting_id)
+    return {"detail": "Title updated", "title": title}
+
+
+# The five approved editable summary fields (spec: topics/figures/sentiment/tags
+# are out of scope). Two have legacy aliases from the old summary schema; the
+# write path canonicalizes so every `x or legacy` reader picks up the edit.
+ALLOWED_SUMMARY_FIELDS = {"summary", "action_items", "decisions", "concerns", "open_questions"}
+_SUMMARY_LEGACY_ALIASES = {"summary": "executive_summary", "open_questions": "questions_raised"}
+
+
+class SummaryFieldPut(BaseModel):
+    value: Any
+
+
+@app.put("/meetings/{meeting_id}/summary/{field}")
+async def update_summary_field(meeting_id: str, field: str, body: SummaryFieldPut):
+    """Replace one summary field wholesale (edit-in-place UI granularity).
+    Single-user app: the client sends back the array it received with one
+    item's text changed. NOTE: keep this handler's read-modify-write synchronous
+    (no await between the file read and _atomic_write) — that invariant is what
+    makes summary.json writers safe without an expected_* guard."""
+    if meeting_id not in meetings:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    m = meetings[meeting_id]
+    if m.get("status") != MeetingStatus.complete:
+        raise HTTPException(status_code=409, detail=f"Meeting not ready (status: {m.get('status')})")
+    if field not in ALLOWED_SUMMARY_FIELDS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown field. Allowed: {sorted(ALLOWED_SUMMARY_FIELDS)}")
+
+    value = body.value
+    if field == "summary":
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(status_code=400, detail="summary must be a non-empty string")
+        value = value.strip()
+    else:
+        if not isinstance(value, list) or not all(isinstance(x, dict) for x in value):
+            raise HTTPException(status_code=400, detail=f"{field} must be a list of objects")
+
+    out_dir = Path(m.get("output_dir", ""))
+    summary_path = out_dir / "summary.json"
+    if not summary_path.exists():
+        raise HTTPException(status_code=404, detail="Summary file not found")
+    summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    if field == "action_items":
+        current = summary_data.get("action_items", [])
+        if len(value) != len(current):
+            raise HTTPException(
+                status_code=400,
+                detail=f"action_items must keep the same length ({len(current)}); "
+                       "add/remove is not supported (task_overlay.json is keyed by index)")
+        # Summary-side edit wins over a stale To-Do-side text override: clear the
+        # overlay's text/edited keys for each index whose task text changed,
+        # preserving done/deleted state (spec, Overlay precedence).
+        def _task_text(item):
+            return item.get("task") or item.get("description", "")
+        changed = [i for i, (old, new) in enumerate(zip(current, value))
+                   if _task_text(old) != _task_text(new)]
+        if changed:
+            overlay = _load_meeting_overlay(meeting_id)
+            dirty = False
+            for i in changed:
+                entry = overlay.get(str(i))
+                if entry and ("text" in entry or "edited" in entry):
+                    entry.pop("text", None)
+                    entry.pop("edited", None)
+                    dirty = True
+            if dirty:
+                _save_meeting_overlay(meeting_id, overlay)
+
+    summary_data[field] = value
+    legacy = _SUMMARY_LEGACY_ALIASES.get(field)
+    if legacy:
+        summary_data.pop(legacy, None)
+
+    _atomic_write(summary_path, json.dumps(summary_data, indent=2))
+    _atomic_write(out_dir / "summary.md", build_summary_markdown(summary_data, m))
+    m["summary"] = summary_data          # related-notes reads the in-memory copy
+    _save_index()
+    _reindex_meeting_safe(meeting_id)
+    return summary_data
+
+
+class SegmentEdit(BaseModel):
+    text: str
+    expected_text: Optional[str] = None  # optimistic guard, mirrors TaskToggle
+
+
+@app.put("/meetings/{meeting_id}/segments/{index}")
+async def update_segment(meeting_id: str, index: int, body: SegmentEdit):
+    """Edit one transcript segment's text in place. expected_text (when sent)
+    must match the current on-disk text or the edit 409s and writes nothing —
+    the same stale-guard contract as task-line edits. raw_transcript.json is
+    deliberately untouched (pre-cleanup source; reprocess 'cleanup' re-derives
+    from it and is an accepted destructive re-run)."""
+    if meeting_id not in meetings:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    m = meetings[meeting_id]
+    if m.get("status") != MeetingStatus.complete:
+        raise HTTPException(status_code=409, detail=f"Meeting not ready (status: {m.get('status')})")
+
+    new_text = (body.text or "").strip()
+    if not new_text:
+        raise HTTPException(status_code=400, detail="Segment text cannot be empty")
+
+    out_dir = Path(m.get("output_dir", ""))
+    transcript_path = out_dir / "transcript.json"
+    if not transcript_path.exists():
+        raise HTTPException(status_code=404, detail="Transcript file not found")
+    transcript_data = json.loads(transcript_path.read_text(encoding="utf-8"))
+    segments = transcript_data.get("segments", [])
+    if index < 0 or index >= len(segments):
+        raise HTTPException(status_code=404, detail="Segment not found")
+    if body.expected_text is not None and body.expected_text != segments[index].get("text"):
+        raise HTTPException(status_code=409, detail="Segment changed; refresh")
+
+    segments[index]["text"] = new_text
+    _atomic_write(transcript_path, json.dumps(transcript_data, indent=2))
+    _atomic_write(out_dir / "transcript.srt", _generate_srt(segments))
+    _atomic_write(out_dir / "transcript.md", build_transcript_markdown(segments, m))
+    m["transcript_text"] = build_transcript_text(segments)
+    m["transcript_edited"] = True
+    _save_index()
+    _reindex_meeting_safe(meeting_id)
+    return segments[index]
 
 
 @app.get("/meetings/{meeting_id}/files/{filename}")
@@ -2763,7 +3266,7 @@ async def meeting_file(meeting_id: str, filename: str):
     if not file_path.exists() and filename in ("transcript.md", "summary.md"):
         transcript_path = out_dir / "transcript.json"
         if filename == "transcript.md" and transcript_path.exists():
-            data = json.loads(transcript_path.read_text())
+            data = json.loads(transcript_path.read_text(encoding="utf-8"))
             segments = data.get("segments", [])
             if segments:
                 md = build_transcript_markdown(segments, m)
@@ -2771,7 +3274,7 @@ async def meeting_file(meeting_id: str, filename: str):
         elif filename == "summary.md":
             summary_path = out_dir / "summary.json"
             if summary_path.exists():
-                summary_data = json.loads(summary_path.read_text())
+                summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
                 md = build_summary_markdown(summary_data, m)
                 _atomic_write(file_path, md)
 
@@ -2906,34 +3409,45 @@ async def delete_meeting(meeting_id: str):
         if out_dir and Path(out_dir).exists():
             shutil.rmtree(out_dir, ignore_errors=True)
 
-        # Delete vectors from Qdrant (best-effort)
-        try:
-            qdrant = get_qdrant()
-            qdrant.delete(
-                collection_name=COLLECTION_NAME,
-                points_selector=Filter(
-                    must=[FieldCondition(key="meeting_id", match=MatchValue(value=meeting_id))]
-                ),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to delete Qdrant vectors for {meeting_id} (non-fatal): {e}")
+        # Serialize with any queued/running reindex job for this meeting so the
+        # job can't re-upsert points after this delete (permanent orphans that
+        # /meetings/search would keep surfacing — see _reindex_meeting_safe).
+        # Runs off the event loop (asyncio.to_thread) because threading.Lock is
+        # blocking: holding it synchronously here would freeze the whole server
+        # for as long as a queued reindex job (real Qdrant delete + re-embed)
+        # takes to release it.
+        def _locked_delete():
+            with _lock_for(meeting_id):
+                # Delete vectors from Qdrant (best-effort)
+                try:
+                    qdrant = get_qdrant()
+                    qdrant.delete(
+                        collection_name=COLLECTION_NAME,
+                        points_selector=Filter(
+                            must=[FieldCondition(key="meeting_id", match=MatchValue(value=meeting_id))]
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to delete Qdrant vectors for {meeting_id} (non-fatal): {e}")
 
-        # Clean up links in other meetings that reference this one
-        for other_id, other in meetings.items():
-            if other_id == meeting_id:
-                continue
-            other_links = other.get("links")
-            if not other_links:
-                continue
-            if meeting_id in other_links.get("manual", []):
-                other_links["manual"].remove(meeting_id)
-            other_links["suggestions"] = [
-                s for s in other_links.get("suggestions", [])
-                if s.get("meeting_id") != meeting_id
-            ]
+                # Clean up links in other meetings that reference this one
+                for other_id, other in meetings.items():
+                    if other_id == meeting_id:
+                        continue
+                    other_links = other.get("links")
+                    if not other_links:
+                        continue
+                    if meeting_id in other_links.get("manual", []):
+                        other_links["manual"].remove(meeting_id)
+                    other_links["suggestions"] = [
+                        s for s in other_links.get("suggestions", [])
+                        if s.get("meeting_id") != meeting_id
+                    ]
 
-        del meetings[meeting_id]
-        _save_index()
+                del meetings[meeting_id]
+                _save_index()
+
+        await asyncio.to_thread(_locked_delete)
 
     return {"detail": f"Meeting {meeting_id} deleted"}
 
@@ -2955,7 +3469,7 @@ async def get_tags(meeting_id: str):
     tags_path = out_dir / "tags.json"
     if tags_path.exists():
         try:
-            tags = json.loads(tags_path.read_text())
+            tags = json.loads(tags_path.read_text(encoding="utf-8"))
             m["tags"] = tags
             return tags
         except Exception:
@@ -2985,7 +3499,7 @@ async def update_tags(meeting_id: str, body: TagsUpdateRequest):
         tags_path = out_dir / "tags.json"
         if tags_path.exists():
             try:
-                current_tags = json.loads(tags_path.read_text())
+                current_tags = json.loads(tags_path.read_text(encoding="utf-8"))
             except Exception:
                 current_tags = {}
 
@@ -3013,6 +3527,143 @@ async def update_tags(meeting_id: str, body: TagsUpdateRequest):
     return {"detail": "Tags updated", "tags": current_tags}
 
 
+class CompanyUpdateRequest(BaseModel):
+    company: Optional[str] = None   # null or "" clears the tag
+
+
+@app.patch("/meetings/{meeting_id}/company")
+async def update_company(meeting_id: str, body: CompanyUpdateRequest):
+    """Set or clear a meeting's confirmed company tag. User metadata, not
+    pipeline output — allowed for ANY meeting status. index.json is the source
+    of truth (via _save_index); the summary.json mirror is best-effort, a
+    mirror failure logs a warning and never fails the request (house
+    non-fatal pattern, same as update_tags' tags.json write)."""
+    if meeting_id not in meetings:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    m = meetings[meeting_id]
+    value = _norm_company(body.company or "")
+    if value:
+        m["company"] = value
+    else:
+        m.pop("company", None)
+    _save_index()
+
+    out_dir = Path(m.get("output_dir", ""))
+    summary_path = out_dir / "summary.json"
+    if m.get("output_dir") and summary_path.exists():
+        try:
+            # FRESH read on purpose (read-modify-write) — never a cached JSON
+            # read: a stale summary here would clobber newer fields on rewrite.
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+            if value:
+                data["company"] = value
+            else:
+                data.pop("company", None)
+            _atomic_write(summary_path, json.dumps(data, indent=2))
+        except Exception as e:
+            logger.warning(f"[{meeting_id}] company mirror to summary.json failed (non-fatal): {e}")
+
+    return {"detail": "Company updated", "company": value or None}
+
+
+# ---------------------------------------------------------------------------
+# a360 (Sales Intel) pull API — bearer-guarded; the only in-app auth
+# ---------------------------------------------------------------------------
+
+
+def require_a360_token(authorization: str = Header(default="")) -> None:
+    """Bearer guard for the two a360 pull routes ONLY — a per-route dependency,
+    NOT middleware (the BaseHTTPMiddleware stack has known coupling quirks —
+    see _run_bg's docstring — and a middleware would either break the browser
+    app, which sends no token, or need a path allowlist). This is the first
+    in-app auth in this service: host port 8191 is LAN-reachable with no
+    Authelia in front.
+
+    Reads the module global at call time so tests can monkeypatch it.
+    Secure default: env unset -> 401 (feature off until a token is minted).
+    compare_digest on BYTES, not str: constant-time AND no TypeError->500 on a
+    non-ASCII token from the unauthenticated LAN port. No token echoes in
+    logs; no 403s."""
+    if not A360_API_TOKEN:
+        raise HTTPException(status_code=401, detail="a360 API disabled",
+                            headers={"WWW-Authenticate": "Bearer"})
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(
+            token.encode("utf-8"), A360_API_TOKEN.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Invalid token",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+
+@app.get("/api/companies", dependencies=[Depends(require_a360_token)])
+async def a360_list_companies():
+    """a360 pull API: distinct CONFIRMED companies across all meetings.
+    Suggestion-only meetings never appear (unconfirmed = not a company row).
+    Grouped by casefolded comparison key — display form is the first-seen
+    original casing (meetings-dict insertion order) — sorted by meeting_count
+    desc then name. In-memory scan of `meetings`; no disk IO."""
+    agg: dict[str, dict] = {}
+    for m in meetings.values():
+        raw = m.get("company")
+        if not raw:
+            continue
+        norm = _norm_company(raw)
+        row = agg.setdefault(norm.casefold(),
+                             {"company": norm, "meeting_count": 0, "last_meeting_date": ""})
+        row["meeting_count"] += 1
+        row["last_meeting_date"] = max(row["last_meeting_date"], m.get("date") or "")
+    return sorted(agg.values(), key=lambda r: (-r["meeting_count"], r["company"].casefold()))
+
+
+@app.get("/api/companies/meetings", dependencies=[Depends(require_a360_token)])
+async def a360_company_meetings(name: str = Query(...)):
+    """a360 pull API: complete meetings whose CONFIRMED company matches `name`.
+
+    `name` is a REQUIRED QUERY PARAM, never a path segment: company names are
+    free-form strings from LLM extraction and user-typed rosters and can
+    contain '/' ("TBC Bank / JSC") — Starlette path params match one segment
+    and do not route %2F, so a path route would let /api/companies enumerate
+    rows this endpoint could not fetch, silently breaking the pull-API-as-
+    reconciliation guarantee. Missing name -> FastAPI's standard 422.
+    Unknown company -> [] (not 404: a typo and "no confirmed meetings yet" are
+    indistinguishable, and both are recoverable). Missing/corrupt summary.json
+    -> summary null / action_items [] rather than dropping the meeting.
+    Sorted date desc."""
+    want = _norm_company(name).casefold()
+    out = []
+    for mid, m in meetings.items():
+        mine = m.get("company")
+        if not want or not mine or _norm_company(mine).casefold() != want:
+            continue
+        if m.get("status") != MeetingStatus.complete:
+            continue    # nothing to pull yet — no summary exists
+        # Read-only summary access via the (mtime_ns, size)-keyed JSON cache
+        # (same source meeting_summary serves; the PATCH mirror rewrite changes
+        # the mtime, so a fresh confirm is picked up immediately).
+        data = _read_json_cached(Path(m.get("output_dir", "")) / "summary.json")
+        attendees = []
+        for entry in (m.get("speaker_info") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            pname = (entry.get("name") or "").strip()
+            if not pname or pname.upper().startswith("SPEAKER_"):
+                continue    # the list_people placeholder filter
+            attendees.append({"name": pname,
+                              "company": (entry.get("company") or "").strip(),
+                              "title": (entry.get("title") or "").strip()})
+        out.append({
+            "id": mid,
+            "date": m.get("date"),
+            "title": m.get("title"),
+            "duration_formatted": m.get("duration_formatted"),
+            "company": mine,
+            "summary": data.get("summary") if isinstance(data, dict) else None,
+            "action_items": (data.get("action_items") or []) if isinstance(data, dict) else [],
+            "attendees": attendees,
+        })
+    out.sort(key=lambda r: r["date"] or "", reverse=True)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Notes CRUD
 # ---------------------------------------------------------------------------
@@ -3038,7 +3689,7 @@ def _load_notes(meeting_id: str) -> dict:
     notes_path = out_dir / "notes.json"
     if notes_path.exists():
         try:
-            return json.loads(notes_path.read_text())
+            return json.loads(notes_path.read_text(encoding="utf-8"))
         except Exception:
             pass
     return {"notes": []}
@@ -3314,7 +3965,7 @@ async def _auto_generate_insights(meeting_id: str):
         if d.exists():
             for f in d.glob("ins_*.json"):
                 try:
-                    entry = json.loads(f.read_text())
+                    entry = json.loads(f.read_text(encoding="utf-8"))
                     ts = datetime.fromisoformat(entry.get("timestamp", "2000-01-01"))
                     if (datetime.now() - ts).total_seconds() < 60:
                         logger.info(f"[{meeting_id}] Skipping auto-insights — recent insight exists")
@@ -3438,7 +4089,7 @@ def _migrate_legacy_insights(meeting_id: str):
     if not legacy.exists():
         return
     try:
-        data = json.loads(legacy.read_text())
+        data = json.loads(legacy.read_text(encoding="utf-8"))
         ts = datetime.now().strftime("%Y%m%dT%H%M%S")
         entry = {
             "id": f"ins_{ts}",
@@ -3466,7 +4117,7 @@ def _list_insights(meeting_id: str) -> list[dict]:
     results = []
     for f in sorted(d.glob("ins_*.json"), reverse=True):
         try:
-            entry = json.loads(f.read_text())
+            entry = json.loads(f.read_text(encoding="utf-8"))
             results.append({
                 "id": entry["id"],
                 "timestamp": entry.get("timestamp", ""),
@@ -3495,7 +4146,7 @@ def _build_meeting_context(target_ids: list[str]) -> str:
         summary_path = out_dir / "summary.json"
         if summary_path.exists():
             try:
-                summary = json.loads(summary_path.read_text())
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
                 ctx += f"**Summary:** {summary.get('summary', '')}\n"
                 topics = summary.get("topics", [])
                 if topics:
@@ -3639,7 +4290,7 @@ async def get_cross_meeting_insights(meeting_id: str, insight_id: Optional[str] 
         path = d / f"{insight_id}.json"
         if not path.exists():
             raise HTTPException(status_code=404, detail="Insight not found")
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
 
     return {"insights": _list_insights(meeting_id)}
 
@@ -3674,12 +4325,12 @@ async def get_speakers(meeting_id: str):
     # Try rich speaker_info first, fall back to flat speaker_map
     speaker_info_path = out_dir / "speaker_info.json"
     if speaker_info_path.exists():
-        speaker_info = json.loads(speaker_info_path.read_text())
+        speaker_info = json.loads(speaker_info_path.read_text(encoding="utf-8"))
         return {"speaker_info": speaker_info}
 
     speaker_map_path = out_dir / "speaker_map.json"
     if speaker_map_path.exists():
-        speaker_map = json.loads(speaker_map_path.read_text())
+        speaker_map = json.loads(speaker_map_path.read_text(encoding="utf-8"))
         # Convert flat map to speaker_info format
         speaker_info = {}
         for label, name in speaker_map.items():
@@ -3721,7 +4372,7 @@ async def update_speakers(meeting_id: str, body: SpeakerMapRequest):
     existing_map = {}
     if existing_map_path.exists():
         try:
-            existing_map = json.loads(existing_map_path.read_text())
+            existing_map = json.loads(existing_map_path.read_text(encoding="utf-8"))
         except Exception:
             pass
     # reverse: {"Alex": "SPEAKER_00", ...}
@@ -3746,7 +4397,7 @@ async def update_speakers(meeting_id: str, body: SpeakerMapRequest):
     # Update transcript.json — revert to SPEAKER_XX labels then apply new names
     transcript_path = out_dir / "transcript.json"
     if transcript_path.exists():
-        transcript_data = json.loads(transcript_path.read_text())
+        transcript_data = json.loads(transcript_path.read_text(encoding="utf-8"))
         segments = transcript_data.get("segments", [])
         # Revert any previously applied display names back to SPEAKER_XX
         for seg in segments:
@@ -3775,7 +4426,7 @@ async def update_speakers(meeting_id: str, body: SpeakerMapRequest):
     # Update summary.json — replace speaker labels/names in all fields
     summary_path = out_dir / "summary.json"
     if summary_path.exists():
-        summary_data = json.loads(summary_path.read_text())
+        summary_data = json.loads(summary_path.read_text(encoding="utf-8"))
         # Build a combined replacement map: SPEAKER_XX -> new_name AND old_name -> new_name
         replace_map = {}
         for label, new_name in canonical_map.items():
@@ -3837,7 +4488,7 @@ async def update_speakers(meeting_id: str, body: SpeakerMapRequest):
     speaker_info_path = out_dir / "speaker_info.json"
     if speaker_info_path.exists():
         try:
-            speaker_info = json.loads(speaker_info_path.read_text())
+            speaker_info = json.loads(speaker_info_path.read_text(encoding="utf-8"))
             for original_label, new_name in canonical_map.items():
                 if original_label in speaker_info:
                     speaker_info[original_label]["name"] = new_name
@@ -3869,6 +4520,10 @@ async def update_speakers(meeting_id: str, body: SpeakerMapRequest):
     # Store canonical mapping in memory
     m["speaker_map"] = canonical_map
     _save_index()
+
+    # Re-embed: Qdrant payloads stamp speaker names into text + the speaker
+    # field, so renames must delete->re-store or RAG answers with old names.
+    _reindex_meeting_safe(meeting_id)
 
     return {"detail": "Speaker names updated", "speaker_map": canonical_map}
 
@@ -3906,7 +4561,7 @@ async def merge_speakers(meeting_id: str, body: MergeSpeakersRequest):
     # Update transcript.json
     transcript_path = out_dir / "transcript.json"
     if transcript_path.exists():
-        transcript_data = json.loads(transcript_path.read_text())
+        transcript_data = json.loads(transcript_path.read_text(encoding="utf-8"))
         segments = transcript_data.get("segments", [])
         for seg in segments:
             if seg.get("speaker") in sources:
@@ -3919,7 +4574,7 @@ async def merge_speakers(meeting_id: str, body: MergeSpeakersRequest):
     # Update speaker_map.json
     speaker_map_path = out_dir / "speaker_map.json"
     if speaker_map_path.exists():
-        speaker_map = json.loads(speaker_map_path.read_text())
+        speaker_map = json.loads(speaker_map_path.read_text(encoding="utf-8"))
         for label, name in list(speaker_map.items()):
             if name in sources:
                 speaker_map[label] = target
@@ -3930,7 +4585,7 @@ async def merge_speakers(meeting_id: str, body: MergeSpeakersRequest):
     speaker_info_path = out_dir / "speaker_info.json"
     if speaker_info_path.exists():
         try:
-            speaker_info = json.loads(speaker_info_path.read_text())
+            speaker_info = json.loads(speaker_info_path.read_text(encoding="utf-8"))
             for label, info in list(speaker_info.items()):
                 if info.get("name") in sources or info.get("display_name") in sources:
                     # Point this to the target
@@ -3944,7 +4599,7 @@ async def merge_speakers(meeting_id: str, body: MergeSpeakersRequest):
     # Update summary — replace merged speaker names in text
     summary_path = out_dir / "summary.json"
     if summary_path.exists():
-        summary_text = summary_path.read_text()
+        summary_text = summary_path.read_text(encoding="utf-8")
         for src in sources:
             summary_text = summary_text.replace(src, target)
         _atomic_write(summary_path, summary_text)
@@ -3955,6 +4610,7 @@ async def merge_speakers(meeting_id: str, body: MergeSpeakersRequest):
             pass
 
     _save_index()
+    _reindex_meeting_safe(meeting_id)
     logger.info(f"[{meeting_id}] Merged speakers {list(sources)} -> {target} ({merged_count} segments)")
     return {"detail": f"Merged {list(sources)} into {target}", "segments_changed": merged_count}
 
@@ -3987,7 +4643,7 @@ async def reassign_segments(meeting_id: str, body: ReassignSegmentsRequest):
     if not transcript_path.exists():
         raise HTTPException(status_code=404, detail="Transcript not found")
 
-    transcript_data = json.loads(transcript_path.read_text())
+    transcript_data = json.loads(transcript_path.read_text(encoding="utf-8"))
     segments = transcript_data.get("segments", [])
     changed = 0
 
@@ -4002,6 +4658,7 @@ async def reassign_segments(meeting_id: str, body: ReassignSegmentsRequest):
     _atomic_write(out_dir / "transcript.md", build_transcript_markdown(segments, m))
 
     _save_index()
+    _reindex_meeting_safe(meeting_id)
     logger.info(f"[{meeting_id}] Reassigned {changed} segments to {body.new_speaker}")
     return {"detail": f"Reassigned {changed} segments to {body.new_speaker}", "segments_changed": changed}
 
@@ -4151,7 +4808,7 @@ def _read_capture_meta(sid: str) -> Optional[dict]:
     if not mp.exists():
         return None
     try:
-        return json.loads(mp.read_text())
+        return json.loads(mp.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -4159,7 +4816,7 @@ def _read_capture_meta(sid: str) -> Optional[dict]:
 def _write_capture_meta(sid: str, meta: dict) -> None:
     d = _capture_dir(sid)
     d.mkdir(parents=True, exist_ok=True)
-    (d / "meta.json").write_text(json.dumps(meta))
+    (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
 
 def _gc_captures() -> int:
@@ -4276,6 +4933,7 @@ class CaptureTagsRequest(BaseModel):
     roster: list[dict] = []
     title: Optional[str] = None
     context: Optional[str] = None
+    note_id: Optional[str] = None
 
 
 @app.post("/captures/{sid}/tags")
@@ -4295,6 +4953,12 @@ async def capture_tags(sid: str, body: CaptureTagsRequest):
         meta["title"] = body.title
     if body.context is not None:
         meta["context"] = body.context
+    if body.note_id is not None:
+        # Only-when-present: frequent tag-only re-posts from liveTags._flush
+        # must never wipe a previously mirrored in-meeting note id. This is
+        # what makes dead-device adopt linking possible — a server-only
+        # capture has no local meta left, so this copy is the only survivor.
+        meta["note_id"] = body.note_id
     meta["updated_at"] = datetime.now(timezone.utc).timestamp()
     _write_capture_meta(sid, meta)
     return {"ok": True, "tag_count": len(meta["speaker_tags"])}
@@ -4327,6 +4991,7 @@ async def capture_list():
 
 class CaptureAdoptRequest(BaseModel):
     title: Optional[str] = None
+    note_id: Optional[str] = None
 
 
 @app.post("/captures/{sid}/adopt")
@@ -4343,6 +5008,11 @@ async def capture_adopt(sid: str, body: CaptureAdoptRequest):
     if not parts:
         raise HTTPException(status_code=404, detail="Capture has no data")
 
+    # Effective note id: explicit body value, else the server capture meta's
+    # mirrored copy (posted by the live tags mirror while recording) — mirrors
+    # the existing title fallback below. The recovery UI keeps posting {}.
+    eff_note_id = body.note_id or meta.get("note_id")
+
     # Idempotency across recovery paths: if the local blob already uploaded this
     # capture (a meeting carries source_sid == sid), don't create a second meeting —
     # return the existing one and drop the now-redundant staging dir.
@@ -4350,6 +5020,7 @@ async def capture_adopt(sid: str, body: CaptureAdoptRequest):
         if m.get("source_sid") == sid:
             shutil.rmtree(_capture_dir(sid), ignore_errors=True)
             logger.info(f"[{existing_id}] Adopt for already-uploaded capture {sid} — returning existing meeting")
+            await _link_note_to_meeting(eff_note_id, existing_id)
             return JSONResponse(
                 content={"meeting_id": existing_id, "title": m.get("title"), "status": "queued"},
                 status_code=202,
@@ -4391,6 +5062,8 @@ async def capture_adopt(sid: str, body: CaptureAdoptRequest):
     _save_index()
 
     logger.info(f"[{new_id}] Adopted streamed capture {sid} ({len(parts)} chunks, {meta.get('bytes', 0)} bytes)")
+
+    await _link_note_to_meeting(eff_note_id, new_id)
 
     task = asyncio.create_task(process_meeting(new_id))
     meeting["_task"] = task
@@ -4439,12 +5112,18 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
     async def _run_reprocess():
         try:
             if step == "cleanup":
-                # Read raw transcript if available, else current transcript
+                # Re-clean from the raw (pre-cleanup) transcript.
                 raw_path = out_dir / "raw_transcript.json"
                 transcript_path = out_dir / "transcript.json"
-                source_path = raw_path if raw_path.exists() else transcript_path
+                if not raw_path.exists():
+                    # Legacy meeting: transcript.json is the ONLY copy. Snapshot it
+                    # to raw_transcript.json BEFORE any destructive re-cleanup so a
+                    # toggle-OFF Re-cleanup can always restore the unstripped text.
+                    # If this write raises, the outer except aborts the re-cleanup —
+                    # never strip the only remaining copy of the transcript.
+                    _atomic_write(raw_path, transcript_path.read_text(encoding="utf-8"))
 
-                data = json.loads(source_path.read_text())
+                data = json.loads(raw_path.read_text(encoding="utf-8"))
                 segments = data.get("segments", [])
 
                 m["status"] = MeetingStatus.cleaning_transcript
@@ -4453,15 +5132,18 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
 
                 cleaned = await step_cleanup_transcript(segments, m.get("meeting_context"))
 
-                # Check if changes were made
-                changes = sum(1 for a, b in zip(segments, cleaned) if a["text"] != b["text"])
-                if changes > 0:
+                # Length-aware: the filler pre-pass can DROP segments (see
+                # _segment_texts_differ) — a drop-only run must still rewrite.
+                if _segment_texts_differ(segments, cleaned):
                     transcript_text = build_transcript_text(cleaned)
                     transcript_data = {**data, "segments": cleaned, "cleaned": True}
                     _atomic_write(transcript_path, json.dumps(transcript_data, indent=2))
                     _atomic_write(out_dir / "transcript.srt", _generate_srt(cleaned))
                     _atomic_write(out_dir / "transcript.md", build_transcript_markdown(cleaned, m))
                     m["transcript_cleaned"] = True
+                    # dropped pure-filler segments change the count (mirrors the
+                    # live-path bookkeeping)
+                    m["segment_count"] = len(cleaned)
 
             elif step == "identify_speakers":
                 transcript_path = out_dir / "transcript.json"
@@ -4469,7 +5151,7 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
 
                 # Prefer raw_transcript.json which has original SPEAKER_XX labels
                 if raw_transcript_path.exists():
-                    raw_data = json.loads(raw_transcript_path.read_text())
+                    raw_data = json.loads(raw_transcript_path.read_text(encoding="utf-8"))
                     raw_segments = raw_data.get("segments", [])
                     # Check if labels are still original (SPEAKER_XX pattern)
                     sample_speaker = next((s.get("speaker", "") for s in raw_segments if s.get("speaker")), "")
@@ -4480,7 +5162,7 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
                         source_segments = raw_segments
                         old_map_path = out_dir / "speaker_map.json"
                         if old_map_path.exists():
-                            old_map = json.loads(old_map_path.read_text())
+                            old_map = json.loads(old_map_path.read_text(encoding="utf-8"))
                             reverse_map = {v: k for k, v in old_map.items()}
                             for seg in source_segments:
                                 sp = seg.get("speaker", "")
@@ -4488,11 +5170,11 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
                                     seg["speaker"] = reverse_map[sp]
                 else:
                     # No raw_transcript.json at all, fall back to transcript.json with reverse-map
-                    data = json.loads(transcript_path.read_text())
+                    data = json.loads(transcript_path.read_text(encoding="utf-8"))
                     source_segments = data.get("segments", [])
                     old_map_path = out_dir / "speaker_map.json"
                     if old_map_path.exists():
-                        old_map = json.loads(old_map_path.read_text())
+                        old_map = json.loads(old_map_path.read_text(encoding="utf-8"))
                         reverse_map = {v: k for k, v in old_map.items()}
                         for seg in source_segments:
                             sp = seg.get("speaker", "")
@@ -4511,13 +5193,13 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
 
                 if speaker_map:
                     # Read the current transcript.json for updating with new names
-                    transcript_data = json.loads(transcript_path.read_text())
+                    transcript_data = json.loads(transcript_path.read_text(encoding="utf-8"))
                     display_segments = transcript_data.get("segments", [])
 
                     # Build reverse map from old speaker_map to undo previous names
                     old_map_path = out_dir / "speaker_map.json"
                     if old_map_path.exists():
-                        old_map = json.loads(old_map_path.read_text())
+                        old_map = json.loads(old_map_path.read_text(encoding="utf-8"))
                         old_reverse = {v: k for k, v in old_map.items()}
                         # Revert display segments back to SPEAKER_XX labels first
                         for seg in display_segments:
@@ -4541,7 +5223,7 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
 
             elif step == "summarize":
                 transcript_path = out_dir / "transcript.json"
-                data = json.loads(transcript_path.read_text())
+                data = json.loads(transcript_path.read_text(encoding="utf-8"))
                 segments = data.get("segments", [])
                 transcript_text = build_transcript_text(segments)
                 duration = m.get("duration", 0)
@@ -4553,17 +5235,22 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
                 context = await asyncio.get_event_loop().run_in_executor(
                     None, _gather_meeting_context, meeting_id)
                 summary = await step_summarize(transcript_text, duration, context=context)
-                if "title" in summary and summary["title"] != "Meeting":
+                if m.get("title_edited"):
+                    # Manual rename wins over the LLM title; keep summary.json's
+                    # title key consistent with the preserved record title.
+                    summary["title"] = m.get("title", summary.get("title"))
+                elif "title" in summary and summary["title"] != "Meeting":
                     m["title"] = summary["title"]
 
                 _atomic_write(out_dir / "summary.json", json.dumps(summary, indent=2))
                 summary_md = build_summary_markdown(summary, m)
                 _atomic_write(out_dir / "summary.md", summary_md)
                 m["summary"] = summary
+                m["transcript_edited"] = False  # summary is fresh w.r.t. the edited transcript
 
             elif step == "tagging":
                 transcript_path = out_dir / "transcript.json"
-                data = json.loads(transcript_path.read_text())
+                data = json.loads(transcript_path.read_text(encoding="utf-8"))
                 segments = data.get("segments", [])
                 transcript_text = build_transcript_text(segments)
 
@@ -4584,6 +5271,12 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
                 _auto_compute_link_suggestions(meeting_id)
             except Exception as e2:
                 logger.warning(f"[{meeting_id}] Auto-linking after reprocess failed (non-fatal): {e2}")
+
+            # Re-index vectors from the rewritten files so chat RAG / search /
+            # insights see the reprocessed text (closes the pre-existing
+            # staleness gap for all four steps; failures are non-fatal inside
+            # _reindex_meeting_safe itself).
+            _reindex_meeting_safe(meeting_id)
 
         except Exception as e:
             m["status"] = MeetingStatus.complete  # Restore to complete even on failure
@@ -4630,6 +5323,7 @@ class SettingsRequest(BaseModel):
     temperature: Optional[float] = None
     chat: Optional[ChatSettingsRequest] = None
     smtp: Optional[SmtpSettingsRequest] = None
+    remove_filler: Optional[bool] = None
 
 
 @app.get("/api/settings")
@@ -4698,6 +5392,9 @@ async def update_settings(body: SettingsRequest):
             smtp["reply_to"] = body.smtp.reply_to.strip()
         if body.smtp.recipients is not None:
             smtp["recipients"] = body.smtp.recipients.strip()
+
+    if body.remove_filler is not None:
+        settings["remove_filler"] = bool(body.remove_filler)
 
     save_settings(settings)
     return {"detail": "Settings updated", "settings": settings}
@@ -5222,7 +5919,7 @@ async def api_get_note_analysis(note_id: str):
     p = _analysis_path(note_id)
     if p.exists():
         try:
-            result = json.loads(p.read_text())
+            result = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             result = None
     status = _analysis_status.get(note_id) or ("done" if result else "idle")
@@ -5305,7 +6002,7 @@ def _load_meeting_overlay(meeting_id: str) -> dict:
     p = _meeting_overlay_path(meeting_id)
     if p and p.exists():
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
@@ -5329,7 +6026,7 @@ def _meeting_action_item_count(meeting_id: str) -> int:
     if not sp.exists():
         return 0
     try:
-        return len(json.loads(sp.read_text()).get("action_items", []))
+        return len(json.loads(sp.read_text(encoding="utf-8")).get("action_items", []))
     except Exception:
         return 0
 
@@ -5356,7 +6053,7 @@ def _read_json_cached(path: Path):
     if hit is not None and hit["key"] == key:
         return hit["data"]
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
     _json_file_cache[key_path] = {"key": key, "data": data}
@@ -5553,7 +6250,7 @@ async def api_push_action_items(note_id: str, payload: PushActionItems):
         sp = Path(out_dir) / "summary.json"
         if sp.exists():
             try:
-                items = json.loads(sp.read_text()).get("action_items", [])
+                items = json.loads(sp.read_text(encoding="utf-8")).get("action_items", [])
             except Exception:
                 items = []
     if not items:
