@@ -213,3 +213,45 @@ def test_backlinks(tmp_path):
     notes_store.create_note(tmp_path, "Spoke", folder="", body="links to [[Hub]] here")
     bl = notes_store.backlinks(tmp_path, target["id"])
     assert len(bl) == 1 and bl[0]["title"] == "Spoke"
+
+def test_note_attachments_parses_both_forms(tmp_path):
+    body = (
+        "Here is a chart ![[chart-ab12cd.png]] and the spec "
+        "[report.pdf](attachments/report-ff33aa.pdf). "
+        "Also see [[Some Other Note]] (a wiki link, NOT an attachment)."
+    )
+    rec = notes_store.create_note(tmp_path, "N", body=body)
+    got = notes_store.note_attachments(tmp_path, rec["id"])
+    assert got == ["chart-ab12cd.png", "report-ff33aa.pdf"]
+
+
+def test_note_attachments_dedups_and_orders(tmp_path):
+    body = "![[a-1.png]] then attachments/b-2.pdf then again ![[a-1.png]]"
+    rec = notes_store.create_note(tmp_path, "N", body=body)
+    assert notes_store.note_attachments(tmp_path, rec["id"]) == ["a-1.png", "b-2.pdf"]
+
+
+def test_note_attachments_missing_note_empty(tmp_path):
+    assert notes_store.note_attachments(tmp_path, "n_missing") == []
+
+
+def test_note_attachments_interleaved_body_order(tmp_path):
+    rec = notes_store.create_note(tmp_path, "Order", body=(
+        "See the spec [report.pdf](attachments/report-ff33aa.pdf) "
+        "and this chart ![[chart-ab12cd.png]]."
+    ))
+    assert notes_store.note_attachments(tmp_path, rec["id"]) == [
+        "report-ff33aa.pdf", "chart-ab12cd.png"]
+
+
+def test_note_attachments_ignores_external_urls(tmp_path):
+    rec = notes_store.create_note(tmp_path, "Ext", body=(
+        "External https://cdn.example.com/attachments/photo.jpg link, "
+        "but local [f](attachments/real-aa11bb.pdf) counts."
+    ))
+    assert notes_store.note_attachments(tmp_path, rec["id"]) == ["real-aa11bb.pdf"]
+
+
+def test_note_attachments_trims_trailing_punctuation(tmp_path):
+    rec = notes_store.create_note(tmp_path, "Punct", body="see attachments/report-cc22dd.pdf.")
+    assert notes_store.note_attachments(tmp_path, rec["id"]) == ["report-cc22dd.pdf"]

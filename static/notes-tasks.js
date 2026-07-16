@@ -259,8 +259,7 @@
     const target = !t.done;
     try {
       if (t.source === 'note') {
-        await api('/api/tasks/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ note_id: t.source_id, line: t.line, done: target, expected_text: t.text }) });
+        await window.NotesSync.applyTask(t.source_id, { kind: 'toggle', line: t.line, done: target, expectedText: t.text });
       } else {
         await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ index: t.index, done: target }) });
@@ -339,9 +338,11 @@
   function newTask() {
     taskFormModal({ heading: 'New task', saveLabel: 'Add', task: null, onSave: async (val, m) => {
       try {
-        await api('/api/tasks', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(val) });
+        await window.NotesSync.addTask(val);   // val = {text, owner, due, priority}; no note_id -> Tasks inbox
         m.close(); toast('Task added', 'success');
-        allNotes = []; await loadTasks();
+        allNotes = [];
+        if (navigator.onLine && window.NotesSync) { try { await window.NotesSync.flush(); } catch (e) {} }
+        await loadTasks();
         if (currentNoteId && noteEditor) reloadCurrentNoteBody();
       } catch (e) { toast('Add failed: ' + e.message, 'error'); }
     } });
@@ -353,13 +354,13 @@
       onSave: async (val, m) => {
         try {
           if (t.source === 'note') {
-            await api('/api/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text, text: val.text, owner: val.owner, due: val.due, priority: val.priority }) });
+            await window.NotesSync.applyTask(t.source_id, { kind: 'edit', line: t.line, expectedText: t.text, text: val.text, owner: val.owner, due: val.due, priority: val.priority });
           } else {
             await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ index: t.index, text: val.text, owner: val.owner, due: val.due, priority: val.priority }) });
           }
           m.close(); toast('Task updated', 'success');
+          if (navigator.onLine && window.NotesSync) { try { await window.NotesSync.flush(); } catch (e) {} }
           await loadTasks();
           if (t.source === 'note' && currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
         } catch (e) {
@@ -380,13 +381,13 @@
     m.q('[data-yes]').onclick = async () => {
       try {
         if (isNote) {
-          await api('/api/tasks', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ note_id: t.source_id, line: t.line, expected_text: t.text }) });
+          await window.NotesSync.applyTask(t.source_id, { kind: 'delete', line: t.line, expectedText: t.text });
         } else {
           await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks', { method: 'DELETE', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ index: t.index }) });
         }
         m.close(); toast(isNote ? 'Task deleted' : 'Task dismissed', 'success');
+        if (navigator.onLine && window.NotesSync) { try { await window.NotesSync.flush(); } catch (e) {} }
         await loadTasks();
         if (isNote && currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
       } catch (e) {
@@ -441,7 +442,10 @@
   async function loadNotesTree() {
     const body = $('notesTreeBody'); if (!body) return;
     try {
-      const [nd, fd] = await Promise.all([api('/api/notes'), api('/api/notes/folders')]);
+      const [nd, fd] = await Promise.all([
+        window.NotesSync.listNotes().then((notes) => ({ notes })),   // read from the offline mirror
+        api('/api/notes/folders').catch(() => ({ folders: allFolders })),  // folders stay online, best-effort
+      ]);
       allNotes = (nd && nd.notes) || [];
       allFolders = (fd && fd.folders) || [];
       renderTree();
@@ -526,7 +530,8 @@
 
   async function openNote(id) {
     try {
-      const note = await api('/api/notes/' + id);
+      const note = await window.NotesSync.readNote(id);
+      if (!note) throw new Error('Note not found');
       currentNote = note; currentNoteId = note.id;
       $('notesWelcome').style.display = 'none';
       $('notesDoc').style.display = 'flex';
@@ -538,13 +543,14 @@
       renderTree();
       loadBacklinks();
       loadRelated();
+      loadAnalysis();
       if (isMobileWidth()) notesViewEl().classList.remove('tree-open');
     } catch (e) { toast('Open failed: ' + e.message, 'error'); }
   }
 
   async function reloadCurrentNoteBody() {
     if (!currentNoteId) return;
-    try { const note = await api('/api/notes/' + currentNoteId); currentNote = note; if (noteEditor) noteEditor.setValue(note.body || ''); } catch (e) {}
+    try { const note = await window.NotesSync.readNote(currentNoteId); if (note) { currentNote = note; if (noteEditor) noteEditor.setValue(note.body || ''); } } catch (e) {}
   }
 
   function openByTitle(title) {
@@ -581,7 +587,7 @@
     if (!currentNoteId || !noteEditor) return;
     const body = noteEditor.getValue();
     try {
-      const updated = await api('/api/notes/' + currentNoteId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ body }) });
+      const updated = await window.NotesSync.updateNote(currentNoteId, { body });
       currentNote = updated;
       const li = allNotes.find((n) => n.id === currentNoteId); if (li) li.updated = updated.updated;
       setSaveState('saved', 'Saved'); renderMeta();
@@ -592,7 +598,7 @@
     if (!currentNoteId) return;
     const title = $('noteTitleInput').value.trim() || 'Untitled';
     try {
-      const updated = await api('/api/notes/' + currentNoteId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }) });
+      const updated = await window.NotesSync.updateNote(currentNoteId, { title });
       currentNote = updated;
       const li = allNotes.find((n) => n.id === currentNoteId); if (li) li.title = updated.title;
       renderTree();
@@ -602,17 +608,25 @@
   async function setTags(tags) {
     if (!currentNoteId) return;
     try {
-      const updated = await api('/api/notes/' + currentNoteId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tags }) });
+      // Direct online write — server owns tags (the auto-tagger overwrites them
+      // within 60s otherwise), and the offline mirror never pushes tags, so a
+      // mirror-only edit would silently revert on the next pull(). Offline this
+      // throws a normal network error (caught below) — acceptable per spec.
+      const updated = await api('/api/notes/' + currentNoteId, { method: 'PUT',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tags }) });
       currentNote = updated; renderTags();
       const li = allNotes.find((n) => n.id === currentNoteId); if (li) li.tags = updated.tags;
       renderTree();
+      // Absorb the new server record into the offline mirror so it doesn't look
+      // stale/dirty on the next pull; NotesSync has no "absorb one record" helper,
+      // so fall back to a full pull().
+      if (window.NotesSync && window.NotesSync.pull) { try { await window.NotesSync.pull(); } catch (e) {} }
     } catch (e) { toast('Tag save failed: ' + e.message, 'error'); }
   }
 
   async function createNote(title, folder) {
     try {
-      const note = await api('/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: title || 'Untitled note', folder: folder || '', type: 'note', body: '' }) });
+      const note = await window.NotesSync.createNote({ title: title || 'Untitled note', folder: folder || '', type: 'note', body: '' });
       allNotes.unshift({ id: note.id, title: note.title, type: note.type, folder: note.folder, path: note.path, tags: note.tags, linked_meetings: note.linked_meetings, created: note.created, updated: note.updated });
       await openNote(note.id);
       const ti = $('noteTitleInput'); ti.focus(); ti.select();
@@ -624,8 +638,7 @@
     const existing = allNotes.find((n) => n.type === 'journal' && n.title === t) || allNotes.find((n) => n.title === t);
     if (existing) { openNote(existing.id); return; }
     try {
-      const note = await api('/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: t, folder: 'Journal', type: 'journal', body: '# ' + t + '\n\n' }) });
+      const note = await window.NotesSync.createNote({ title: t, folder: 'Journal', type: 'journal', body: '# ' + t + '\n\n' });
       allNotes.unshift({ id: note.id, title: note.title, type: note.type, folder: note.folder, path: note.path, tags: [], linked_meetings: [], created: note.created, updated: note.updated });
       if (allFolders.indexOf('Journal') < 0) allFolders.push('Journal');
       await openNote(note.id);
@@ -637,7 +650,7 @@
     if (!confirm('Move “' + (currentNote.title || 'this note') + '” to trash?')) return;
     const id = currentNoteId;
     try {
-      await api('/api/notes/' + id, { method: 'DELETE' });
+      await window.NotesSync.deleteNote(id);
       allNotes = allNotes.filter((n) => n.id !== id);
       currentNoteId = null; currentNote = null;
       $('notesDoc').style.display = 'none'; $('notesWelcome').style.display = 'flex';
@@ -712,6 +725,63 @@
         '<span class="bl-chip" data-meeting="' + esc(r.meeting_id) + '">' + esc(r.title || r.meeting_id) +
         '<span class="pin" data-pin="' + esc(r.meeting_id) + '" title="Pin as a link">📌</span></span>').join('');
     } catch (e) {}
+  }
+
+  // ---- AI analysis ----
+  function renderAnalysisPanel(result) {
+    const el = $('noteAnalysis'); if (!el) return;
+    if (!result || typeof result !== 'object') { el.style.display = 'none'; el.innerHTML = ''; return; }
+    const list = (title, items, bullet) => {
+      const arr = Array.isArray(items) ? items.filter((x) => x != null && String(x).trim()) : [];
+      if (!arr.length) return '';
+      return '<h4 style="margin:8px 0 4px;font-size:12px;opacity:.8">' + esc(title) + '</h4><ul style="margin:4px 0 4px 18px">'
+        + arr.map((x) => '<li>' + esc(bullet + String(x).trim()) + '</li>').join('') + '</ul>';
+    };
+    const summary = (result.summary == null ? '' : String(result.summary)).trim();
+    let html = '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px">'
+      + '<span style="font-weight:600">AI analysis</span>'
+      + '<div style="display:flex;gap:8px"><button class="nt-modal-btn primary" data-na-insert>Insert into note</button>'
+      + '<button class="nt-modal-btn" data-na-close>Close</button></div></div>';
+    if (summary) html += '<p style="margin:8px 0">' + esc(summary) + '</p>';
+    html += list('Key points', result.key_points, '');
+    html += list('Action items', result.action_items, '☐ ');
+    html += list('Insights', result.insights, '');
+    el.innerHTML = html;      // all interpolations above are esc()-wrapped
+    el.style.display = 'block';
+    el._result = result;
+  }
+
+  async function loadAnalysis() {
+    const el = $('noteAnalysis'); if (!el || !currentNoteId) return;
+    el.style.display = 'none'; el.innerHTML = '';
+    try {
+      const data = await api('/api/notes/' + currentNoteId + '/analysis');
+      if (data && data.status === 'done' && data.result) renderAnalysisPanel(data.result);
+    } catch (e) {}
+  }
+
+  function pollAnalysis(noteId, tries) {
+    if (currentNoteId !== noteId) return;                 // navigated away
+    if (tries <= 0) { toast('Analysis is taking a while — reopen the note to check', 'error'); return; }
+    setTimeout(async () => {
+      if (currentNoteId !== noteId) return;
+      try {
+        const data = await api('/api/notes/' + noteId + '/analysis');
+        if (data && data.status === 'done' && data.result) { renderAnalysisPanel(data.result); toast('Analysis ready', 'success'); return; }
+        if (data && data.status === 'error') { toast('Analysis failed', 'error'); return; }
+      } catch (e) {}
+      pollAnalysis(noteId, tries - 1);
+    }, 3000);
+  }
+
+  async function runAnalyze() {
+    if (!currentNoteId) return;
+    const noteId = currentNoteId;
+    try {
+      await api('/api/notes/' + noteId + '/analyze', { method: 'POST' });
+      toast('Analyzing note — runs when the GPU is free…', 'success');
+      pollAnalysis(noteId, 40);
+    } catch (e) { toast('Analyze failed: ' + e.message, 'error'); }
   }
 
   // ---- preview ----
@@ -815,6 +885,20 @@
       } catch (e) { toast('Retag failed: ' + e.message, 'error'); }
     };
 
+    $('noteAnalyzeBtn').onclick = runAnalyze;
+    $('noteAnalysis').addEventListener('click', (e) => {
+      const panel = $('noteAnalysis');
+      if (e.target.closest('[data-na-close]')) { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+      if (e.target.closest('[data-na-insert]')) {
+        const md = window.NotesAnalysis ? window.NotesAnalysis.formatAnalysisMarkdown(panel._result) : '';
+        if (md && noteEditor && noteEditor.insertAtCursor) {
+          noteEditor.insertAtCursor('\n' + md + '\n');
+          if (previewOn) updatePreview();
+          toast('Inserted', 'success');
+        }
+      }
+    });
+
     $('noteTagsRow').addEventListener('click', (e) => {
       const rm = e.target.closest('[data-rmtag]');
       if (rm) { setTags((currentNote.tags || []).filter((t) => t !== rm.dataset.rmtag)); return; }
@@ -892,6 +976,17 @@
     initPillarNav();
     initTasksView();
     initNotesView();
+    if (window.NotesSync) {
+      window.NotesSync.init({
+        onNotes: (notes) => { allNotes = notes; if (currentPillar === 'notes') renderTree(); },
+        onRemap: (tempIdVal, serverId) => {
+          if (currentNoteId === tempIdVal) currentNoteId = serverId;
+          if (currentNote && currentNote.id === tempIdVal) currentNote.id = serverId;
+          const li = allNotes.find((n) => n.id === tempIdVal); if (li) li.id = serverId;
+        },
+        toast,
+      });
+    }
     api('/api/tasks').then((d) => { allTasks = (d && d.tasks) || []; updateTaskBadge(); }).catch(() => {});
   }
 

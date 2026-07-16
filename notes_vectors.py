@@ -50,11 +50,15 @@ def delete_note_vectors(qdrant, note_id: str, *, collection: str) -> None:
     )
 
 
-def index_note(qdrant, embedder, rec: dict, *, collection: str, dim: int) -> int:
-    """(Re)index a note's body into the notes collection. Returns chunk count."""
+def index_note(qdrant, embedder, rec: dict, *, collection: str, dim: int, extra_text: str = "") -> int:
+    """(Re)index a note's body (+ optional attachment text) into the notes
+    collection. Returns chunk count."""
     ensure_collection(qdrant, collection, dim)
     delete_note_vectors(qdrant, rec["id"], collection=collection)
-    chunks = chunk_note(rec.get("body", ""))
+    corpus = (rec.get("body", "") or "")
+    if extra_text:
+        corpus = (corpus + "\n\n" + extra_text).strip()
+    chunks = chunk_note(corpus)
     if not chunks:
         return 0
     vectors = embedder.encode(chunks)

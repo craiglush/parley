@@ -19,7 +19,10 @@
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
 <link rel="stylesheet" href="/static/notes-tasks.css?v=12">
 <script defer src="/static/vendor/codemirror.bundle.js?v=12"></script>
-<script defer src="/static/notes-tasks.js?v=12"></script>
+<script defer src="/static/notes-sync-logic.js?v=1"></script>
+<script defer src="/static/notes-sync.js?v=1"></script>
+<script defer src="/static/notes-analysis-logic.js?v=1"></script>
+<script defer src="/static/notes-tasks.js?v=13"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -393,6 +396,7 @@
             <button class="nt-icon-btn" id="noteLinkMeetingBtn" title="Link a meeting">&#128279;</button>
             <button class="nt-icon-btn" id="noteMoveBtn" title="Rename / move">&#9998;</button>
             <button class="nt-icon-btn" id="noteRetagBtn" title="Re-tag this note now">✨</button>
+            <button class="nt-icon-btn" id="noteAnalyzeBtn" title="Analyze this note with AI">🧠</button>
             <button class="nt-icon-btn danger" id="noteDeleteBtn" title="Move to trash">&#128465;</button>
           </div>
         </div>
@@ -405,6 +409,7 @@
           <div class="note-tags-row" id="noteTagsRow"></div>
           <div class="note-backlinks" id="noteBacklinks"></div>
           <div class="note-backlinks" id="noteRelated"></div>
+          <div id="noteAnalysis" style="display:none; margin-top:10px; padding:10px 12px; border:1px solid rgba(127,127,127,0.28); border-radius:8px; font-size:13px"></div>
         </div>
       </div>
     </section>

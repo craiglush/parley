@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v14-offline-queue';
+const CACHE_NAME = 'meetings-v15-notes-attachments';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.
@@ -9,7 +9,10 @@ const SHELL_ASSETS = [
   '/static/app.js',
   '/static/floating-chat.js',
   '/static/notes-tasks.css',
+  '/static/notes-sync-logic.js',
+  '/static/notes-sync.js',
   '/static/notes-tasks.js',
+  '/static/notes-analysis-logic.js',
   '/static/vendor/codemirror.bundle.js',
   '/static/icons/favicon.svg',
   '/static/icons/favicon-32.png',
@@ -37,7 +40,26 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // Always use network for API calls and uploads
+  // Notes GETs (export / list / single) get a runtime cache as a first-paint
+  // fallback when offline. The IndexedDB mirror remains the real offline source
+  // of truth; this only helps the very first paint before the mirror is warm.
+  if (event.request.method === 'GET'
+      && (url.pathname === '/api/notes/export' || url.pathname === '/api/notes'
+          || url.pathname.startsWith('/api/notes/'))
+      && !url.pathname.startsWith('/api/notes/attachments/')) {
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          return response;
+        })
+        .catch(() => caches.match(event.request))
+    );
+    return;
+  }
+
+  // Always use network for other API calls and uploads
   if (url.pathname.startsWith('/meetings') || url.pathname.startsWith('/api')) {
     return;
   }

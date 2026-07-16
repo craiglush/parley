@@ -6,6 +6,7 @@ in-memory, signature-invalidated index (snapshotted to notes_index.json) makes
 listing fast and picks up external edits (e.g. Obsidian). Deletes go to .trash/.
 """
 import os
+import hashlib
 import re
 import json
 import shutil
@@ -21,6 +22,16 @@ TRASH_DIRNAME = ".trash"
 ATTACH_DIRNAME = "attachments"
 INDEX_NAME = "notes_index.json"
 NOTE_TYPES = ("note", "journal", "todo")
+
+
+class NoteConflict(Exception):
+    """Raised by update_note when expected_body_hash != the current on-disk hash.
+    The PUT handler turns this into HTTP 409; the offline client makes a conflict
+    copy. Carries the current server record so the client can keep it."""
+
+    def __init__(self, current: dict):
+        self.current = current
+        super().__init__("note content hash mismatch")
 
 
 def now_iso() -> str:
@@ -99,6 +110,46 @@ def attachment_path(notes_dir, filename: str) -> Path | None:
     return target
 
 
+# Attachment references in a note body: the Obsidian embed `![[file]]` and the
+# markdown-link/path `attachments/file` form. Body is the source of truth for
+# which attachments belong to a note (no frontmatter, no drift).
+_ATTACH_EMBED_RE = re.compile(r"!\[\[([^\]|#]+?)\]\]")
+_ATTACH_PATH_RE = re.compile(r"(?<![\w/])attachments/([^\s\)\]]+)")
+
+
+def note_attachments(notes_dir, note_id: str) -> list:
+    """Referenced attachment filenames for a note, de-duped in body order.
+    Matches both `![[file]]` and `attachments/file`. Empty if the note is gone."""
+    rec = read_note(notes_dir, note_id)
+    if not rec:
+        return []
+    body = rec.get("body", "") or ""
+
+    # Collect matches from both regexes as (position, name, is_path) tuples
+    matches = []
+    for m in _ATTACH_EMBED_RE.finditer(body):
+        name = m.group(1).strip()
+        if name:
+            matches.append((m.start(), name, False))
+    for m in _ATTACH_PATH_RE.finditer(body):
+        name = m.group(1).strip()
+        if name:
+            # Trim trailing punctuation from path-form captures
+            name = name.rstrip(".,;:")
+            if name:  # re-check after trim
+                matches.append((m.start(), name, True))
+
+    # Sort by position and dedup keeping first occurrence
+    matches.sort(key=lambda x: x[0])
+    out = []
+    seen = set()
+    for _, name, _ in matches:
+        if name not in seen:
+            out.append(name)
+            seen.add(name)
+    return out
+
+
 def _atomic_write(path: Path, content: str):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(content, encoding="utf-8")
@@ -113,6 +164,13 @@ def _unique_path(directory: Path, slug: str) -> Path:
         candidate = directory / f"{slug}-{n}.md"
         n += 1
     return candidate
+
+
+def content_hash(title: str, body: str) -> str:
+    """Version token for a note: sha1 of title + NUL + body. Changes iff the
+    user-visible text changes; blind to tag-only / metadata-only server writes,
+    so the background auto-tagger never triggers a false offline-sync conflict."""
+    return hashlib.sha1(((title or "") + "\x00" + (body or "")).encode("utf-8")).hexdigest()
 
 
 def _record(notes_dir, path: Path, meta: dict, body=None) -> dict:
@@ -134,6 +192,11 @@ def _record(notes_dir, path: Path, meta: dict, body=None) -> dict:
     }
     if body is not None:
         rec["body"] = body
+        # Hash the STRIPPED body: parse_frontmatter's regex leaves a trailing
+        # newline (and can swallow leading whitespace) on round-trip, so an
+        # unstripped hash would differ between write and re-read — making every
+        # synced note look dirty. Do not "simplify" this back to raw body.
+        rec["content_hash"] = content_hash(rec["title"], body.strip())
     return rec
 
 
@@ -263,11 +326,16 @@ def read_note(notes_dir, note_id: str) -> dict | None:
     return _record(notes_dir, p, meta, body)
 
 
-def update_note(notes_dir, note_id: str, *, title=None, body=None, tags=None) -> dict | None:
+def update_note(notes_dir, note_id: str, *, title=None, body=None, tags=None,
+                expected_body_hash=None) -> dict | None:
     p = find_path(notes_dir, note_id)
     if not p:
         return None
     meta, cur_body = parse_frontmatter(p.read_text(encoding="utf-8"))
+    if expected_body_hash is not None:
+        cur_title = meta.get("title", p.stem)
+        if content_hash(cur_title, cur_body.strip()) != expected_body_hash:
+            raise NoteConflict(_record(notes_dir, p, meta, cur_body))
     if title is not None:
         meta["title"] = title
     if tags is not None:

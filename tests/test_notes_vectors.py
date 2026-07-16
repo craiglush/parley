@@ -94,3 +94,23 @@ def test_search_notes():
     h = hits[0]
     assert h["note_id"] == "n_1" and h["title"] == "Recipe" and h["folder"] == "Food"
     assert "text" in h and "score" in h
+
+
+def test_index_note_appends_extra_text():
+    q, e = FakeQdrant(), FakeEmbedder()
+    rec = {"id": "n_9", "title": "T", "folder": "", "tags": [],
+           "linked_meetings": [], "body": "Short body."}
+    n = notes_vectors.index_note(q, e, rec, collection="notes", dim=4,
+                                 extra_text="Attachment says the merger closes in March.")
+    assert n >= 1
+    joined = " ".join(p.payload["text"] for p in q.points["notes"])
+    assert "merger closes in March" in joined
+    assert "Short body" in joined
+
+
+def test_index_note_extra_text_only_still_indexes():
+    q, e = FakeQdrant(), FakeEmbedder()
+    rec = {"id": "n_10", "body": ""}
+    n = notes_vectors.index_note(q, e, rec, collection="notes", dim=4,
+                                 extra_text="Only attachment text here.")
+    assert n >= 1

@@ -85,3 +85,104 @@ def test_attachment_path_rejects_absolute(tmp_path):
     secret = tmp_path / "secret.md"
     secret.write_bytes(b"top secret")
     assert ns.attachment_path(tmp_path, str(secret)) is None
+
+
+def test_list_attachments(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    nid = client.post("/api/notes", json={"title": "N", "body": ""}).json()["id"]
+    up = client.post(f"/api/notes/{nid}/attachments",
+                     files={"file": ("plan.txt", io.BytesIO(b"the quarterly plan"), "text/plain")}).json()
+    fname = up["filename"]
+    # embed the reference into the note body so it is "referenced"
+    client.put(f"/api/notes/{nid}", json={"body": f"see [{fname}](attachments/{fname})"})
+    r = client.get(f"/api/notes/{nid}/attachments")
+    assert r.status_code == 200, r.text
+    items = r.json()["attachments"]
+    assert len(items) == 1
+    it = items[0]
+    assert it["filename"] == fname and it["is_image"] is False and it["size"] == 18
+    assert it["extraction_status"] in ("done", "none")
+
+
+def test_list_attachments_missing_note_404(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    assert client.get("/api/notes/n_missing/attachments").status_code == 404
+
+
+def test_delete_attachment_removes_bytes_and_extracted_only(tmp_path, monkeypatch):
+    import extract
+    client = _client(tmp_path, monkeypatch)
+    nid = client.post("/api/notes", json={"title": "N", "body": ""}).json()["id"]
+    up = client.post(f"/api/notes/{nid}/attachments",
+                     files={"file": ("plan.txt", io.BytesIO(b"content here"), "text/plain")}).json()
+    fname = up["filename"]
+    attach_dir = ns.attachments_dir(tmp_path)
+
+    # seed extraction sidecar directly
+    extract.write_extraction(attach_dir, fname, {"text": "x", "method": "text", "chars": 1, "status": "done"})
+
+    # seed a per-note .analysis sidecar that must SURVIVE the single-attachment delete
+    analysis = attach_dir / ".analysis" / f"{nid}.json"
+    analysis.parent.mkdir(parents=True, exist_ok=True)
+    analysis.write_text('{"summary": "keep me"}', encoding="utf-8")
+
+    assert ns.attachment_path(tmp_path, fname) is not None
+    assert extract.read_extraction(attach_dir, fname) is not None
+
+    r = client.delete(f"/api/notes/{nid}/attachments/{fname}")
+    assert r.status_code == 200 and r.json()["deleted"] is True
+    assert ns.attachment_path(tmp_path, fname) is None                       # bytes gone
+    assert extract.read_extraction(attach_dir, fname) is None                # .extracted gone
+    assert analysis.exists()                                                 # .analysis kept
+
+
+def test_delete_attachment_missing_404(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    nid = client.post("/api/notes", json={"title": "N", "body": ""}).json()["id"]
+    assert client.delete(f"/api/notes/{nid}/attachments/missing.png").status_code == 404
+    assert client.delete("/api/notes/n_missing/attachments/x.png").status_code == 404
+
+
+def test_upload_txt_extracts_inline(tmp_path, monkeypatch):
+    import extract
+    client = _client(tmp_path, monkeypatch)
+    nid = client.post("/api/notes", json={"title": "N", "body": ""}).json()["id"]
+    r = client.post(f"/api/notes/{nid}/attachments",
+                    files={"file": ("plan.txt", io.BytesIO(b"budget review notes"), "text/plain")})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["status"] == "done" and data["extracted"] is True
+    sc = extract.read_extraction(ns.attachments_dir(tmp_path), data["filename"])
+    assert sc["text"] == "budget review notes" and sc["method"] == "text"
+
+
+def test_upload_image_is_pending_and_enqueued(tmp_path, monkeypatch):
+    import app
+    enq = []
+    monkeypatch.setattr(app, "_enqueue_extract", lambda nid, fn: enq.append((nid, fn)))
+    client = _client(tmp_path, monkeypatch)
+    nid = client.post("/api/notes", json={"title": "N", "body": ""}).json()["id"]
+    r = client.post(f"/api/notes/{nid}/attachments",
+                    files={"file": ("pic.png", io.BytesIO(b"\x89PNG x"), "image/png")})
+    data = r.json()
+    assert data["status"] == "pending" and data["extracted"] is False
+    assert data["is_image"] is True                 # existing behavior preserved
+    assert enq == [(nid, data["filename"])]
+
+
+def test_upload_survives_sidecar_write_failure(tmp_path, monkeypatch):
+    import extract
+    client = _client(tmp_path, monkeypatch)
+    nid = client.post("/api/notes", json={"title": "N", "body": ""}).json()["id"]
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(extract, "write_extraction", _boom)
+    r = client.post(f"/api/notes/{nid}/attachments",
+                    files={"file": ("x.txt", io.BytesIO(b"hello"), "text/plain")})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "failed" and body["extracted"] is False
+    # bytes were still stored
+    assert client.get(body["url"]).status_code == 200

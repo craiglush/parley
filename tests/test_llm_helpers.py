@@ -53,3 +53,17 @@ def test_parse_object_logs_on_garbage(caplog):
 def test_parse_array_handles_think():
     raw = "<think>x</think>[{\"task\": \"a\"}]"
     assert app._parse_json_array(raw) == [{"task": "a"}]
+
+
+def test_build_body_omits_images_by_default():
+    body = app._build_generate_body("m", "hi", temperature=0.3, num_predict=512)
+    assert "images" not in body
+
+
+def test_build_body_includes_images_when_passed():
+    b64 = "aGVsbG8="  # "hello"
+    body = app._build_generate_body("m", "hi", temperature=0.3, num_predict=512, images=[b64])
+    assert body["images"] == [b64]
+    # text portion identical to the no-images body (regression guard)
+    plain = app._build_generate_body("m", "hi", temperature=0.3, num_predict=512)
+    assert {k: v for k, v in body.items() if k != "images"} == plain

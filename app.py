@@ -47,6 +47,7 @@ import storage
 import vector
 import notes_store
 import notes_vectors
+import extract
 import tasks_store
 import emailer
 # Phase-4 modularization: pure LLM helpers live in llm.py. Re-bound here so
@@ -325,6 +326,28 @@ DEFAULT_PROMPTS = {
         "\n"
         "{chunk}"
     ),
+    "note_analysis": (
+        "You are a knowledge assistant. Read the note below — it may include the note\n"
+        "body plus text extracted from its attachments — and produce a structured\n"
+        "analysis. Base everything strictly on the provided text; do not invent details.\n"
+        "\n"
+        "NOTE:\n"
+        "{corpus}\n"
+        "\n"
+        "Guidance:\n"
+        "- summary: 2-4 sentences capturing what this note is about and why it matters.\n"
+        "- key_points: the most important facts or ideas, each a short standalone bullet.\n"
+        "- action_items: concrete tasks or follow-ups implied by the note; [] if none.\n"
+        "- insights: non-obvious observations, connections, or risks worth noting; [] if none.\n"
+        "\n"
+        "Respond ONLY with valid JSON, no other text:\n"
+        "{\n"
+        '  "summary": "2-4 sentence overview",\n'
+        '  "key_points": ["short bullet", "short bullet"],\n'
+        '  "action_items": ["actionable task"],\n'
+        '  "insights": ["non-obvious observation"]\n'
+        "}"
+    ),
 }
 
 # JSON Schemas for Ollama structured outputs (`format`). These MUST mirror the
@@ -455,6 +478,16 @@ ANALYSIS_SCHEMAS = {
         },
         "required": ["category"],
     },
+    "note_analysis": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "key_points": _STR_ARRAY,
+            "action_items": _STR_ARRAY,
+            "insights": _STR_ARRAY,
+        },
+        "required": ["summary"],
+    },
 }
 
 DEFAULT_CHAT_SYSTEM_PROMPT = (
@@ -560,6 +593,24 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 _ATTACH_MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                  ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
                  ".pdf": "application/pdf"}
+# Vision prompt used when resolving a deferred image/scanned-PDF attachment for analysis.
+VISION_EXTRACT_PROMPT = os.getenv(
+    "VISION_EXTRACT_PROMPT",
+    "Transcribe every piece of text visible in this image, verbatim and in reading "
+    "order. If the image contains no text, describe it in one or two sentences.")
+# Note-analysis corpus cap (chars). Sized so body+attachment text stays inside the
+# 16k num_ctx tier alongside a 3072-token output budget. This TRUNCATES the corpus;
+# _ctx_for_text (llm.py:23) only sizes num_ctx, it does not cut.
+ANALYSIS_CORPUS_MAX = int(os.getenv("ANALYSIS_CORPUS_MAX", "40000"))
+
+ATTACH_TEXT_MAX = 20000  # per-attachment extracted-text cap fed to search/tags/analysis
+VISION_PROMPT = ("Describe this image in detail and transcribe any visible text "
+                 "verbatim. Be thorough and factual; do not speculate.")
+
+# Meeting-analysis context (Phase C): char cap on the linked-note + attachment
+# text prepended to the transcript before the analysis passes. Named constant so
+# the prompt stays bounded; _ctx_for_text sizes num_ctx separately.
+MEETING_CONTEXT_MAX = int(os.getenv("MEETING_CONTEXT_MAX", str(20000)))
 
 # ---------------------------------------------------------------------------
 # App & global state
@@ -637,7 +688,10 @@ async def _verify_embedding_dim_on_startup():
             logger.warning(f"Embedding dim check skipped (non-fatal): {e}")
     _probe_t = asyncio.create_task(_probe()); _bg_tasks.add(_probe_t); _probe_t.add_done_callback(_bg_tasks.discard)
     _tag_t = asyncio.create_task(_tag_worker()); _bg_tasks.add(_tag_t); _tag_t.add_done_callback(_bg_tasks.discard)
+    _an_t = asyncio.create_task(_analysis_worker()); _bg_tasks.add(_an_t); _an_t.add_done_callback(_bg_tasks.discard)
     _gc_t = asyncio.create_task(_capture_gc_worker()); _bg_tasks.add(_gc_t); _gc_t.add_done_callback(_bg_tasks.discard)
+    _ext_t = asyncio.create_task(_extract_worker()); _bg_tasks.add(_ext_t); _ext_t.add_done_callback(_bg_tasks.discard)
+    _rescan_t = asyncio.create_task(_rescan_pending_extractions()); _bg_tasks.add(_rescan_t); _rescan_t.add_done_callback(_bg_tasks.discard)
 
 
 # In-memory meeting registry (survives container restarts via on-disk JSON index)
@@ -649,6 +703,17 @@ TAG_IDLE_POLL = 30.0
 _tag_queue: "asyncio.Queue[str]" = asyncio.Queue()
 _tag_pending: set = set()
 _bg_tasks: set = set()
+
+# Background note-analysis worker (same enqueue -> idle-worker -> LLM shape as tags)
+ANALYSIS_IDLE_POLL = 30.0
+_analysis_queue: "asyncio.Queue[str]" = asyncio.Queue()
+_analysis_pending: set = set()
+_analysis_status: dict[str, str] = {}  # note_id -> queued|running|done|error
+
+# Background attachment-extraction worker (deferred STT/vision — GPU work)
+EXTRACT_IDLE_POLL = 30.0
+_extract_queue: "asyncio.Queue[tuple[str, str]]" = asyncio.Queue()
+_extract_pending: set = set()
 
 
 class MeetingStatus(str, Enum):
@@ -793,7 +858,64 @@ async def step_unload_ollama_models():
         logger.warning(f"Failed to unload Ollama models (non-critical): {e}")
 
 
-async def step_summarize(transcript_text: str, duration: float, progress_callback=None) -> dict:
+def _read_extracted_text(filename: str) -> str:
+    """Return an attachment's extracted text from its Phase A `.extracted` sidecar
+    (`attachments/.extracted/<filename>.json`, shape
+    {text, method, chars, extracted_at, status}). Only a `done` extraction yields
+    text; a missing / pending / empty / failed / unreadable sidecar yields "".
+    Never raises."""
+    try:
+        base = (notes_store.attachments_dir(notes_store.NOTES_DIR) / ".extracted").resolve()
+        p = (base / f"{filename}.json").resolve()
+        if p.parent != base:
+            return ""  # traversal attempt or nested path — never read outside .extracted
+        if not p.exists():
+            return ""
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict) or data.get("status") != "done":
+        return ""
+    return data.get("text") or ""
+
+
+def _gather_meeting_context(meeting_id: str) -> str:
+    """Concatenate the body + extracted attachment text of every note the user
+    EXPLICITLY linked to this meeting via its `linked_meetings` frontmatter
+    (deterministic and user-controlled — not fuzzy related-notes). Hard-capped at
+    MEETING_CONTEXT_MAX characters. Returns "" when nothing is linked, which keeps
+    the analysis prompt byte-for-byte identical to today. Never raises — meeting
+    analysis must not break because of note/attachment reads."""
+    try:
+        index = notes_store.get_index(notes_store.NOTES_DIR)
+    except Exception as e:
+        logger.warning(f"[{meeting_id}] context gather: notes index read failed (non-fatal): {e}")
+        return ""
+    parts: list[str] = []
+    for rec in index.values():
+        if meeting_id not in (rec.get("linked_meetings") or []):
+            continue
+        try:
+            note = notes_store.read_note(notes_store.NOTES_DIR, rec["id"])
+        except Exception:
+            note = None
+        if not note:
+            continue
+        parts.append(f"## Linked note: {note.get('title') or 'Untitled'}\n\n{note.get('body') or ''}")
+        try:
+            filenames = notes_store.note_attachments(notes_store.NOTES_DIR, rec["id"])
+        except Exception:
+            filenames = []
+        for fname in filenames:
+            text = _read_extracted_text(fname)
+            if text:
+                parts.append(f"### Attachment: {fname}\n\n{text}")
+    if not parts:
+        return ""
+    return "\n\n".join(parts)[:MEETING_CONTEXT_MAX]
+
+
+async def step_summarize(transcript_text: str, duration: float, progress_callback=None, context: str = "") -> dict:
     """Use Ollama to generate a structured meeting summary via 6 focused passes."""
     settings = load_settings()
     model = settings.get("ollama_model", OLLAMA_MODEL)
@@ -801,15 +923,28 @@ async def step_summarize(transcript_text: str, duration: float, progress_callbac
 
     # For long meetings (>90 min), do hierarchical summarization
     if duration > 5400:
-        return await _hierarchical_summarize(transcript_text, duration, model, temperature, progress_callback)
+        return await _hierarchical_summarize(transcript_text, duration, model, temperature, progress_callback, context=context)
 
-    return await _run_analysis_passes(transcript_text, model, temperature, progress_callback)
+    return await _run_analysis_passes(transcript_text, model, temperature, progress_callback, context=context)
 
 
-async def _run_analysis_passes(transcript_text: str, model: str, temperature: float, progress_callback=None) -> dict:
+async def _run_analysis_passes(transcript_text: str, model: str, temperature: float, progress_callback=None, context: str = "") -> dict:
     """Run 6 sequential analysis passes against the transcript, each with a focused prompt."""
     settings = load_settings()
     prompts = settings.get("prompts", {})
+
+    # Phase C: prepend context from notes the user linked to this meeting. Done
+    # ONCE here, before the pass loop, so all six prompts share it. An empty or
+    # None context leaves transcript_text untouched, keeping every prompt
+    # byte-for-byte identical to the pre-context behaviour (regression-guarded).
+    if context:
+        transcript_text = (
+            "[Context from notes linked to this meeting — background only; "
+            "base all analysis on the transcript that follows]\n\n"
+            f"{context}\n\n"
+            "[Transcript]\n\n"
+            f"{transcript_text}"
+        )
 
     # Pass configs: (prompt_key, parser_type)
     pass_configs = [
@@ -986,13 +1121,17 @@ def _body_sig(body: str) -> str:
     return hashlib.sha1((body or "").encode("utf-8")).hexdigest()
 
 
-async def auto_tag_note(title: str, body: str) -> dict:
-    """Tag a note the way meetings are tagged (analysis_pass_g). Non-fatal -> defaults."""
+async def auto_tag_note(title: str, body: str, *, attachment_text: str = "") -> dict:
+    """Tag a note the way meetings are tagged (analysis_pass_g). Non-fatal -> defaults.
+    Body comes first; attachment text is appended, then the whole blob is capped."""
     settings = load_settings()
     model = settings.get("ollama_model", OLLAMA_MODEL)
     temperature = settings.get("temperature", 0.3)
     template = settings["prompts"].get("analysis_pass_g", DEFAULT_PROMPTS.get("analysis_pass_g", ""))
-    text = (f"{title}\n\n{body}")[:16000]
+    blob = f"{title}\n\n{body}"
+    if attachment_text:
+        blob = f"{blob}\n\n{attachment_text}"
+    text = blob[:16000]
     prompt = template.replace("{transcript}", text)
     default = {"category": "other", "keywords": [], "entities": {}}
     try:
@@ -1018,6 +1157,106 @@ async def auto_tag_note(title: str, body: str) -> dict:
         return default
 
 
+async def analyze_note_text(text: str) -> dict:
+    """Run one structured 'note_analysis' pass over a note+attachments corpus.
+    Non-fatal: any failure or unparseable/empty response yields empty defaults."""
+    settings = load_settings()
+    model = settings.get("ollama_model", OLLAMA_MODEL)
+    temperature = settings.get("temperature", 0.3)
+    template = settings["prompts"].get("note_analysis", DEFAULT_PROMPTS.get("note_analysis", ""))
+    prompt = template.replace("{corpus}", text)
+    default = {"summary": "", "key_points": [], "action_items": [], "insights": []}
+    try:
+        body = _build_generate_body(
+            model, prompt, temperature=temperature, num_predict=3072,
+            schema=ANALYSIS_SCHEMAS.get("note_analysis"))  # num_ctx sized by _ctx_for_text
+        resp = await _retry_ollama_call(
+            "POST", f"{OLLAMA_URL}/api/generate",
+            json_body=body, timeout_seconds=300.0, max_retries=2)
+        parsed = _parse_json_object(resp.json().get("response", ""), context="note-analysis")
+        if not parsed:
+            return default
+        return {
+            "summary": str(parsed.get("summary", "")),
+            "key_points": [str(x) for x in (parsed.get("key_points") or []) if x],
+            "action_items": [str(x) for x in (parsed.get("action_items") or []) if x],
+            "insights": [str(x) for x in (parsed.get("insights") or []) if x],
+        }
+    except Exception as e:
+        logger.warning(f"note analysis failed (non-fatal): {e}")
+        return default
+
+
+def _build_analysis_corpus(note: dict, extractions: list[dict]) -> str:
+    """Assemble the analysis corpus: title header + body + each attachment's
+    extracted text, blank-line separated, hard-capped at ANALYSIS_CORPUS_MAX."""
+    parts = []
+    title = (note.get("title") or "").strip()
+    if title:
+        parts.append(f"# {title}")
+    body = note.get("body") or ""
+    if body.strip():
+        parts.append(body)
+    for ex in extractions or []:
+        text = (ex.get("text") or "").strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)[:ANALYSIS_CORPUS_MAX]
+
+
+async def _resolve_note_extractions(note_id: str) -> list[dict]:
+    """Ensure every referenced attachment has a resolved .extracted sidecar, running
+    deferred vision NOW (explicit user action -> allowed to use the GPU). A terminal
+    sidecar is reused; a pending 'vision' method is resolved via llm.describe_image;
+    other pending methods (e.g. 'stt') are left to Phase A's idle extraction worker
+    and contribute no text this pass. Non-fatal per attachment: a failure yields a
+    'failed' Extraction and never aborts the analysis."""
+    results = []
+    loop = asyncio.get_event_loop()
+    for fname in notes_store.note_attachments(notes_store.NOTES_DIR, note_id):
+        p = notes_store.attachment_path(notes_store.NOTES_DIR, fname)
+        if p is None:
+            continue
+        side_path = extract.extracted_sidecar_path(
+            notes_store.attachments_dir(notes_store.NOTES_DIR), fname)
+        ex = None
+        if side_path.exists():
+            try:
+                raw = await loop.run_in_executor(None, side_path.read_text)
+                ex = json.loads(raw)
+            except Exception:
+                ex = None
+        if ex and ex.get("status") in ("done", "empty", "failed"):
+            results.append(ex)
+            continue
+        try:
+            ex = await loop.run_in_executor(None, extract.extract_text, str(p), fname)
+            if ex.get("status") == "pending" and ex.get("method") == "vision":
+                text = await llm.describe_image(str(p), prompt=VISION_EXTRACT_PROMPT)
+                ex = {"text": text or "", "method": "vision",
+                      "chars": len(text or ""), "status": "done"}
+        except llm.VisionUnavailable as e:
+            # Model not present right now (e.g. still loading / GPU busy elsewhere) —
+            # keep this retryable instead of burying it as a terminal failure.
+            logger.warning(f"vision model unavailable for {fname}; leaving pending for retry: {e}")
+            ex = {"text": "", "method": "vision", "chars": 0, "status": "pending"}
+        except Exception as e:
+            logger.warning(f"attachment extraction failed for {fname} (non-fatal): {e}")
+            ex = {"text": "", "method": (ex or {}).get("method", ""), "chars": 0, "status": "failed"}
+        ex.setdefault("status", "empty")
+        ex["extracted_at"] = notes_store.now_iso()
+        ex["note_id"] = note_id
+        try:
+            def _write():
+                side_path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write(side_path, json.dumps(ex, indent=2))
+            await loop.run_in_executor(None, _write)
+        except Exception as e:
+            logger.warning(f"extracted sidecar write failed for {fname} (non-fatal): {e}")
+        results.append(ex)
+    return results
+
+
 async def _run_tag_job(note_id: str) -> bool:
     if _pipeline_busy():
         return False
@@ -1028,7 +1267,9 @@ async def _run_tag_job(note_id: str) -> bool:
     state = _enhance_state()
     if state.get(note_id, {}).get("tag_sig") == sig:
         return False
-    tags = await auto_tag_note(note.get("title", ""), note.get("body", ""))
+    attach_text = _note_attachment_text(note)
+    tags = await auto_tag_note(note.get("title", ""), note.get("body", ""),
+                               attachment_text=attach_text)
     kws = list(tags.get("keywords", []))
     if tags.get("category") and tags["category"] != "other":
         kws.append(tags["category"])
@@ -1038,7 +1279,7 @@ async def _run_tag_job(note_id: str) -> bool:
     return True
 
 
-async def _hierarchical_summarize(transcript: str, duration: float, model: str = None, temperature: float = None, progress_callback=None) -> dict:
+async def _hierarchical_summarize(transcript: str, duration: float, model: str = None, temperature: float = None, progress_callback=None, context: str = "") -> dict:
     """For very long meetings: summarize 15-min segments, then run multi-pass analysis on combined summaries."""
     if model is None or temperature is None:
         settings = load_settings()
@@ -1102,7 +1343,7 @@ async def _hierarchical_summarize(transcript: str, duration: float, model: str =
         f"--- Segment {i+1} ---\n{s}" for i, s in enumerate(segment_summaries)
     )
     prefix = f"[Synthesis of segment summaries from a {_format_timestamp(duration)} meeting]\n\n"
-    return await _run_analysis_passes(prefix + combined, model, temperature, progress_callback)
+    return await _run_analysis_passes(prefix + combined, model, temperature, progress_callback, context=context)
 
 
 def build_transcript_text(segments: list[dict]) -> str:
@@ -1867,7 +2108,9 @@ async def process_meeting(meeting_id: str):
             _update_progress(meeting, pct, detail)
 
         t0 = time.monotonic()
-        summary = await step_summarize(transcript_text, duration, progress_callback=_summarize_progress)
+        context = await asyncio.get_event_loop().run_in_executor(
+            None, _gather_meeting_context, meeting_id)
+        summary = await step_summarize(transcript_text, duration, progress_callback=_summarize_progress, context=context)
         if "title" in summary and summary["title"] != "Meeting":
             meeting["title"] = summary["title"]
         step_timings["summarization"] = round(time.monotonic() - t0, 1)
@@ -4307,7 +4550,9 @@ async def reprocess_meeting(meeting_id: str, body: ReprocessRequest):
                 _update_progress(m, 72, "Re-summarizing...")
                 _save_index()
 
-                summary = await step_summarize(transcript_text, duration)
+                context = await asyncio.get_event_loop().run_in_executor(
+                    None, _gather_meeting_context, meeting_id)
+                summary = await step_summarize(transcript_text, duration, context=context)
                 if "title" in summary and summary["title"] != "Meeting":
                     m["title"] = summary["title"]
 
@@ -4513,6 +4758,7 @@ class NoteUpdate(BaseModel):
     title: Optional[str] = None
     body: Optional[str] = None
     tags: Optional[list] = None
+    expected_body_hash: Optional[str] = None
 
 
 class NoteLinkMeeting(BaseModel):
@@ -4593,16 +4839,37 @@ def _run_bg(fn, *args) -> None:
         fn(*args)
 
 
+def _note_attachment_text(rec: dict, cap: int = None) -> str:
+    """Concatenate the `done` extracted text of a note's referenced attachments,
+    capped at ATTACH_TEXT_MAX. Best-effort — never raises."""
+    if cap is None:
+        cap = ATTACH_TEXT_MAX
+    try:
+        filenames = notes_store.note_attachments(notes_store.NOTES_DIR, rec.get("id", ""))
+        attach_dir = notes_store.attachments_dir(notes_store.NOTES_DIR)
+        parts = []
+        for fname in filenames:
+            sc = extract.read_extraction(attach_dir, fname)
+            if sc and sc.get("status") == "done" and sc.get("text"):
+                parts.append(sc["text"])
+        return ("\n\n".join(parts))[:cap]
+    except Exception as e:
+        logger.warning(f"attachment-text gather failed for {rec.get('id')} (non-fatal): {e}")
+        return ""
+
+
 def _index_note_safe(rec: dict) -> None:
-    """Best-effort, non-blocking: index a note's vectors; never let Qdrant/embedder
-    errors (or latency) break or delay note CRUD."""
+    """Best-effort, non-blocking: index a note's vectors (+ attachment text); never
+    let Qdrant/embedder errors (or latency) break or delay note CRUD."""
     if not rec:
         return
 
     def work():
         try:
+            extra = _note_attachment_text(rec)
             notes_vectors.index_note(get_qdrant(), get_embedder(), rec,
-                                     collection=notes_vectors.NOTES_COLLECTION, dim=EMBEDDING_DIM)
+                                     collection=notes_vectors.NOTES_COLLECTION,
+                                     dim=EMBEDDING_DIM, extra_text=extra)
         except Exception as e:
             logger.warning(f"Note vector index failed for {rec.get('id')} (non-fatal): {e}")
     _run_bg(work)
@@ -4640,6 +4907,178 @@ async def _tag_worker():
             _tag_queue.task_done()
 
 
+def _analysis_path(note_id: str) -> Path:
+    return notes_store.attachments_dir(notes_store.NOTES_DIR) / ".analysis" / f"{note_id}.json"
+
+
+def _write_analysis(note_id: str, result: dict) -> None:
+    d = notes_store.attachments_dir(notes_store.NOTES_DIR) / ".analysis"
+    d.mkdir(parents=True, exist_ok=True)
+    payload = {**result, "analyzed_at": notes_store.now_iso()}
+    _atomic_write(d / f"{note_id}.json", json.dumps(payload, indent=2))
+
+
+async def _run_analysis_job(note_id: str) -> dict:
+    """Resolve deferred extraction, build the corpus, run one analysis pass, and
+    persist the result sidecar. Returns the analysis dict (empty if the note is gone)."""
+    note = notes_store.read_note(notes_store.NOTES_DIR, note_id)
+    if not note:
+        return {}
+    extractions = await _resolve_note_extractions(note_id)
+    corpus = _build_analysis_corpus(note, extractions)
+    result = await analyze_note_text(corpus)
+    _write_analysis(note_id, result)
+    return result
+
+
+def _enqueue_analysis(note_id: str) -> None:
+    """Enqueue a note for background analysis (coalesced by note_id)."""
+    if note_id and note_id not in _analysis_pending:
+        _analysis_pending.add(note_id)
+        _analysis_status[note_id] = "queued"
+        _analysis_queue.put_nowait(note_id)
+
+
+async def _analysis_worker():
+    """Background worker: analyze queued notes once the meeting pipeline is idle."""
+    while True:
+        note_id = await _analysis_queue.get()
+        try:
+            while _pipeline_busy():
+                await asyncio.sleep(ANALYSIS_IDLE_POLL)
+            _analysis_status[note_id] = "running"
+            await _run_analysis_job(note_id)
+            _analysis_status[note_id] = "done"
+        except Exception as e:
+            logger.warning(f"analysis worker error (non-fatal): {e}")
+            _analysis_status[note_id] = "error"
+        finally:
+            _analysis_pending.discard(note_id)
+            _analysis_queue.task_done()
+
+
+def _enqueue_extract(note_id: str, filename: str) -> None:
+    """Enqueue a deferred (STT/vision) extraction, coalesced by (note_id, filename)."""
+    key = f"{note_id}\x00{filename}"
+    if key not in _extract_pending:
+        _extract_pending.add(key)
+        _extract_queue.put_nowait((note_id, filename))
+
+
+async def _extract_worker():
+    """Resolve deferred attachment extractions when no meeting is mid-pipeline."""
+    while True:
+        note_id, filename = await _extract_queue.get()
+        key = f"{note_id}\x00{filename}"
+        try:
+            while _pipeline_busy():
+                await asyncio.sleep(EXTRACT_IDLE_POLL)
+            await _run_extract_job(note_id, filename)
+        except Exception as e:
+            logger.warning(f"extract worker error (non-fatal): {e}")
+        finally:
+            _extract_pending.discard(key)
+            _extract_queue.task_done()
+
+
+async def _extract_stt(path: str) -> str:
+    """Transcribe an audio/video attachment (no diarization) into plain lines."""
+    loop = asyncio.get_event_loop()
+    with tempfile.TemporaryDirectory() as td:
+        wav = os.path.join(td, "audio.wav")
+        await loop.run_in_executor(None, stt.preprocess_audio, path, wav)
+        result = await stt.step_transcribe(wav, None, None, diarize=False)
+    return "\n".join(s.get("text", "") for s in result.get("segments", []) if s.get("text"))
+
+
+async def _extract_scanned_pdf(path: str) -> str:
+    loop = asyncio.get_event_loop()
+    pngs = await loop.run_in_executor(None, extract.render_pdf_page_pngs, path)
+    texts = []
+    with tempfile.TemporaryDirectory() as td:
+        for i, png in enumerate(pngs):
+            fp = os.path.join(td, f"page{i}.png")
+            with open(fp, "wb") as fh:
+                fh.write(png)
+            texts.append(await llm.describe_image(fp, prompt=VISION_PROMPT))
+    return "\n\n".join(t for t in texts if t.strip())
+
+
+async def _extract_vision(path: str, filename: str) -> str:
+    ext = ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
+    if ext == ".pdf":
+        return await _extract_scanned_pdf(path)
+    return await llm.describe_image(path, prompt=VISION_PROMPT)
+
+
+async def _run_extract_job(note_id: str, filename: str) -> bool:
+    """Resolve one deferred extraction; write the sidecar; re-feed the owning note.
+    Never raises — failure -> status='failed'. Returns True iff status='done'."""
+    attach_dir = notes_store.attachments_dir(notes_store.NOTES_DIR)
+    p = notes_store.attachment_path(notes_store.NOTES_DIR, filename)
+    if p is None:
+        return False
+    sidecar = extract.read_extraction(attach_dir, filename) or {}
+    # A terminal sidecar means someone else (inline Analyze, or an earlier pass)
+    # already resolved this — skip the duplicate GPU pass / prompt-mismatch overwrite.
+    if sidecar.get("status") in ("done", "empty", "failed"):
+        return sidecar.get("status") == "done"
+    method = sidecar.get("method", "")
+    if method not in ("stt", "vision"):
+        return False
+    try:
+        text = await (_extract_stt(str(p)) if method == "stt"
+                      else _extract_vision(str(p), filename))
+        text = (text or "")[:ATTACH_TEXT_MAX]
+        result = {"text": text, "method": method, "chars": len(text),
+                  "status": "done" if text.strip() else "empty"}
+    except llm.VisionUnavailable as e:
+        # Model not present right now — keep retryable instead of terminal 'failed'.
+        logger.warning(f"vision model unavailable for {filename}; leaving pending for retry: {e}")
+        result = {"text": "", "method": "vision", "chars": 0, "status": "pending"}
+    except Exception as e:
+        logger.warning(f"deferred extraction failed for {filename} (non-fatal): {e}")
+        result = {"text": "", "method": method, "chars": 0, "status": "failed"}
+    result["note_id"] = note_id
+    extract.write_extraction(attach_dir, filename, result)
+    # Feed the new text into search + tags now that the attachment resolved.
+    if result["status"] == "done":
+        rec = notes_store.read_note(notes_store.NOTES_DIR, note_id)
+        if rec:
+            _index_note_safe(rec)
+            _enqueue_tag(note_id)
+    return result["status"] == "done"
+
+
+async def _rescan_pending_extractions() -> None:
+    """Startup rescan: the deferred-extraction queue lives only in memory, so a
+    restart strands any attachment whose sidecar is still 'pending' (queued but
+    never resolved). Walk the .extracted sidecars and re-enqueue anything pending
+    that carries a note_id. Non-fatal — a missing/unreadable vault is a no-op."""
+    def _scan() -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        edir = notes_store.attachments_dir(notes_store.NOTES_DIR) / extract.EXTRACTED_DIRNAME
+        if not edir.is_dir():
+            return pairs
+        for sc in edir.glob("*.json"):
+            try:
+                data = json.loads(sc.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            note_id = data.get("note_id")
+            if data.get("status") == "pending" and note_id:
+                pairs.append((note_id, sc.stem))   # "<stored_filename>.json" -> stem strips ".json"
+        return pairs
+    try:
+        pairs = await asyncio.get_event_loop().run_in_executor(None, _scan)
+        for note_id, filename in pairs:
+            _enqueue_extract(note_id, filename)
+    except Exception as e:
+        logger.warning(f"pending extraction rescan failed (non-fatal): {e}")
+
+
 @app.get("/api/notes")
 async def api_list_notes(folder: Optional[str] = None, tag: Optional[str] = None,
                          type: Optional[str] = None, q: Optional[str] = None):
@@ -4648,6 +5087,24 @@ async def api_list_notes(folder: Optional[str] = None, tag: Optional[str] = None
     def _do():
         return notes_store.list_notes(
             notes_store.NOTES_DIR, folder=folder, tag=tag, type=type, q=q)
+    notes = await asyncio.get_event_loop().run_in_executor(None, _do)
+    return {"notes": notes}
+
+
+@app.get("/api/notes/export")
+async def api_export_notes():
+    """Full mirror payload for offline sync: every note record WITH its body and
+    content_hash, built on the same index/read_note the rest of the API uses (so
+    the .trash/ and attachments/ subtrees are already excluded). Body-only — never
+    inlines attachment extracted text. Offloaded like api_list_notes."""
+    def _do():
+        idx = notes_store.get_index(notes_store.NOTES_DIR)
+        out = []
+        for nid in list(idx.keys()):
+            rec = notes_store.read_note(notes_store.NOTES_DIR, nid)
+            if rec is not None:
+                out.append(rec)
+        return out
     notes = await asyncio.get_event_loop().run_in_executor(None, _do)
     return {"notes": notes}
 
@@ -4706,9 +5163,15 @@ async def api_get_note(note_id: str):
 
 @app.put("/api/notes/{note_id}")
 async def api_update_note(note_id: str, payload: NoteUpdate):
-    rec = notes_store.update_note(
-        notes_store.NOTES_DIR, note_id,
-        title=payload.title, body=payload.body, tags=payload.tags)
+    try:
+        rec = notes_store.update_note(
+            notes_store.NOTES_DIR, note_id,
+            title=payload.title, body=payload.body, tags=payload.tags,
+            expected_body_hash=payload.expected_body_hash)
+    except notes_store.NoteConflict as e:
+        # Body/title changed elsewhere (another device or Obsidian): reject the
+        # push and hand the client our current record so it can make a conflict copy.
+        return JSONResponse(status_code=409, content=e.current)
     if rec is None:
         raise HTTPException(status_code=404, detail="Note not found")
     _index_note_safe(rec)
@@ -4732,6 +5195,36 @@ async def api_retag_note(note_id: str):
         raise HTTPException(status_code=404, detail="Note not found")
     _enqueue_tag(note_id)
     return {"queued": True}
+
+
+@app.post("/api/notes/{note_id}/analyze")
+async def api_analyze_note(note_id: str):
+    """Enqueue a note for background AI analysis (resolves deferred extraction,
+    then runs one structured pass). Returns immediately; poll GET .../analysis."""
+    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    _enqueue_analysis(note_id)
+    return {"queued": True, "status": _analysis_status.get(note_id, "queued")}
+
+
+@app.get("/api/notes/{note_id}/analysis")
+async def api_get_note_analysis(note_id: str):
+    """Report analysis status + the last persisted result (if any)."""
+    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    result = None
+    p = _analysis_path(note_id)
+    if p.exists():
+        try:
+            result = json.loads(p.read_text())
+        except Exception:
+            result = None
+    status = _analysis_status.get(note_id) or ("done" if result else "idle")
+    if status == "done" and result is None:
+        # In-memory says done but the sidecar is missing/corrupt — never
+        # present "done" without content; the UI renders result on "done".
+        status = "error"
+    return {"status": status, "result": result}
 
 
 @app.post("/api/notes/{note_id}/link-meeting")
@@ -5035,7 +5528,30 @@ async def api_add_attachment(note_id: str, file: UploadFile = File(...)):
     ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
     is_image = ext in _IMAGE_EXTS
     embed = f"![[{fname}]]" if is_image else f"[{fname}](attachments/{fname})"
-    return {"filename": fname, "url": f"/api/notes/attachments/{fname}", "is_image": is_image, "embed": embed}
+
+    # Instant extraction runs in the executor (a 50 MiB docx parse must not block
+    # the handler); deferred formats only get a `pending` sidecar + enqueue.
+    attach_dir = notes_store.attachments_dir(notes_store.NOTES_DIR)
+
+    def _extract_and_write():
+        try:
+            result = extract.extract_text(str(attach_dir / fname), fname)
+            if result.get("text"):
+                result["text"] = result["text"][:ATTACH_TEXT_MAX]
+                result["chars"] = len(result["text"])
+            result["note_id"] = note_id   # so a restart-stranded 'pending' sidecar can be rescanned
+            extract.write_extraction(attach_dir, fname, result)
+            return result
+        except Exception as e:
+            logger.warning(f"attachment extraction/sidecar failed for {fname} (non-fatal): {e}")
+            return {"text": "", "method": "", "chars": 0, "status": "failed"}
+
+    result = await asyncio.get_event_loop().run_in_executor(None, _extract_and_write)
+    if result["status"] == "pending":
+        _enqueue_extract(note_id, fname)
+    return {"filename": fname, "url": f"/api/notes/attachments/{fname}",
+            "is_image": is_image, "embed": embed,
+            "extracted": result["status"] == "done", "status": result["status"]}
 
 
 @app.get("/api/notes/attachments/{filename}")
@@ -5044,6 +5560,54 @@ async def api_get_attachment(filename: str):
     if p is None:
         raise HTTPException(status_code=404, detail="Attachment not found")
     return FileResponse(p, media_type=_ATTACH_MEDIA.get(p.suffix.lower(), "application/octet-stream"), filename=p.name)
+
+
+@app.get("/api/notes/{note_id}/attachments")
+async def api_list_attachments(note_id: str):
+    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+
+    def _do():
+        attach_dir = notes_store.attachments_dir(notes_store.NOTES_DIR)
+        out = []
+        for fname in notes_store.note_attachments(notes_store.NOTES_DIR, note_id):
+            p = notes_store.attachment_path(notes_store.NOTES_DIR, fname)
+            if p is None:
+                continue
+            ext = ("." + fname.rsplit(".", 1)[-1].lower()) if "." in fname else ""
+            sc = extract.read_extraction(attach_dir, fname)
+            out.append({
+                "filename": fname,
+                "is_image": ext in _IMAGE_EXTS,
+                "size": p.stat().st_size,
+                "extraction_status": (sc or {}).get("status", "none"),
+            })
+        return out
+
+    items = await asyncio.get_event_loop().run_in_executor(None, _do)
+    return {"attachments": items}
+
+
+@app.delete("/api/notes/{note_id}/attachments/{filename}")
+async def api_delete_attachment(note_id: str, filename: str):
+    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    p = notes_store.attachment_path(notes_store.NOTES_DIR, filename)
+    if p is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    attach_dir = notes_store.attachments_dir(notes_store.NOTES_DIR)
+    sidecar = extract.extracted_sidecar_path(attach_dir, filename)
+    try:
+        p.unlink()
+    except OSError:
+        pass
+    # Remove ONLY this attachment's per-attachment .extracted sidecar. The note-level
+    # .analysis/<note_id>.json is left as (possibly stale) — re-run Analyze to refresh.
+    try:
+        sidecar.unlink()
+    except OSError:
+        pass
+    return {"deleted": True}
 
 
 # ---------------------------------------------------------------------------

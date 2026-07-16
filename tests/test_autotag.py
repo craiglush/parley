@@ -39,7 +39,7 @@ def test_run_tag_job_tags_when_idle(tmp_path, monkeypatch):
     import app
     monkeypatch.setattr(ns, "NOTES_DIR", tmp_path); ns._index_cache.clear()
     monkeypatch.setattr(app, "meetings", {})
-    async def _fake_tag(title, body):
+    async def _fake_tag(title, body, *, attachment_text=""):
         return {"category": "planning", "keywords": ["roadmap"], "entities": {}}
     monkeypatch.setattr(app, "auto_tag_note", _fake_tag)
     rec = ns.create_note(tmp_path, "N", body="content about the roadmap")
@@ -62,3 +62,41 @@ def test_retag_endpoint_enqueues(tmp_path, monkeypatch):
     r = client.post(f"/api/notes/{nid}/retag")
     assert r.status_code == 200 and r.json()["queued"] is True
     assert nid in enqueued
+
+
+def test_auto_tag_includes_attachment_text_within_cap(tmp_path, monkeypatch):
+    import app
+    captured = {}
+
+    class _Resp:
+        def json(self):
+            return {"response": '{"category": "planning", "keywords": ["merger"], "entities": {}}'}
+
+    async def fake_call(method, url, *, json_body, timeout_seconds=180.0, max_retries=2):
+        captured["prompt"] = json_body["prompt"]
+        return _Resp()
+
+    monkeypatch.setattr(app, "_retry_ollama_call", fake_call)
+    out = asyncio.run(app.auto_tag_note("Title", "the body", attachment_text="MERGER MEMO details"))
+    assert out["category"] == "planning"
+    assert "the body" in captured["prompt"]
+    assert "MERGER MEMO" in captured["prompt"]
+
+
+def test_auto_tag_caps_at_16000(tmp_path, monkeypatch):
+    import app
+    captured = {}
+
+    class _Resp:
+        def json(self):
+            return {"response": '{"category": "other", "keywords": [], "entities": {}}'}
+
+    async def fake_call(method, url, *, json_body, timeout_seconds=180.0, max_retries=2):
+        captured["prompt"] = json_body["prompt"]
+        return _Resp()
+
+    monkeypatch.setattr(app, "_retry_ollama_call", fake_call)
+    big_attach = "A" * 40000
+    asyncio.run(app.auto_tag_note("T", "body", attachment_text=big_attach))
+    # analysis_pass_g template wraps {transcript}; the transcript slice itself is <=16000
+    assert "A" * 40000 not in captured["prompt"]
