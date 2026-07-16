@@ -17,12 +17,12 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
-<link rel="stylesheet" href="/static/notes-tasks.css?v=12">
+<link rel="stylesheet" href="/static/notes-tasks.css?v=13">
 <script defer src="/static/vendor/codemirror.bundle.js?v=12"></script>
 <script defer src="/static/notes-sync-logic.js?v=1"></script>
-<script defer src="/static/notes-sync.js?v=2"></script>
+<script defer src="/static/notes-sync.js?v=3"></script>
 <script defer src="/static/notes-analysis-logic.js?v=1"></script>
-<script defer src="/static/notes-tasks.js?v=13"></script>
+<script defer src="/static/notes-tasks.js?v=14"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -52,7 +52,7 @@
     }
   });
 </script>
-<link rel="stylesheet" href="/static/styles.css?v=16">
+<link rel="stylesheet" href="/static/styles.css?v=14">
 </head>
 <body>
 
@@ -128,7 +128,14 @@
         <span class="live-speakers-title">Who's talking</span>
         <span id="liveTagHint" class="live-tag-hint">Tap a name when they speak</span>
       </div>
-      <div id="liveSpeakerChips" class="live-speaker-chips"></div>
+      <div class="capture-notes-head">
+        <button class="capture-notes-toggle" id="liveSpeakersToggle" type="button" aria-expanded="true">
+          <span class="capture-notes-chevron">&#9662;</span> Speakers
+        </button>
+      </div>
+      <div id="liveSpeakersBody" class="capture-notes-body">
+        <div id="liveSpeakerChips" class="live-speaker-chips"></div>
+      </div>
       <div class="live-speaker-add-row">
         <input id="liveSpeakerAdd" class="live-speaker-add" type="text"
                list="liveSpeakerList" placeholder="Add attendee…" autocomplete="off" />
@@ -174,20 +181,27 @@
       <span class="file-size" id="fileSize"></span>
       <button class="remove-file" id="removeFile" title="Remove file">&times;</button>
     </div>
-    <div class="cb-fields-row">
-      <div class="field">
-        <label for="meetingTitle">Meeting Title (optional)</label>
-        <input type="text" id="meetingTitle" placeholder="e.g. Sprint Planning 2026-02-16">
+    <div class="capture-notes-head">
+      <button class="capture-notes-toggle" id="uploadFieldsToggle" type="button" aria-expanded="true">
+        <span class="capture-notes-chevron">&#9662;</span> Details
+      </button>
+    </div>
+    <div id="uploadFieldsBody" class="capture-notes-body">
+      <div class="cb-fields-row">
+        <div class="field">
+          <label for="meetingTitle">Meeting Title (optional)</label>
+          <input type="text" id="meetingTitle" placeholder="e.g. Sprint Planning 2026-02-16">
+        </div>
+        <div class="field">
+          <label for="numSpeakers">Speakers (optional)</label>
+          <input type="number" id="numSpeakers" min="1" max="20" placeholder="e.g. 4">
+        </div>
+        <div class="field">
+          <label for="meetingContext">Context (optional)</label>
+          <input type="text" id="meetingContext" placeholder="e.g. AWS infrastructure review">
+        </div>
+        <button class="upload-btn" id="uploadBtn">Upload & Process</button>
       </div>
-      <div class="field">
-        <label for="numSpeakers">Speakers (optional)</label>
-        <input type="number" id="numSpeakers" min="1" max="20" placeholder="e.g. 4">
-      </div>
-      <div class="field">
-        <label for="meetingContext">Context (optional)</label>
-        <input type="text" id="meetingContext" placeholder="e.g. AWS infrastructure review">
-      </div>
-      <button class="upload-btn" id="uploadBtn">Upload & Process</button>
     </div>
     <div class="upload-progress" id="uploadProgress">
       <div class="progress-bar"><div class="progress-bar-fill" id="progressFill"></div></div>
@@ -899,7 +913,7 @@
 
 <script src="/static/capture-notes-logic.js?v=1"></script>
 <script src="/static/queue-logic.js?v=1"></script>
-<script src="/static/app.js?v=19"></script>
+<script src="/static/app.js?v=16"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js');

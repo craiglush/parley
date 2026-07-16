@@ -58,6 +58,14 @@ body[data-pillar="tasks"] .main-content { overflow: hidden; }
   width: 300px; min-width: 300px; display: flex; flex-direction: column;
   background: var(--bg-secondary); border-right: 1px solid var(--border); min-height: 0;
 }
+/* Desktop pane toggle (mobile drawer behavior below is separate/unchanged:
+   see .notes-view.tree-open in the max-width:768px block). .notes-editor-pane
+   already has flex:1 and is the only other flex child of .notes-view — hiding
+   .notes-tree lets it fill the freed width automatically, no additional layout
+   rule needed. */
+@media (min-width: 769px) {
+  .notes-view.tree-collapsed .notes-tree { display: none; }
+}
 .notes-tree-head { padding: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
 .notes-tree-actions { display: flex; gap: 6px; }
 .nt-new-btn {
@@ -137,7 +145,7 @@ body[data-pillar="tasks"] .main-content { overflow: hidden; }
 
 .notes-doc { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .notes-doc-head { display: flex; align-items: center; gap: 12px; padding: 18px 30px 8px; flex-wrap: wrap; }
-.nt-tree-toggle { display: none; background: transparent; border: 1px solid var(--border); color: var(--text-secondary);
+.nt-tree-toggle { display: inline-flex; background: transparent; border: 1px solid var(--border); color: var(--text-secondary);
   border-radius: var(--radius-sm); width: 34px; height: 34px; font-size: 16px; cursor: pointer; flex: 0 0 auto; align-items: center; justify-content: center; }
 .nt-tree-toggle:hover { color: var(--accent); border-color: var(--accent); }
 .note-title-input {

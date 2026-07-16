@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v16-export-etag';
+const CACHE_NAME = 'meetings-v17-batch2-collapsible';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.

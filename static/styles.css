@@ -1861,6 +1861,39 @@ body {
 .notes-section { margin-bottom: 20px; }
 .notes-section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .notes-section-header h3 { font-size: 15px; font-weight: 600; color: var(--accent); margin: 0; }
+
+/* Collapsible detail sections (session-only; module memory, resets on
+   reload — no localStorage). Reuses the .collapsed idiom from meeting-list
+   groups (.group-chevron.collapsed, styles.css:1652) and notes-tree folders
+   (.nt-folder.collapsed, notes-tasks.css:108). */
+.summary-section > h3,
+.tags-section > h3,
+.link-section > h3,
+.notes-section-header {
+  cursor: pointer;
+  user-select: none;
+}
+.summary-section > h3::before,
+.tags-section > h3::before,
+.link-section > h3::before,
+.notes-section-header > h3::before {
+  content: '▾';
+  display: inline-block;
+  width: 1em;
+  transition: transform 0.15s ease;
+  font-size: 12px;
+}
+.summary-section.collapsed > h3::before,
+.tags-section.collapsed > h3::before,
+.link-section.collapsed > h3::before,
+.notes-section.collapsed .notes-section-header > h3::before {
+  transform: rotate(-90deg);
+}
+.summary-section.collapsed > :not(h3) { display: none !important; }
+.tags-section.collapsed > :not(h3) { display: none !important; }
+.link-section.collapsed > :not(h3) { display: none !important; }
+.notes-section.collapsed > :not(.notes-section-header) { display: none !important; }
+
 .note-card {
   background: var(--bg-card);
   border: 1px solid var(--border);

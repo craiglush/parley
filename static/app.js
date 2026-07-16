@@ -627,6 +627,21 @@ function capturePostTagsMirror(sid, noteId) {
   }).catch(() => {});
 }
 
+// Shared collapse/expand wiring for capture-notes-style header+body pairs.
+// Session-only: no localStorage — used by the recording-panel sections below
+// (liveSpeakers, uploadFields). captureNotes keeps its own setOpen()/
+// localStorage logic untouched (it predates and is unrelated to this helper).
+function wireCollapse(toggleEl, bodyEl) {
+  if (!toggleEl || !bodyEl) return;
+  const chevronEl = toggleEl.querySelector('.capture-notes-chevron');
+  toggleEl.addEventListener('click', () => {
+    const open = bodyEl.hidden;   // hidden now -> clicking opens it
+    bodyEl.hidden = !open;
+    toggleEl.setAttribute('aria-expanded', String(open));
+    if (chevronEl) chevronEl.textContent = open ? '▾' : '▸';
+  });
+}
+
 // ---------------------------------------------------------------------------
 // In-meeting Notes — collapsible panel in the recording area writing a REAL
 // vault note through window.NotesSync (batch-1 offline mirror) from the first
@@ -2001,6 +2016,90 @@ function stopPolling() {
 // --- Detail View ---
 function isMobile() { return window.innerWidth < 768; }
 
+// --- Detail section collapse (session-only: module memory, resets on
+// reload — per design spec, NO localStorage for these). Global across
+// meetings: sectionKey = wrapperClass + ':' + headingText, so collapsing
+// "Key Topics" stays collapsed for every meeting viewed this session.
+const DETAIL_WRAPPER_CLASSES = ['summary-section', 'tags-section', 'notes-section', 'link-section'];
+const collapsedDetailSections = {};   // sectionKey -> true when collapsed
+
+// Desktop/Mobile container id pairs for each wrapper class — mirrors the ids
+// used by renderSummary/renderTags/loadRelated/renderNotes. Used to re-sync
+// the duplicated copy of a section after a toggle (see toggleDetailSection).
+const DETAIL_CONTAINER_IDS = {
+  'summary-section': ['summaryContent', 'summaryContentMobile'],
+  'tags-section': ['tagsContent', 'tagsContentMobile'],
+  'link-section': ['relatedContent', 'relatedContentMobile'],
+  'notes-section': ['notesContent', 'notesContentMobile'],
+};
+
+function detailSectionHeadingFromTarget(target) {
+  const header = target.closest('.notes-section-header');
+  if (header && header.parentElement && header.parentElement.classList.contains('notes-section')) {
+    return header;
+  }
+  const h3 = target.closest('h3');
+  if (!h3 || !h3.parentElement) return null;
+  const wrapperClass = DETAIL_WRAPPER_CLASSES.find(cls => h3.parentElement.classList.contains(cls));
+  return wrapperClass ? h3 : null;
+}
+
+function toggleDetailSection(headingEl) {
+  const section = headingEl.parentElement;
+  if (!section) return;
+  const wrapperClass = DETAIL_WRAPPER_CLASSES.find(cls => section.classList.contains(cls));
+  if (!wrapperClass) return;
+  const h3 = headingEl.tagName === 'H3' ? headingEl : headingEl.querySelector('h3');
+  if (!h3) return;
+  const key = wrapperClass + ':' + h3.textContent.trim();
+  const collapsed = !collapsedDetailSections[key];
+  collapsedDetailSections[key] = collapsed;
+  section.classList.toggle('collapsed', collapsed);
+  headingEl.setAttribute('aria-expanded', String(!collapsed));
+  // Sync the duplicated desktop/mobile copy of this section (F3) — without
+  // this the other viewport's copy keeps its stale class until next render.
+  (DETAIL_CONTAINER_IDS[wrapperClass] || []).forEach(id => applyDetailCollapse($(id)));
+}
+
+// Delegated (document-level; capture not needed) so it works for headings
+// inside innerHTML template strings without per-render listener rebinding.
+// MUST ignore clicks on button/a/input inside a heading — e.g. the
+// pencil-edit button that lives inside the Summary <h3> (app.js:2951).
+document.addEventListener('click', (e) => {
+  if (e.target.closest('button, a, input')) return;
+  const heading = detailSectionHeadingFromTarget(e.target);
+  if (heading) toggleDetailSection(heading);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  if (e.target.closest('button, a, input')) return;
+  const heading = detailSectionHeadingFromTarget(e.target);
+  if (heading) { e.preventDefault(); toggleDetailSection(heading); }
+});
+
+// Re-applies collapsedDetailSections to a freshly-rendered container. Call
+// immediately after any renderer sets that container's innerHTML — the
+// wrapper divs are template strings, not persistent DOM nodes, so collapse
+// state (and the a11y attrs below) do not survive a re-render on their own.
+function applyDetailCollapse(containerEl) {
+  if (!containerEl) return;
+  DETAIL_WRAPPER_CLASSES.forEach(cls => {
+    containerEl.querySelectorAll(':scope > .' + cls).forEach(section => {
+      const h3 = section.querySelector('h3');
+      if (!h3) return;
+      const headingEl = cls === 'notes-section' ? section.querySelector(':scope > .notes-section-header') : h3;
+      if (!headingEl) return;
+      const key = cls + ':' + h3.textContent.trim();
+      const collapsed = !!collapsedDetailSections[key];
+      section.classList.toggle('collapsed', collapsed);
+      headingEl.setAttribute('role', 'button');
+      headingEl.setAttribute('tabindex', '0');
+      headingEl.setAttribute('aria-expanded', String(!collapsed));
+    });
+  });
+}
+
 async function openMeeting(id) {
   currentMeetingId = id;
   if (typeof updateFloatingChatScope === 'function') updateFloatingChatScope();
@@ -2364,7 +2463,7 @@ function renderTags(tags, meetingId) {
     <div id="relatedMeetings"><div class="spinner"></div> Loading...</div>
   </div>`;
 
-  [$('tagsContent'), $('tagsContentMobile')].filter(Boolean).forEach(el => el.innerHTML = html);
+  [$('tagsContent'), $('tagsContentMobile')].filter(Boolean).forEach(el => { el.innerHTML = html; applyDetailCollapse(el); });
 
   // Load related meetings async
   loadRelatedMeetings(meetingId);
@@ -2469,7 +2568,7 @@ async function loadRelated(meetingId) {
       html += '</div>';
     }
 
-    containers.forEach(el => el.innerHTML = html);
+    containers.forEach(el => { el.innerHTML = html; applyDetailCollapse(el); });
 
     // Load insights history
     if (data.manual && data.manual.length) {
@@ -2494,7 +2593,7 @@ async function loadRelated(meetingId) {
         });
         notesHtml += '</div>';
         // safe: notesHtml built entirely with escHtml-escaped values
-        containers.forEach(el => el.insertAdjacentHTML('beforeend', notesHtml));
+        containers.forEach(el => { el.insertAdjacentHTML('beforeend', notesHtml); applyDetailCollapse(el); });
       }
     } catch (e) { /* related notes are best-effort */ }
   } catch (err) {
@@ -3077,7 +3176,7 @@ function renderSummary(s) {
   }
 
   const summaryHtml = html || '<div class="empty-state">No summary data.</div>';
-  [$('summaryContent'), $('summaryContentMobile')].filter(Boolean).forEach(el => el.innerHTML = summaryHtml);
+  [$('summaryContent'), $('summaryContentMobile')].filter(Boolean).forEach(el => { el.innerHTML = summaryHtml; applyDetailCollapse(el); });
 }
 
 // --- Summary field editing (PUT /meetings/{id}/summary/{field}) ---
@@ -3105,7 +3204,9 @@ function replaceSummaryItem(field, i, updated) {
 }
 
 function editSummaryText(btn) {
-  const p = btn.closest('.summary-section').querySelector('.summary-text');
+  const section = btn.closest('.summary-section');
+  if (section.classList.contains('collapsed')) toggleDetailSection(section.querySelector('h3'));
+  const p = section.querySelector('.summary-text');
   const raw = currentSummaryData.summary || currentSummaryData.executive_summary || '';
   inlineEdit(p, { value: raw, multiline: true,
                   onSave: (v) => saveSummaryField('summary', v) });
@@ -3992,7 +4093,7 @@ function renderNotes(meetingId) {
           .map(n => renderAnnotationCard(n, meetingId)).join('')}
     </div>
   `;
-  containers.forEach(c => c.innerHTML = html);
+  containers.forEach(c => { c.innerHTML = html; applyDetailCollapse(c); });
 }
 
 function renderNoteCard(note, meetingId) {
@@ -4821,3 +4922,5 @@ setTimeout(() => {
     if (!inProgress) stopPolling();
   }).catch(() => {});
 }, 6000);
+wireCollapse($('liveSpeakersToggle'), $('liveSpeakersBody'));
+wireCollapse($('uploadFieldsToggle'), $('uploadFieldsBody'));

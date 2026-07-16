@@ -97,7 +97,10 @@
     if (p === 'notes') {
       if (!notesInit) { notesInit = true; loadNotesTree(); }
       else loadNotesTree();
-      if (isMobileWidth() && !currentNoteId) notesViewEl().classList.add('tree-open');
+      if (!currentNoteId) {
+        if (isMobileWidth()) notesViewEl().classList.add('tree-open');
+        notesViewEl().classList.remove('tree-collapsed');
+      }
     }
   }
   function isMobileWidth() { return (typeof window.isMobile === 'function') ? window.isMobile() : window.innerWidth < 768; }
@@ -654,6 +657,7 @@
       allNotes = allNotes.filter((n) => n.id !== id);
       currentNoteId = null; currentNote = null;
       $('notesDoc').style.display = 'none'; $('notesWelcome').style.display = 'flex';
+      notesViewEl().classList.remove('tree-collapsed');
       renderTree(); toast('Moved to trash', 'success');
     } catch (e) { toast('Delete failed: ' + e.message, 'error'); }
   }
@@ -965,7 +969,10 @@
 
     const toggle = document.createElement('button');
     toggle.className = 'nt-tree-toggle'; toggle.innerHTML = '☰'; toggle.title = 'Notes list';
-    toggle.onclick = () => notesViewEl().classList.toggle('tree-open');
+    toggle.onclick = () => {
+      const cls = isMobileWidth() ? 'tree-open' : 'tree-collapsed';
+      notesViewEl().classList.toggle(cls);
+    };
     $('notesDoc').querySelector('.notes-doc-head').prepend(toggle);
   }
 
