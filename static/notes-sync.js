@@ -159,10 +159,23 @@
   }
 
   // ---- pull ----
+  // Last ETag seen from /api/notes/export (module-scoped, per tab). Sent back
+  // as If-None-Match so an unchanged vault answers 304 in milliseconds instead
+  // of shipping ~12MB of bodies on every 60s poll. First pull of a session has
+  // no ETag and stays a normal full 200.
+  let lastExportEtag = null;
+
   function pull() {
-    return fetch(API + '/api/notes/export', { headers: { Accept: 'application/json' } })
-      .then((resp) => { if (!resp.ok) throw new Error('export ' + resp.status); return resp.json(); })
-      .then((data) => {
+    const headers = { Accept: 'application/json' };
+    if (lastExportEtag) headers['If-None-Match'] = lastExportEtag;
+    return fetch(API + '/api/notes/export', { headers }).then((resp) => {
+      // The 304 short-circuit MUST come before BOTH hazards below: 304 is not
+      // "ok" (the throw would misfire) and its body is empty (resp.json()
+      // would reject). Nothing changed -> skip merge + UI refresh entirely.
+      if (resp.status === 304) return;
+      if (!resp.ok) throw new Error('export ' + resp.status);
+      lastExportEtag = resp.headers.get('ETag');
+      return resp.json().then((data) => {
         const server = (data && data.notes) || [];
         return withNotesFlushLock(() => {
           return mAll().then((all) => {
@@ -179,6 +192,7 @@
           if (result !== undefined) return refreshUI();
         });
       });
+    });
   }
 
   // ---- flush (under a distinct Web Lock, mirroring app.js withFlushLock) ----

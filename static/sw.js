@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v15-notes-attachments';
+const CACHE_NAME = 'meetings-v16-export-etag';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.
@@ -50,8 +50,14 @@ self.addEventListener('fetch', (event) => {
     event.respondWith(
       fetch(event.request)
         .then((response) => {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          // Only cache good responses: a 304 (empty body, now that export is
+          // conditional) or an error stored here would poison the offline
+          // first-paint fallback. Non-ok responses pass through untouched;
+          // the last good 200 stays cached for offline.
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+          }
           return response;
         })
         .catch(() => caches.match(event.request))

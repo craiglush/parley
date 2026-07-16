@@ -1,3 +1,4 @@
+import asyncio
 import json
 from fastapi.testclient import TestClient
 
@@ -168,3 +169,54 @@ def test_rename_and_push_action_items(tmp_path, monkeypatch):
     assert "- [ ] Follow up" in r.json()["body"] and "📅 2026-06-25" in r.json()["body"]
     # and it now shows up as a task
     assert any(t["text"] == "Follow up" for t in client.get("/api/tasks").json()["tasks"])
+
+
+def test_read_json_cached_caches_until_file_changes(tmp_path):
+    import app
+    p = tmp_path / "summary.json"
+    p.write_text(json.dumps({"action_items": [{"task": "one"}]}))
+    first = app._read_json_cached(p)
+    assert first == {"action_items": [{"task": "one"}]}
+    assert app._read_json_cached(p) is first          # unchanged -> cached object, no re-parse
+    # different content (and size) -> (mtime_ns, size) key misses -> re-read
+    p.write_text(json.dumps({"action_items": [{"task": "one"}, {"task": "two"}]}))
+    assert len(app._read_json_cached(p)["action_items"]) == 2
+    p.unlink()
+    assert app._read_json_cached(p) is None           # missing -> None
+
+
+def test_tasks_collection_runs_off_event_loop(tmp_path, monkeypatch):
+    # /api/tasks used to collect synchronously ON the event loop (unlike its
+    # offloaded siblings), stalling the whole service for the full walk. Inside
+    # run_in_executor there is no running loop -> RuntimeError.
+    client, app = _client(tmp_path, monkeypatch)
+    monkeypatch.setattr(app, "meetings", {})
+    seen = {}
+
+    def probe():
+        try:
+            asyncio.get_running_loop()
+            seen["on_loop"] = True
+        except RuntimeError:
+            seen["on_loop"] = False
+        return []
+
+    monkeypatch.setattr(app, "_collect_note_tasks", probe)
+    assert client.get("/api/tasks").status_code == 200
+    assert seen["on_loop"] is False
+
+
+def test_meeting_tasks_pick_up_summary_rewrite(tmp_path, monkeypatch):
+    # Guards the cache KEY: a rewritten summary.json (new mtime/size) must be
+    # re-read, never served stale from the JSON cache.
+    client, app = _client(tmp_path, monkeypatch)
+    mdir = tmp_path / "_m"
+    mdir.mkdir()
+    (mdir / "summary.json").write_text(json.dumps({"action_items": [{"task": "First", "who": ""}]}))
+    monkeypatch.setattr(app, "meetings", {"m1": {"title": "Sync", "status": app.MeetingStatus.complete, "output_dir": str(mdir)}})
+    texts = {t["text"] for t in client.get("/api/tasks?all_owners=1").json()["tasks"]}
+    assert texts == {"First"}
+    (mdir / "summary.json").write_text(json.dumps({"action_items": [
+        {"task": "First", "who": ""}, {"task": "Second added later", "who": ""}]}))
+    texts = {t["text"] for t in client.get("/api/tasks?all_owners=1").json()["tasks"]}
+    assert "Second added later" in texts

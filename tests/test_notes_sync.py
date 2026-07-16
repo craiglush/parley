@@ -127,3 +127,35 @@ def test_export_excludes_attachments_subtree(tmp_path, monkeypatch):
     ns._index_cache.clear()
     titles = [n["title"] for n in client.get("/api/notes/export").json()["notes"]]
     assert "Real" in titles and "Sneaky" not in titles
+
+
+def test_export_sends_etag_and_304_on_match(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    client.post("/api/notes", json={"title": "A", "body": "alpha"})
+    r1 = client.get("/api/notes/export")
+    assert r1.status_code == 200
+    etag = r1.headers.get("etag")
+    assert etag and etag.startswith('"') and etag.endswith('"')   # quoted sha1
+    r2 = client.get("/api/notes/export", headers={"If-None-Match": etag})
+    assert r2.status_code == 304
+    assert r2.headers.get("etag") == etag        # 304 repeats the ETag (Caddy in front)
+    assert r2.content == b""                     # empty body
+
+
+def test_export_new_etag_and_body_after_write(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    nid = client.post("/api/notes", json={"title": "A", "body": "alpha"}).json()["id"]
+    etag = client.get("/api/notes/export").headers["etag"]
+    client.put(f"/api/notes/{nid}", json={"body": "beta which is longer"})
+    r = client.get("/api/notes/export", headers={"If-None-Match": etag})
+    assert r.status_code == 200                  # stale validator -> full 200
+    assert r.headers["etag"] != etag             # new ETag on every 200
+    assert any(n["body"].strip() == "beta which is longer" for n in r.json()["notes"])
+
+
+def test_export_mismatched_etag_returns_full_200(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    client.post("/api/notes", json={"title": "A", "body": "alpha"})
+    r = client.get("/api/notes/export", headers={"If-None-Match": '"deadbeef"'})
+    assert r.status_code == 200 and r.headers.get("etag")
+    assert len(r.json()["notes"]) == 1

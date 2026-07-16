@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -5092,21 +5092,27 @@ async def api_list_notes(folder: Optional[str] = None, tag: Optional[str] = None
 
 
 @app.get("/api/notes/export")
-async def api_export_notes():
+async def api_export_notes(request: Request):
     """Full mirror payload for offline sync: every note record WITH its body and
-    content_hash, built on the same index/read_note the rest of the API uses (so
-    the .trash/ and attachments/ subtrees are already excluded). Body-only — never
-    inlines attachment extracted text. Offloaded like api_list_notes."""
-    def _do():
-        idx = notes_store.get_index(notes_store.NOTES_DIR)
-        out = []
-        for nid in list(idx.keys()):
-            rec = notes_store.read_note(notes_store.NOTES_DIR, nid)
-            if rec is not None:
-                out.append(rec)
-        return out
-    notes = await asyncio.get_event_loop().run_in_executor(None, _do)
-    return {"notes": notes}
+    content_hash (the .trash/ and attachments/ subtrees are excluded by the
+    index). Body-only — never inlines attachment extracted text.
+
+    Three phases: (1) refresh the index and compute the vault ETag (quoted sha1
+    of the walk signature — changes iff any note file changed); (2) compare
+    If-None-Match; (3) assemble bodies from the cache ONLY on mismatch. The
+    offline mirror polls this every 60s per tab; an unchanged vault now costs a
+    304 + at most one stat-sweep instead of ~12MB of body re-reads. The 304
+    repeats the ETag header (Caddy sits in front; the header must survive).
+    Offloaded like api_list_notes."""
+    loop = asyncio.get_event_loop()
+    sig = await loop.run_in_executor(None, notes_store.index_signature, notes_store.NOTES_DIR)
+    etag = f'"{sig}"'
+    inm = request.headers.get("if-none-match")   # Starlette header lookup is case-insensitive
+    if inm is not None and inm.strip() == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    notes = await loop.run_in_executor(
+        None, lambda: list(notes_store.get_bodies(notes_store.NOTES_DIR).values()))
+    return JSONResponse(content={"notes": notes}, headers={"ETag": etag})
 
 
 @app.post("/api/notes")
@@ -5271,11 +5277,15 @@ async def api_note_related(note_id: str, limit: int = 5):
 
 
 def _collect_note_tasks() -> list:
+    # Bulk path: ONE get_bodies() (cache-served when warm) instead of a disk
+    # read per note per call. list_notes still drives the iteration so task
+    # collection order stays exactly as before (newest-updated note first).
     out = []
+    bodies = notes_store.get_bodies(notes_store.NOTES_DIR)
     for rec in notes_store.list_notes(notes_store.NOTES_DIR):
-        full = notes_store.read_note(notes_store.NOTES_DIR, rec["id"])
+        full = bodies.get(rec["id"])
         if full:
-            out.extend(tasks_store.parse_tasks_from_body(full["body"], rec["id"], rec["title"]))
+            out.extend(tasks_store.parse_tasks_from_body(full.get("body", ""), rec["id"], rec["title"]))
     return out
 
 
@@ -5288,6 +5298,10 @@ def _meeting_overlay_path(meeting_id: str) -> Optional[Path]:
 
 
 def _load_meeting_overlay(meeting_id: str) -> dict:
+    """FRESH read on purpose (meeting-side mirror of the notes RMW rule): the
+    overlay toggle/edit/dismiss endpoints do read-modify-write through here —
+    a stale cached overlay would clobber a newer one. Read-only consumers
+    (_collect_meeting_tasks) go through _read_json_cached instead."""
     p = _meeting_overlay_path(meeting_id)
     if p and p.exists():
         try:
@@ -5320,7 +5334,39 @@ def _meeting_action_item_count(meeting_id: str) -> int:
         return 0
 
 
+_json_file_cache: dict = {}  # str(path) -> {"key": (mtime_ns, size), "data": parsed-json}
+
+
+def _read_json_cached(path: Path):
+    """(mtime_ns, size)-keyed JSON read cache for the small per-meeting sidecars
+    (summary.json / task_overlay.json) that /api/tasks touches per meeting per
+    call over the slow bind mount. Returns the parsed JSON, or None when the
+    file is missing/unreadable/unparseable (parse failures are NOT cached, so a
+    half-written file heals on the next call). Returned objects are shared
+    cache state — callers must treat them as READ-ONLY. One entry per sidecar
+    path; bounded by the number of meetings."""
+    key_path = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        _json_file_cache.pop(key_path, None)
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _json_file_cache.get(key_path)
+    if hit is not None and hit["key"] == key:
+        return hit["data"]
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    _json_file_cache[key_path] = {"key": key, "data": data}
+    return data
+
+
 def _collect_meeting_tasks() -> list:
+    """Meeting action items as tasks. summary.json / task_overlay.json come through
+    the (mtime_ns, size)-keyed JSON cache — strictly read-only here; the overlay
+    WRITE endpoints keep fresh reads via _load_meeting_overlay."""
     out = []
     for mid, m in meetings.items():
         if m.get("status") != MeetingStatus.complete:
@@ -5328,14 +5374,12 @@ def _collect_meeting_tasks() -> list:
         out_dir = m.get("output_dir")
         if not out_dir:
             continue
-        sp = Path(out_dir) / "summary.json"
-        if not sp.exists():
+        summary = _read_json_cached(Path(out_dir) / "summary.json")
+        if not isinstance(summary, dict):
             continue
-        try:
-            summary = json.loads(sp.read_text())
-        except Exception:
-            continue
-        overlay = _load_meeting_overlay(mid)
+        op = _meeting_overlay_path(mid)
+        raw_overlay = _read_json_cached(op) if op else None
+        overlay = raw_overlay if isinstance(raw_overlay, dict) else {}
         for i, item in enumerate(summary.get("action_items", [])):
             task = tasks_store.meeting_action_item_to_task(item, mid, m.get("title", mid))
             task["index"] = i  # stable per-meeting id (summary.json is immutable post-processing)
@@ -5348,7 +5392,12 @@ def _collect_meeting_tasks() -> list:
 @app.get("/api/tasks")
 async def api_list_tasks(status: Optional[str] = None, owner: Optional[str] = None,
                          source: Optional[str] = None, due: Optional[str] = None):
-    tasks = _collect_note_tasks() + _collect_meeting_tasks()
+    # Collection is blocking file IO over the slow bind-mount on cold/changed
+    # paths; run it off the event loop like its api_list_notes /
+    # api_export_notes siblings so a cold vault can't stall every request.
+    def _collect():
+        return _collect_note_tasks() + _collect_meeting_tasks()
+    tasks = await asyncio.get_event_loop().run_in_executor(None, _collect)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     tasks = tasks_store.filter_tasks(tasks, status=status, owner=owner, source=source, due=due, today=today)
     return {"tasks": tasks_store.sort_tasks(tasks)}
