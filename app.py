@@ -782,9 +782,11 @@ async def _verify_embedding_dim_on_startup():
     _tag_t = asyncio.create_task(_tag_worker()); _bg_tasks.add(_tag_t); _tag_t.add_done_callback(_bg_tasks.discard)
     _an_t = asyncio.create_task(_analysis_worker()); _bg_tasks.add(_an_t); _an_t.add_done_callback(_bg_tasks.discard)
     _gc_t = asyncio.create_task(_capture_gc_worker()); _bg_tasks.add(_gc_t); _gc_t.add_done_callback(_bg_tasks.discard)
+    _sgc_t = asyncio.create_task(_sidecar_gc_worker()); _bg_tasks.add(_sgc_t); _sgc_t.add_done_callback(_bg_tasks.discard)
     _ext_t = asyncio.create_task(_extract_worker()); _bg_tasks.add(_ext_t); _ext_t.add_done_callback(_bg_tasks.discard)
     _rescan_t = asyncio.create_task(_rescan_pending_extractions()); _bg_tasks.add(_rescan_t); _rescan_t.add_done_callback(_bg_tasks.discard)
     _digest_t = asyncio.create_task(_digest_worker()); _bg_tasks.add(_digest_t); _digest_t.add_done_callback(_bg_tasks.discard)
+    _reindex_t = asyncio.create_task(_reindex_worker()); _bg_tasks.add(_reindex_t); _reindex_t.add_done_callback(_bg_tasks.discard)
 
 
 # In-memory meeting registry (survives container restarts via on-disk JSON index)
@@ -971,46 +973,83 @@ def _lock_for(meeting_id: str) -> threading.Lock:
         return lock
 
 
-def _reindex_meeting_safe(meeting_id: str) -> None:
-    """Fire-and-forget: delete this meeting's Qdrant points and re-store them
-    from the on-disk transcript.json / summary.json (files are the source of
-    truth for all text edits). Never blocks the HTTP response; failures are
+def _reindex_now(meeting_id: str) -> None:
+    """Delete this meeting's Qdrant points and re-store them from the on-disk
+    transcript.json / summary.json (files are the source of truth for all
+    text edits). Blocking/sync — run off-loop by the caller. Failures are
     non-fatal — the files stay correct and the next edit/reprocess reindexes
     everything again (full delete -> re-store, so it self-heals).
+
+    Re-fetches the meeting record fresh at call time (not at enqueue time),
+    since a coalesced job can sit in the queue for a while before running.
 
     NOTE: calls the app-namespace get_qdrant() / store_in_qdrant on purpose
     (never vector.-qualified) so test monkeypatches on app.* intercept them.
     """
-    m = meetings.get(meeting_id)
-    if not m:
-        return
-    out_dir = Path(m.get("output_dir") or "")
+    try:
+        with _lock_for(meeting_id):
+            m = meetings.get(meeting_id)
+            if not m:
+                return  # deleted before/while queued — never resurrect points
+            out_dir = Path(m.get("output_dir") or "")
+            get_qdrant().delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=Filter(
+                    must=[FieldCondition(key="meeting_id",
+                                         match=MatchValue(value=meeting_id))]
+                ),
+            )
+            segments = []
+            tp = out_dir / "transcript.json"
+            if tp.exists():
+                segments = json.loads(tp.read_text(encoding="utf-8")).get("segments", [])
+            summary = {}
+            sp = out_dir / "summary.json"
+            if sp.exists():
+                summary = json.loads(sp.read_text(encoding="utf-8"))
+            store_in_qdrant(meeting_id, m, segments, summary)
+    except Exception as e:
+        logger.warning(f"[{meeting_id}] Vector reindex failed (non-fatal): {e}")
 
-    def work():
+
+# Background reindex worker: coalesces rapid successive edits to the same
+# meeting into a single reindex job instead of firing one executor job (and
+# one embed pass) per edit. Mirrors the _tag_worker pattern.
+REINDEX_DEBOUNCE = 2.0
+_reindex_queue: "asyncio.Queue[str]" = asyncio.Queue()
+_reindex_pending: set = set()
+
+
+def _enqueue_reindex(meeting_id: str) -> None:
+    """Enqueue a meeting for background reindex (coalesced by meeting_id)."""
+    if meeting_id and meeting_id not in _reindex_pending:
+        _reindex_pending.add(meeting_id)
+        _reindex_queue.put_nowait(meeting_id)
+
+
+async def _reindex_worker():
+    """Background worker: consume meeting_ids from the queue, debounce briefly
+    to let a burst of edits coalesce, then reindex once. `mid` is discarded
+    from `_reindex_pending` immediately after get() (NOT in a finally after the
+    reindex runs) so an edit made DURING the reindex re-enqueues and is not
+    lost — reindex freshness matters more here than in the tag worker."""
+    while True:
+        mid = await _reindex_queue.get()
+        _reindex_pending.discard(mid)
         try:
-            with _lock_for(meeting_id):
-                if meeting_id not in meetings:
-                    return  # deleted while queued — never resurrect points
-                get_qdrant().delete(
-                    collection_name=COLLECTION_NAME,
-                    points_selector=Filter(
-                        must=[FieldCondition(key="meeting_id",
-                                             match=MatchValue(value=meeting_id))]
-                    ),
-                )
-                segments = []
-                tp = out_dir / "transcript.json"
-                if tp.exists():
-                    segments = json.loads(tp.read_text(encoding="utf-8")).get("segments", [])
-                summary = {}
-                sp = out_dir / "summary.json"
-                if sp.exists():
-                    summary = json.loads(sp.read_text(encoding="utf-8"))
-                store_in_qdrant(meeting_id, m, segments, summary)
+            await asyncio.sleep(REINDEX_DEBOUNCE)
+            await asyncio.to_thread(_reindex_now, mid)
         except Exception as e:
-            logger.warning(f"[{meeting_id}] Vector reindex failed (non-fatal): {e}")
+            logger.warning(f"reindex worker error (non-fatal): {e}")
+        finally:
+            _reindex_queue.task_done()
 
-    _run_bg(work)
+
+def _reindex_meeting_safe(meeting_id: str) -> None:
+    """Back-compat alias: existing callers fire-and-forget a reindex by name;
+    this now enqueues onto the coalescing queue instead of spawning its own
+    executor job."""
+    _enqueue_reindex(meeting_id)
 
 
 # ---------------------------------------------------------------------------
@@ -4925,6 +4964,83 @@ async def _capture_gc_worker():
         await asyncio.sleep(24 * 60 * 60)
 
 
+def _sidecar_gc() -> None:
+    """Sweep sidecars orphaned when their parent note (or attachment) was
+    deleted without the sidecar being cleaned up: (A) attachment
+    `.extracted/<stored>.json` sidecars, (B) `.analysis/<note_id>.json`, and
+    (C) per-note entries in `.enhance_state.json`. Meeting sidecars are out of
+    scope here — delete_meeting rmtree's the whole output_dir already.
+
+    Liveness is always read from DISK, never the in-memory index: notes
+    liveness is a fresh (force=True) notes_store.get_index() scan of the
+    actual .md files under NOTES_DIR (which excludes .trash/attachments —
+    see notes_store._walk_notes), and attachment liveness is the attachment
+    file's own existence under attachments/. This avoids deleting a live
+    sidecar during an index-staleness window.
+
+    Sync/blocking (file IO over the bind mount) — callers offload it. Never
+    raises: a GC error is logged and swallowed so it can't take the app down.
+    """
+    removed = {"analysis": 0, "enhance_state": 0, "extracted": 0}
+    try:
+        live_note_ids = set(notes_store.get_index(notes_store.NOTES_DIR, force=True).keys())
+        attach_dir = notes_store.attachments_dir(notes_store.NOTES_DIR)
+
+        # (B) .analysis/<note_id>.json — orphaned when the note is gone
+        analysis_dir = attach_dir / ".analysis"
+        if analysis_dir.is_dir():
+            for f in analysis_dir.glob("*.json"):
+                if f.stem not in live_note_ids:
+                    try:
+                        f.unlink()
+                        removed["analysis"] += 1
+                    except OSError:
+                        pass
+
+        # (C) .enhance_state.json — prune keys for notes no longer on disk
+        state_path = _enhance_state_path()
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                state = None
+            if isinstance(state, dict):
+                pruned = {k: v for k, v in state.items() if k in live_note_ids}
+                if len(pruned) != len(state):
+                    removed["enhance_state"] = len(state) - len(pruned)
+                    _atomic_write(state_path, json.dumps(pruned, indent=2))
+
+        # (A) .extracted/<stored>.json — orphaned when the attachment file itself is gone
+        extracted_dir = attach_dir / extract.EXTRACTED_DIRNAME
+        if extracted_dir.is_dir():
+            for f in extracted_dir.glob("*.json"):
+                stored_name = f.name[:-len(".json")] if f.name.endswith(".json") else f.name
+                if not (attach_dir / stored_name).exists():
+                    try:
+                        f.unlink()
+                        removed["extracted"] += 1
+                    except OSError:
+                        pass
+    except Exception as e:
+        logger.warning(f"Sidecar GC failed (non-fatal): {e}")
+        return
+    logger.info(
+        f"Sidecar GC: removed {removed['analysis']} orphaned .analysis, "
+        f"{removed['enhance_state']} orphaned .enhance_state entries, "
+        f"{removed['extracted']} orphaned .extracted sidecars"
+    )
+
+
+async def _sidecar_gc_worker():
+    """Sweep orphaned note/attachment sidecars on startup and once a day thereafter."""
+    while True:
+        try:
+            await asyncio.to_thread(_sidecar_gc)
+        except Exception as e:
+            logger.warning(f"Sidecar GC worker failed (non-fatal): {e}")
+        await asyncio.sleep(24 * 60 * 60)
+
+
 class CaptureStartRequest(BaseModel):
     sid: str
     mimeType: Optional[str] = "audio/webm"
@@ -5792,6 +5908,29 @@ def _deindex_note_safe(note_id: str) -> None:
     _run_bg(work)
 
 
+def _prune_note_sidecars_eager(note_id: str) -> None:
+    """Best-effort, offloaded cleanup of this note's .analysis sidecar and
+    .enhance_state.json entry right after deletion, so a single note delete
+    doesn't have to wait for the next 24h _sidecar_gc_worker sweep. Attachment
+    .extracted sidecars are left to the sweep (their liveness is keyed off the
+    attachment file, not the note)."""
+    def work():
+        try:
+            p = _analysis_path(note_id)
+            if p.exists():
+                p.unlink()
+        except OSError as e:
+            logger.warning(f"Analysis sidecar prune failed for {note_id} (non-fatal): {e}")
+        try:
+            state = _enhance_state()
+            if note_id in state:
+                del state[note_id]
+                _save_enhance_state(state)
+        except Exception as e:
+            logger.warning(f"Enhance-state prune failed for {note_id} (non-fatal): {e}")
+    _run_bg(work)
+
+
 def _enqueue_tag(note_id: str) -> None:
     """Enqueue a note for background tagging (coalesced by note_id)."""
     if note_id and note_id not in _tag_pending:
@@ -6249,6 +6388,7 @@ async def api_delete_note(note_id: str):
     if not notes_store.delete_note(notes_store.NOTES_DIR, note_id):
         raise HTTPException(status_code=404, detail="Note not found")
     _deindex_note_safe(note_id)
+    _prune_note_sidecars_eager(note_id)
     return {"deleted": True}
 
 
@@ -6769,16 +6909,22 @@ async def api_tasks_calendar_ics(token: str = ""):
 # mutable state lives in task_overlay.json beside the meeting, keyed by the
 # action item's index in summary.json.
 
-def _require_meeting_index(meeting_id: str, index: int) -> None:
+async def _require_meeting_index(meeting_id: str, index: int) -> None:
     if meeting_id not in meetings:
         raise HTTPException(status_code=404, detail="Meeting not found")
-    if index < 0 or index >= _meeting_action_item_count(meeting_id):
+    # summary.json read (_meeting_action_item_count) is blocking file IO on the
+    # bind mount; offload it. The 404 raises stay on-loop (never raise inside
+    # the executor thread).
+    count = await asyncio.get_event_loop().run_in_executor(
+        None, _meeting_action_item_count, meeting_id
+    )
+    if index < 0 or index >= count:
         raise HTTPException(status_code=404, detail="Task not found")
 
 
 @app.post("/api/meetings/{meeting_id}/tasks/toggle")
 async def api_meeting_task_toggle(meeting_id: str, payload: MeetingTaskToggle):
-    _require_meeting_index(meeting_id, payload.index)
+    await _require_meeting_index(meeting_id, payload.index)
 
     # Overlay load+mutate+save is blocking file IO on the bind mount; run the
     # whole unit off the event loop.
@@ -6802,7 +6948,7 @@ async def api_meeting_task_toggle(meeting_id: str, payload: MeetingTaskToggle):
 async def api_meeting_task_state(meeting_id: str, payload: MeetingTaskState):
     if payload.state not in ("open", "doing", "done"):
         raise HTTPException(status_code=400, detail="Invalid state")
-    _require_meeting_index(meeting_id, payload.index)
+    await _require_meeting_index(meeting_id, payload.index)
 
     def _do():
         ov = _load_meeting_overlay(meeting_id)
@@ -6821,7 +6967,7 @@ async def api_meeting_task_state(meeting_id: str, payload: MeetingTaskState):
 async def api_meeting_task_edit(meeting_id: str, payload: MeetingTaskEdit):
     if not (payload.text or "").strip():
         raise HTTPException(status_code=400, detail="Task text is required")
-    _require_meeting_index(meeting_id, payload.index)
+    await _require_meeting_index(meeting_id, payload.index)
 
     def _do():
         ov = _load_meeting_overlay(meeting_id)
@@ -6841,7 +6987,7 @@ async def api_meeting_task_edit(meeting_id: str, payload: MeetingTaskEdit):
 
 @app.delete("/api/meetings/{meeting_id}/tasks")
 async def api_meeting_task_dismiss(meeting_id: str, payload: MeetingTaskDismiss):
-    _require_meeting_index(meeting_id, payload.index)
+    await _require_meeting_index(meeting_id, payload.index)
 
     def _do():
         ov = _load_meeting_overlay(meeting_id)

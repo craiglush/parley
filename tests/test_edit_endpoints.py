@@ -3,14 +3,20 @@ PUT segment text, and the _reindex_meeting_safe delete->re-store cycle.
 
 Harness mirrors tests/test_meeting_routes.py (bare TestClient so startup events
 never fire; MEETINGS_DIR / meetings / get_qdrant / get_embedder monkeypatched)
-with two additions required to observe re-indexing without live services
+with additions required to observe re-indexing without live services
 (design spec, Testing section):
-  * app._run_bg is patched to run inline, so fire-and-forget reindex work is
-    deterministic;
+  * app._run_bg is patched to run inline (still used by unrelated
+    fire-and-forget paths in app.py, e.g. the a360 push);
   * vector.get_qdrant / vector.get_embedder are patched to the SAME fakes,
     because store_in_qdrant resolves those names in the vector module's own
     namespace (vector.py:126-129) — app-level patches alone would let the
     upsert half hit real httpx/Qdrant.
+  * reindex jobs are now coalesced onto app._reindex_queue and consumed by
+    app._reindex_worker (a real background asyncio task started at app
+    startup, which never fires in this bare-TestClient harness). Tests that
+    need the effect of a reindex call the `_drain_reindex(app)` helper below,
+    which synchronously runs every currently-queued job the same way the
+    worker eventually would (minus its debounce sleep).
 """
 
 import json
@@ -83,9 +89,27 @@ def _client(tmp_path, monkeypatch):
     # store_in_qdrant resolves these in vector's namespace — patch there too.
     monkeypatch.setattr(vector, "get_qdrant", lambda: fake_q)
     monkeypatch.setattr(vector, "get_embedder", lambda: _FakeEmbedder())
-    # Run fire-and-forget reindex work inline so its effects are deterministic.
+    # Run fire-and-forget non-reindex background work inline so its effects
+    # are deterministic (reindex itself now goes through the coalescing
+    # queue — see _drain_reindex).
     monkeypatch.setattr(app, "_run_bg", lambda fn, *a: fn(*a))
+    # Fresh reindex queue/pending-set per test: these are real module globals
+    # (not monkeypatched, since _reindex_worker needs the live objects), so
+    # clear any leftovers from a previous test.
+    app._reindex_pending.clear()
+    while not app._reindex_queue.empty():
+        app._reindex_queue.get_nowait()
     return TestClient(app.app), app, fake_q
+
+
+def _drain_reindex(app):
+    """Synchronously run every currently-queued reindex job, mirroring what
+    app._reindex_worker would eventually do minus its debounce sleep. Safe to
+    call even when the queue is empty."""
+    while not app._reindex_queue.empty():
+        mid = app._reindex_queue.get_nowait()
+        app._reindex_pending.discard(mid)
+        app._reindex_now(mid)
 
 
 SEGMENTS = [
@@ -146,6 +170,7 @@ def test_reindex_deletes_by_meeting_filter_then_restores(tmp_path, monkeypatch):
     client, app, fake_q = _client(tmp_path, monkeypatch)
     _seed_editable(app, tmp_path, mid="m1")
     app._reindex_meeting_safe("m1")
+    _drain_reindex(app)
     # Exactly one delete call, targeting exactly this meeting's points.
     assert len(fake_q.deleted) == 1
     coll, selector = fake_q.deleted[0]
@@ -165,27 +190,27 @@ def test_reindex_twice_does_not_duplicate_points(tmp_path, monkeypatch):
     client, app, fake_q = _client(tmp_path, monkeypatch)
     _seed_editable(app, tmp_path, mid="m1")
     app._reindex_meeting_safe("m1")
+    _drain_reindex(app)
     once = len(fake_q.points.get("meetings", []))
     assert once > 0
     app._reindex_meeting_safe("m1")
+    _drain_reindex(app)
     assert len(fake_q.points.get("meetings", [])) == once
 
 
 def test_reindex_skips_meeting_deleted_while_queued(tmp_path, monkeypatch):
     client, app, fake_q = _client(tmp_path, monkeypatch)
     _seed_editable(app, tmp_path, mid="m1")
-    # Capture the queued worker instead of running it inline.
-    queued = []
-    monkeypatch.setattr(app, "_run_bg", lambda fn, *a: queued.append(lambda: fn(*a)))
-    app._reindex_meeting_safe("m1")
-    del app.meetings["m1"]          # meeting deleted before the job runs
-    queued[0]()                     # now run the stale job
+    app._reindex_meeting_safe("m1")   # enqueue, but don't run the job yet
+    del app.meetings["m1"]            # meeting deleted before the job runs
+    _drain_reindex(app)               # now run the stale job
     # The worker must bail inside the lock: no delete, no resurrected points.
     assert fake_q.deleted == []
     assert fake_q.points.get("meetings", []) == []
     # Unknown id is a silent no-op too (captures nothing new).
     app._reindex_meeting_safe("never-existed")
-    assert len(queued) == 1
+    _drain_reindex(app)
+    assert fake_q.deleted == []
 
 
 def test_reindex_failure_is_nonfatal(tmp_path, monkeypatch):
@@ -196,7 +221,22 @@ def test_reindex_failure_is_nonfatal(tmp_path, monkeypatch):
         raise RuntimeError("qdrant down")
 
     monkeypatch.setattr(fake_q, "delete", _boom)
-    app._reindex_meeting_safe("m1")   # must not raise (warning logged)
+    app._reindex_meeting_safe("m1")
+    _drain_reindex(app)   # must not raise (warning logged)
+
+
+def test_reindex_burst_coalesces_to_single_run(tmp_path, monkeypatch):
+    """3 rapid edits to the same meeting must coalesce into ONE queued job
+    (and therefore one reindex run), not three."""
+    client, app, fake_q = _client(tmp_path, monkeypatch)
+    _seed_editable(app, tmp_path, mid="m1")
+    app._reindex_meeting_safe("m1")
+    app._reindex_meeting_safe("m1")
+    app._reindex_meeting_safe("m1")
+    assert app._reindex_queue.qsize() == 1
+    assert "m1" in app._reindex_pending
+    _drain_reindex(app)
+    assert len(fake_q.deleted) == 1, "burst of 3 edits must coalesce to one reindex run"
 
 
 def test_delete_meeting_endpoint_still_works_with_lock(tmp_path, monkeypatch):
@@ -240,6 +280,7 @@ def test_patch_title_success_rewrites_record_files_and_vectors(tmp_path, monkeyp
     assert (out / "summary.md").read_text().splitlines()[0] == "# Beta Launch Sync"
     assert (out / "transcript.md").read_text().splitlines()[0] == "# Transcript: Beta Launch Sync"
     # reindexed: delete targeted this meeting; new payloads carry the new title
+    _drain_reindex(app)
     assert fake_q.deleted and fake_q.deleted[0][1].must[0].match.value == "m1"
     payloads = _payloads(fake_q)
     assert payloads and all(p["title"] == "Beta Launch Sync" for p in payloads)
@@ -321,6 +362,7 @@ def test_put_summary_field_success(tmp_path, monkeypatch, field, value, expect_t
     assert expect_text in (out / "summary.md").read_text()
     assert app.meetings["m1"]["summary"][field] == expected_value
     # reindexed payloads contain the edited text and no longer the replaced text
+    _drain_reindex(app)
     assert fake_q.deleted, "expected a vector delete->re-store"
     texts = " ".join(p["text"] for p in _payloads(fake_q))
     assert expect_text in texts
@@ -412,6 +454,7 @@ def test_put_segment_success_rewrites_files_and_reindexes(tmp_path, monkeypatch)
     # raw_transcript.json (pre-cleanup source) deliberately untouched
     assert not (out / "raw_transcript.json").exists()
     # reindexed with the edited text only
+    _drain_reindex(app)
     assert fake_q.deleted, "expected a vector delete->re-store"
     texts = " ".join(p["text"] for p in _payloads(fake_q))
     assert "next Tuesday" in texts and "on Friday" not in texts
@@ -456,6 +499,7 @@ def test_speaker_edits_reindex(tmp_path, monkeypatch, method, path, body):
     rec, out = _seed_editable(app, tmp_path, mid="m1")
     r = getattr(client, method)(path, json=body)
     assert r.status_code == 200, r.text
+    _drain_reindex(app)
     assert fake_q.deleted, "speaker edits must delete->re-store vectors"
     assert fake_q.deleted[0][1].must[0].match.value == "m1"
     payloads = _payloads(fake_q)
@@ -479,6 +523,7 @@ def test_reprocess_step_reindexes_on_success(tmp_path, monkeypatch):
         s = client.get("/meetings/m1/status").json()
         if done.get("ran") and s["status"] == "complete":
             break
+    _drain_reindex(app)
     assert fake_q.deleted, "reprocess success path must delete->re-store vectors"
     texts = " ".join(p["text"] for p in _payloads(fake_q))
     assert "Reprocessed summary text." in texts   # vectors reflect the NEW summary.json

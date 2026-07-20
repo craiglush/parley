@@ -289,8 +289,12 @@
     }
   }
 
-  async function pushMeetingToNote(idx) {
-    const t = allTasks[idx]; if (!t || t.source !== 'meeting') return;
+  // Accepts either a numeric index into allTasks (list view, unchanged call sites)
+  // or an already-resolved task object (board view, which addresses by stable ref --
+  // see taskFromEl -- and resolves to a task before calling in).
+  async function pushMeetingToNote(idxOrTask) {
+    const t = (idxOrTask && typeof idxOrTask === 'object') ? idxOrTask : allTasks[idxOrTask];
+    if (!t || t.source !== 'meeting') return;
     if (!allNotes.length) { try { allNotes = (await api('/api/notes')).notes || []; } catch (e) {} }
     const items = allNotes.map((n) => '<div class="nt-modal-list-item" data-note="' + esc(n.id) + '">' + esc(n.title) + '<div class="sub">' + esc(n.folder || 'root') + '</div></div>').join('');
     const m = modal('<h3>Push “' + esc(t.source_title) + '” action items to…</h3>'
@@ -317,8 +321,11 @@
     });
   }
 
-  function openTaskSource(idx) {
-    const t = allTasks[idx]; if (!t) return;
+  // See pushMeetingToNote above: accepts a numeric index (list view) or a resolved
+  // task object (board view).
+  function openTaskSource(idxOrTask) {
+    const t = (idxOrTask && typeof idxOrTask === 'object') ? idxOrTask : allTasks[idxOrTask];
+    if (!t) return;
     if (t.source === 'note') { setActivePillar('notes'); openNote(t.source_id); }
     else { setActivePillar('meetings'); if (typeof window.openMeeting === 'function') { try { window.openMeeting(t.source_id); } catch (e) {} } }
   }
@@ -471,6 +478,19 @@
     return ref.source === 'note' ? task.line === ref.line : task.index === ref.index;
   }
 
+  // Board cards address their task by a stable ref (source + source_id + line/index),
+  // NOT by array index into allTasks -- a mid-drag loadTasks() re-render can reassign
+  // allTasks (409-recovery at ~line 626, background refresh at ~line 1411), which would
+  // invalidate a numeric index but not a stable ref. refFromEl reads the ref straight off
+  // the card's dataset; taskFromEl resolves it to the CURRENT task via refMatches.
+  function refFromEl(el) {
+    const d = el.dataset;
+    return { source: d.src, source_id: d.sid, line: d.src === 'note' ? +d.key : undefined, index: d.src === 'meeting' ? +d.key : undefined };
+  }
+  function taskFromEl(el) {
+    return allTasks.find((t) => refMatches(t, refFromEl(el)));
+  }
+
   function setTasksView(view) {
     tasksView = view === 'board' ? 'board' : 'list';
     localStorage.setItem('tasks-view', tasksView);
@@ -514,11 +534,14 @@
     const owner = t.owner ? '<span class="task-chip owner">@' + esc(t.owner) + '</span>' : '';
     const srcIcon = isNote ? '📝' : '🎙';
     const focus = boardFocusRefs.some((r) => refMatches(t, r)) ? ' focus-pulse' : '';
-    const pushBtn = isNote ? '' : '<button class="task-mini-btn" data-push="' + idx + '" title="Copy into a note">→</button>';
-    return '<div class="board-card' + focus + '" draggable="true" data-card="' + idx + '">'
-      + '<div class="board-card-text" data-open-source="' + idx + '">' + esc(t.text) + '</div>'
+    const key = isNote ? t.line : t.index;
+    const pushBtn = isNote ? '' : '<button class="task-mini-btn" data-push title="Copy into a note">→</button>';
+    // data-card is a plain marker (drag/closest() target); the stable ref lives in
+    // data-src/data-sid/data-key -- see refFromEl/taskFromEl above.
+    return '<div class="board-card' + focus + '" draggable="true" data-card data-src="' + t.source + '" data-sid="' + esc(t.source_id) + '" data-key="' + key + '">'
+      + '<div class="board-card-text" data-open-source>' + esc(t.text) + '</div>'
       + '<div class="task-meta">' + due + prio + owner + '<span class="task-chip source">' + srcIcon + ' ' + esc(t.source_title || t.source) + '</span></div>'
-      + '<div class="board-card-actions"><button class="task-mini-btn board-move-btn" data-move="' + idx + '" title="Move to…">⋮</button>' + pushBtn + '</div>'
+      + '<div class="board-card-actions"><button class="task-mini-btn board-move-btn" data-move title="Move to…">⋮</button>' + pushBtn + '</div>'
       + '</div>';
   }
 
@@ -563,8 +586,9 @@
   }
 
   // ---- drag & drop + move menu ----
-  async function applyKanbanDrop(idx, lane) {
-    const t = allTasks[idx]; if (!t) return;
+  async function applyKanbanDrop(ref, lane) {
+    const t = allTasks.find((x) => refMatches(x, ref));
+    if (!t) { toast('That task moved — refreshing', 'error'); loadTasks(); return; }
     const today = todayStr();
     if (window.KanbanLogic.laneForTask(t, today) === lane) return;
     const action = window.KanbanLogic.dropActionFor(t, lane, today);
@@ -611,20 +635,20 @@
     }
   }
 
-  function openMoveMenu(idx) {
+  function openMoveMenu(ref) {
     const m = modal('<h3>Move to…</h3><div class="nt-modal-list">'
       + LANE_DEFS.filter((l) => l.key !== 'overdue').map((l) => '<div class="nt-modal-list-item" data-lane="' + l.key + '">' + esc(l.label) + '</div>').join('')
       + '</div><div class="nt-modal-actions"><button class="nt-modal-btn" data-cancel>Cancel</button></div>');
     m.q('[data-cancel]').onclick = m.close;
-    m.el.querySelectorAll('[data-lane]').forEach((el) => { el.onclick = () => { m.close(); applyKanbanDrop(idx, el.dataset.lane); }; });
+    m.el.querySelectorAll('[data-lane]').forEach((el) => { el.onclick = () => { m.close(); applyKanbanDrop(ref, el.dataset.lane); }; });
   }
 
   function initBoardDnD() {
     const wrap = $('boardLanes'); if (!wrap) return;
-    let dragIdx = null;
+    let dragRef = null;
     wrap.addEventListener('dragstart', (e) => {
       const card = e.target.closest('[data-card]'); if (!card) return;
-      dragIdx = +card.dataset.card;
+      dragRef = refFromEl(card);
       e.dataTransfer.effectAllowed = 'move';
     });
     wrap.addEventListener('dragover', (e) => {
@@ -635,17 +659,17 @@
     });
     wrap.addEventListener('dragleave', (e) => { const body = e.target.closest('[data-lane-drop]'); if (body) body.classList.remove('drag-over'); });
     wrap.addEventListener('drop', (e) => {
-      const body = e.target.closest('[data-lane-drop]'); if (!body || dragIdx == null) return;
+      const body = e.target.closest('[data-lane-drop]'); if (!body || dragRef == null) return;
       e.preventDefault();
       body.classList.remove('drag-over');
       const lane = body.dataset.laneDrop;
-      const idx = dragIdx; dragIdx = null;
-      if (lane !== 'overdue') applyKanbanDrop(idx, lane);
+      const ref = dragRef; dragRef = null;
+      if (lane !== 'overdue') applyKanbanDrop(ref, lane);
     });
     wrap.addEventListener('click', (e) => {
-      const mv = e.target.closest('[data-move]'); if (mv) { openMoveMenu(+mv.dataset.move); return; }
-      const push = e.target.closest('[data-push]'); if (push) { pushMeetingToNote(+push.dataset.push); return; }
-      const src = e.target.closest('[data-open-source]'); if (src) { openTaskSource(+src.dataset.openSource); return; }
+      const mv = e.target.closest('[data-move]'); if (mv) { const card = mv.closest('[data-card]'); if (card) openMoveMenu(refFromEl(card)); return; }
+      const push = e.target.closest('[data-push]'); if (push) { const card = push.closest('[data-card]'); const t = card && taskFromEl(card); if (t) pushMeetingToNote(t); return; }
+      const src = e.target.closest('[data-open-source]'); if (src) { const card = src.closest('[data-card]'); const t = card && taskFromEl(card); if (t) openTaskSource(t); return; }
     });
   }
 
