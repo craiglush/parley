@@ -349,6 +349,7 @@ def _digest_text(data: dict, link: str) -> str:
 
     # Footer
     lines.append(f"Open the task board: {link}")
+    lines.append("Sent automatically by the Meeting Service.")
 
     return "\n".join(lines)
 

@@ -85,6 +85,13 @@ def _date_plus_days(date_str: str, days: int) -> str:
     return (date(y, m, d) + timedelta(days=days)).isoformat()
 
 
+def _task_state(t) -> str:
+    """Derive a task's lane state, falling back to the legacy `done` bool when `state`
+    is absent. Shared by filter_tasks and sort_tasks (NOT build_digest_snapshot, whose
+    fallback is deliberately simpler -- see its docstring)."""
+    return t.get("state") or ("done" if t.get("done") else "open")
+
+
 def filter_tasks(tasks, *, status=None, owner=None, source=None, due=None, today=None) -> list:
     """Filter tasks. status: open|doing|done. due: overdue|today|week (requires today=YYYY-MM-DD)."""
     out = []
@@ -93,7 +100,7 @@ def filter_tasks(tasks, *, status=None, owner=None, source=None, due=None, today
             continue
         if status == "done" and not t["done"]:
             continue
-        if status == "doing" and (t.get("state") or ("done" if t.get("done") else "open")) != "doing":
+        if status == "doing" and _task_state(t) != "doing":
             continue
         if owner is not None and (t.get("owner") or "") != owner:
             continue
@@ -117,7 +124,7 @@ def sort_tasks(tasks) -> list:
     """Open before done; within open, doing before not-doing; then due (none last),
     then priority (high first), then text."""
     def key(t):
-        state = t.get("state") or ("done" if t.get("done") else "open")
+        state = _task_state(t)
         return (
             bool(t.get("done")),
             0 if state == "doing" else 1,
@@ -227,7 +234,7 @@ def format_task_line(text: str, owner=None, due=None, priority=None, done: bool 
     """Render a GFM checkbox task line from explicit fields (text + optional metadata).
     `state` ('open'|'doing'|'done') takes precedence over the legacy `done` bool when
     given, so every existing done=True/False call site keeps working unchanged."""
-    mark = _STATE_TO_MARK.get(state) if state in _STATE_TO_MARK else ("x" if done else " ")
+    mark = _STATE_TO_MARK.get(state, "x" if done else " ")
     return f"- [{mark}] " + _task_remainder(text, owner, due, priority)
 
 

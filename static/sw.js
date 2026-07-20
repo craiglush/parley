@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v18-kanban';
+const CACHE_NAME = 'meetings-v19-board-polish';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.

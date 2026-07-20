@@ -24,6 +24,20 @@ def test_build_digest_snapshot_buckets():
     assert [t["text"] for t in snap["lanes"]["week"]] == ["week1"]
 
 
+def test_build_digest_snapshot_week_boundary_inclusive():
+    """due == today+6 is the last day still in the 'week' lane; due == today+7 falls
+    out of the digest entirely (later/omitted, per v1 digest scope)."""
+    today = "2026-07-17"
+    tasks = [
+        {"text": "boundary_in", "done": False, "state": "open", "due": "2026-07-23"},   # today+6
+        {"text": "boundary_out", "done": False, "state": "open", "due": "2026-07-24"},  # today+7
+    ]
+    snap = ts.build_digest_snapshot(tasks, today)
+    assert [t["text"] for t in snap["lanes"]["week"]] == ["boundary_in"]
+    all_lane_texts = {t["text"] for lane in snap["lanes"].values() for t in lane}
+    assert "boundary_out" not in all_lane_texts
+
+
 def test_build_digest_snapshot_ignores_done_and_no_state_key():
     tasks = [{"text": "legacy open", "done": False, "due": "2026-07-10"}]  # no "state" key
     snap = ts.build_digest_snapshot(tasks, "2026-07-17")

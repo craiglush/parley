@@ -2561,7 +2561,7 @@ async def process_meeting(meeting_id: str):
             try:
                 a360.post_meeting_completed(_a360_completion_payload(m))
             except Exception as e:
-                logger.warning(f"a360 push failed (non-fatal): {e}")
+                logger.warning(f"a360 push failed (non-fatal) [{m.get('id')}]: {e}")
         _run_bg(_a360_push)
 
     except Exception as e:
@@ -3486,6 +3486,13 @@ async def delete_meeting(meeting_id: str):
         # takes to release it.
         def _locked_delete():
             with _lock_for(meeting_id):
+                # Re-check membership now that we hold the per-meeting lock --
+                # mirrors _reindex_meeting_safe's "deleted while queued" guard
+                # above, so a second/losing caller (however it got here) can
+                # never KeyError on an already-removed meeting.
+                if meeting_id not in meetings:
+                    return False
+
                 # Delete vectors from Qdrant (best-effort)
                 try:
                     qdrant = get_qdrant()
@@ -3512,11 +3519,14 @@ async def delete_meeting(meeting_id: str):
                         if s.get("meeting_id") != meeting_id
                     ]
 
-                del meetings[meeting_id]
+                meetings.pop(meeting_id, None)
                 _save_index()
+                return True
 
-        await asyncio.to_thread(_locked_delete)
+        deleted = await asyncio.to_thread(_locked_delete)
 
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Meeting not found")
     return {"detail": f"Meeting {meeting_id} deleted"}
 
 
@@ -6437,17 +6447,22 @@ def _collect_meeting_tasks() -> list:
     return out
 
 
-async def _collect_all_tasks() -> list:
+async def _collect_all_task_dicts() -> list:
     """Collect every note + meeting task, off the event loop (blocking file IO over
-    the slow bind-mount, same reasoning as the inline closure below). Shared by every
-    endpoint that needs the full task list -- POST /api/digest/test (via
-    _build_digest_email), GET /api/tasks/calendar.ics, and POST /api/tasks/ai/
-    triage -- so that collection + executor-hop pattern lives in one place instead
-    of being duplicated a 2nd/3rd/4th time (GET /api/tasks keeps its own inline
-    closure, unchanged)."""
+    the slow bind-mount). Shared by every endpoint that needs the full task list --
+    POST /api/digest/test (via _build_digest_email), GET /api/tasks/calendar.ics,
+    POST /api/tasks/ai/triage, and GET /api/tasks -- so the collection + executor-hop
+    pattern lives in exactly one place."""
     def _collect():
         return _collect_note_tasks() + _collect_meeting_tasks()
     return await asyncio.get_event_loop().run_in_executor(None, _collect)
+
+
+async def _collect_all_tasks() -> list:
+    """Back-compat alias of _collect_all_task_dicts (kept so existing call sites --
+    POST /api/digest/test, GET /api/tasks/calendar.ics, POST /api/tasks/ai/triage --
+    don't need to change)."""
+    return await _collect_all_task_dicts()
 
 
 @app.get("/api/tasks")
@@ -6456,9 +6471,7 @@ async def api_list_tasks(status: Optional[str] = None, owner: Optional[str] = No
     # Collection is blocking file IO over the slow bind-mount on cold/changed
     # paths; run it off the event loop like its api_list_notes /
     # api_export_notes siblings so a cold vault can't stall every request.
-    def _collect():
-        return _collect_note_tasks() + _collect_meeting_tasks()
-    tasks = await asyncio.get_event_loop().run_in_executor(None, _collect)
+    tasks = await _collect_all_task_dicts()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     tasks = tasks_store.filter_tasks(tasks, status=status, owner=owner, source=source, due=due, today=today)
     return {"tasks": tasks_store.sort_tasks(tasks)}
@@ -6466,14 +6479,24 @@ async def api_list_tasks(status: Optional[str] = None, owner: Optional[str] = No
 
 @app.post("/api/tasks/toggle")
 async def api_toggle_task(payload: TaskToggle):
-    rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
-    if rec is None:
+    # Vault read-modify-write is blocking file IO on the bind mount; run the whole
+    # unit off the event loop so it stays atomic w.r.t. the executor thread, then
+    # translate the result to 404/409 back on the loop.
+    def _do():
+        rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
+        if rec is None:
+            return "not_found"
+        new_body, ok = tasks_store.toggle_line(rec["body"], payload.line, payload.done,
+                                               expected_text=payload.expected_text)
+        if not ok:
+            return "conflict"
+        notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+        return "ok"
+    status = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if status == "not_found":
         raise HTTPException(status_code=404, detail="Note not found")
-    new_body, ok = tasks_store.toggle_line(rec["body"], payload.line, payload.done,
-                                           expected_text=payload.expected_text)
-    if not ok:
+    if status == "conflict":
         raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
-    notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
     return {"ok": True}
 
 
@@ -6481,14 +6504,22 @@ async def api_toggle_task(payload: TaskToggle):
 async def api_set_task_state(payload: TaskState):
     if payload.state not in ("open", "doing", "done"):
         raise HTTPException(status_code=400, detail="Invalid state")
-    rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
-    if rec is None:
+
+    def _do():
+        rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
+        if rec is None:
+            return "not_found"
+        new_body, ok = tasks_store.set_state_line(rec["body"], payload.line, payload.state,
+                                                  expected_text=payload.expected_text)
+        if not ok:
+            return "conflict"
+        notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+        return "ok"
+    status = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if status == "not_found":
         raise HTTPException(status_code=404, detail="Note not found")
-    new_body, ok = tasks_store.set_state_line(rec["body"], payload.line, payload.state,
-                                              expected_text=payload.expected_text)
-    if not ok:
+    if status == "conflict":
         raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
-    notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
     return {"ok": True}
 
 
@@ -6510,12 +6541,16 @@ def _find_or_create_tasks_inbox() -> str:
 async def api_create_task(payload: TaskCreate):
     if not (payload.text or "").strip():
         raise HTTPException(status_code=400, detail="Task text is required")
-    note_id = payload.note_id or _find_or_create_tasks_inbox()
-    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
-        raise HTTPException(status_code=404, detail="Note not found")
-    line = tasks_store.format_task_line(payload.text, owner=payload.owner,
-                                        due=payload.due, priority=payload.priority)
-    rec = notes_store.append_task_line(notes_store.NOTES_DIR, note_id, line)
+
+    def _do():
+        note_id = payload.note_id or _find_or_create_tasks_inbox()
+        if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+            return note_id, None
+        line = tasks_store.format_task_line(payload.text, owner=payload.owner,
+                                            due=payload.due, priority=payload.priority)
+        rec = notes_store.append_task_line(notes_store.NOTES_DIR, note_id, line)
+        return note_id, rec
+    note_id, rec = await asyncio.get_event_loop().run_in_executor(None, _do)
     if rec is None:
         raise HTTPException(status_code=404, detail="Note not found")
     _index_note_safe(rec)
@@ -6598,8 +6633,7 @@ async def api_tasks_ai_triage():
     indices back to task refs server-side. Never auto-applies -- the UI renders
     Apply/Dismiss per suggestion."""
     tasks = await _collect_all_tasks()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    open_tasks = tasks_store.filter_tasks(tasks, status="open", today=today)
+    open_tasks = tasks_store.filter_tasks(tasks, status="open")
     open_tasks = tasks_store.sort_tasks(open_tasks)[:80]
     default = {"suggestions": [], "focus": []}
     if not open_tasks:
@@ -6651,14 +6685,15 @@ async def api_tasks_ai_triage():
                 continue
             suggestions.append({"ref": _task_ref(open_tasks[idx]), "priority": prio,
                                 "reason": str(s.get("reason") or "").strip()})
-        focus = []
-        for idx in (parsed.get("focus") or [])[:3]:
+        focus_refs = []
+        for idx in parsed.get("focus") or []:
             try:
                 idx = int(idx)
             except (TypeError, ValueError):
                 continue
             if 0 <= idx < n:
-                focus.append(_task_ref(open_tasks[idx]))
+                focus_refs.append(_task_ref(open_tasks[idx]))
+        focus = focus_refs[:3]
         return {"suggestions": suggestions, "focus": focus}
     except Exception as e:
         logger.warning(f"task triage failed (non-fatal): {e}")
@@ -6669,28 +6704,43 @@ async def api_tasks_ai_triage():
 async def api_update_task(payload: TaskUpdate):
     if not (payload.text or "").strip():
         raise HTTPException(status_code=400, detail="Task text is required")
-    rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
-    if rec is None:
+
+    def _do():
+        rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
+        if rec is None:
+            return "not_found"
+        new_body, ok = tasks_store.update_line(rec["body"], payload.line, payload.expected_text,
+                                               payload.text, owner=payload.owner,
+                                               due=payload.due, priority=payload.priority)
+        if not ok:
+            return "conflict"
+        notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+        return "ok"
+    status = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if status == "not_found":
         raise HTTPException(status_code=404, detail="Note not found")
-    new_body, ok = tasks_store.update_line(rec["body"], payload.line, payload.expected_text,
-                                           payload.text, owner=payload.owner,
-                                           due=payload.due, priority=payload.priority)
-    if not ok:
+    if status == "conflict":
         raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
-    notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
     return {"ok": True}
 
 
 @app.delete("/api/tasks")
 async def api_delete_task(payload: TaskDelete):
-    rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
-    if rec is None:
+    def _do():
+        rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
+        if rec is None:
+            return "not_found"
+        new_body, ok = tasks_store.delete_line(rec["body"], payload.line,
+                                               expected_text=payload.expected_text)
+        if not ok:
+            return "conflict"
+        notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+        return "ok"
+    status = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if status == "not_found":
         raise HTTPException(status_code=404, detail="Note not found")
-    new_body, ok = tasks_store.delete_line(rec["body"], payload.line,
-                                           expected_text=payload.expected_text)
-    if not ok:
+    if status == "conflict":
         raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
-    notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
     return {"ok": True}
 
 
@@ -6729,15 +6779,21 @@ def _require_meeting_index(meeting_id: str, index: int) -> None:
 @app.post("/api/meetings/{meeting_id}/tasks/toggle")
 async def api_meeting_task_toggle(meeting_id: str, payload: MeetingTaskToggle):
     _require_meeting_index(meeting_id, payload.index)
-    ov = _load_meeting_overlay(meeting_id)
-    entry = ov.get(str(payload.index)) or {}
-    entry["done"] = bool(payload.done)
-    # Toggle always lands cleanly on done/open, never doing -- mirrors the note-side
-    # toggle_line, which always rewrites the checkbox mark to 'x' or ' ' regardless
-    # of what it was before. Keeps entry["state"] from going stale after a toggle.
-    entry["state"] = "done" if payload.done else "open"
-    ov[str(payload.index)] = entry
-    if not _save_meeting_overlay(meeting_id, ov):
+
+    # Overlay load+mutate+save is blocking file IO on the bind mount; run the
+    # whole unit off the event loop.
+    def _do():
+        ov = _load_meeting_overlay(meeting_id)
+        entry = ov.get(str(payload.index)) or {}
+        entry["done"] = bool(payload.done)
+        # Toggle always lands cleanly on done/open, never doing -- mirrors the note-side
+        # toggle_line, which always rewrites the checkbox mark to 'x' or ' ' regardless
+        # of what it was before. Keeps entry["state"] from going stale after a toggle.
+        entry["state"] = "done" if payload.done else "open"
+        ov[str(payload.index)] = entry
+        return _save_meeting_overlay(meeting_id, ov)
+    saved = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if not saved:
         raise HTTPException(status_code=404, detail="Meeting not found")
     return {"ok": True}
 
@@ -6747,12 +6803,16 @@ async def api_meeting_task_state(meeting_id: str, payload: MeetingTaskState):
     if payload.state not in ("open", "doing", "done"):
         raise HTTPException(status_code=400, detail="Invalid state")
     _require_meeting_index(meeting_id, payload.index)
-    ov = _load_meeting_overlay(meeting_id)
-    entry = ov.get(str(payload.index)) or {}
-    entry["state"] = payload.state
-    entry["done"] = (payload.state == "done")   # keep the legacy done flag in lockstep
-    ov[str(payload.index)] = entry
-    if not _save_meeting_overlay(meeting_id, ov):
+
+    def _do():
+        ov = _load_meeting_overlay(meeting_id)
+        entry = ov.get(str(payload.index)) or {}
+        entry["state"] = payload.state
+        entry["done"] = (payload.state == "done")   # keep the legacy done flag in lockstep
+        ov[str(payload.index)] = entry
+        return _save_meeting_overlay(meeting_id, ov)
+    saved = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if not saved:
         raise HTTPException(status_code=404, detail="Meeting not found")
     return {"ok": True}
 
@@ -6762,15 +6822,19 @@ async def api_meeting_task_edit(meeting_id: str, payload: MeetingTaskEdit):
     if not (payload.text or "").strip():
         raise HTTPException(status_code=400, detail="Task text is required")
     _require_meeting_index(meeting_id, payload.index)
-    ov = _load_meeting_overlay(meeting_id)
-    entry = ov.get(str(payload.index)) or {}
-    entry["edited"] = True
-    entry["text"] = payload.text.strip()
-    entry["owner"] = (payload.owner or "").strip() or None
-    entry["due"] = (payload.due or "").strip() or None
-    entry["priority"] = (payload.priority or "").strip().lower() or None
-    ov[str(payload.index)] = entry
-    if not _save_meeting_overlay(meeting_id, ov):
+
+    def _do():
+        ov = _load_meeting_overlay(meeting_id)
+        entry = ov.get(str(payload.index)) or {}
+        entry["edited"] = True
+        entry["text"] = payload.text.strip()
+        entry["owner"] = (payload.owner or "").strip() or None
+        entry["due"] = (payload.due or "").strip() or None
+        entry["priority"] = (payload.priority or "").strip().lower() or None
+        ov[str(payload.index)] = entry
+        return _save_meeting_overlay(meeting_id, ov)
+    saved = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if not saved:
         raise HTTPException(status_code=404, detail="Meeting not found")
     return {"ok": True}
 
@@ -6778,11 +6842,15 @@ async def api_meeting_task_edit(meeting_id: str, payload: MeetingTaskEdit):
 @app.delete("/api/meetings/{meeting_id}/tasks")
 async def api_meeting_task_dismiss(meeting_id: str, payload: MeetingTaskDismiss):
     _require_meeting_index(meeting_id, payload.index)
-    ov = _load_meeting_overlay(meeting_id)
-    entry = ov.get(str(payload.index)) or {}
-    entry["deleted"] = True
-    ov[str(payload.index)] = entry
-    if not _save_meeting_overlay(meeting_id, ov):
+
+    def _do():
+        ov = _load_meeting_overlay(meeting_id)
+        entry = ov.get(str(payload.index)) or {}
+        entry["deleted"] = True
+        ov[str(payload.index)] = entry
+        return _save_meeting_overlay(meeting_id, ov)
+    saved = await asyncio.get_event_loop().run_in_executor(None, _do)
+    if not saved:
         raise HTTPException(status_code=404, detail="Meeting not found")
     return {"ok": True}
 

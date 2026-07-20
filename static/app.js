@@ -3586,7 +3586,7 @@ function renderSpeakerMapBar(segments, meetingId) {
     if (info && info.company) detailParts.push(info.company);
     const detailText = detailParts.length ? `<span class="speaker-chip-detail">(${escHtml(detailParts.join(', '))})</span>` : '';
     const nameText = info ? info.name : (currentSpeakerMap[sp] || '');
-    return `<span class="speaker-chip ${colorClass}" data-original="${escHtml(sp)}" title="Edit name, company, title" onclick="editSpeakerName(this, '${escHtml(sp)}', '${meetingId}')">
+    return `<span class="speaker-chip ${colorClass}" data-original="${escHtml(sp)}" title="Edit name, company, title" data-edit-speaker="${escHtml(sp)}" data-meeting="${escHtml(meetingId)}">
       <span class="speaker-chip-label">${escHtml(sp)}:</span>
       <span class="speaker-chip-name">${escHtml(nameText || 'click to rename')}${detailText}${autoStar}</span>
       <span class="pencil-btn" aria-hidden="true">&#9999;</span>
@@ -3656,6 +3656,14 @@ function editSpeakerName(chipEl, originalName, meetingId) {
 
   input.addEventListener('blur', save);
 }
+
+// Delegated click handler for speaker chips (avoids inline onclick w/ interpolated,
+// user/LLM-sourced speaker names — see data-edit-speaker / data-meeting attrs above).
+document.addEventListener('click', (e) => {
+  const chip = e.target.closest('[data-edit-speaker]');
+  if (!chip) return;
+  editSpeakerName(chip, chip.dataset.editSpeaker, chip.dataset.meeting);
+});
 
 let reassignMode = false;
 let reassignMeetingId = null;
@@ -4575,9 +4583,18 @@ function toggleIcsFields() {
   const fields = $('icsFields');
   if (fields) fields.classList.toggle('visible', $('icsEnabled').checked);
 }
+function updateIcsUrlHint() {
+  const hint = $('icsUrlHint');
+  if (!hint) return;
+  const token = $('icsToken').value.trim();
+  hint.textContent = token
+    ? `https://meetings.example.com/api/tasks/calendar.ics?token=${token}`
+    : 'https://meetings.example.com/api/tasks/calendar.ics?token=…';
+}
 $('icsEnabled').addEventListener('change', () => { toggleIcsFields(); markSettingsDirty(); });
 $('icsGenerateBtn').addEventListener('click', () => {
   $('icsToken').value = crypto.randomUUID().replace(/-/g, '');
+  updateIcsUrlHint();
   markSettingsDirty();
 });
 
@@ -4740,6 +4757,7 @@ function populateSettingsForm(settings, defaults) {
   $('icsEnabled').checked = ics.enabled === true;
   $('icsToken').value = ics.token || '';
   toggleIcsFields();
+  updateIcsUrlHint();
 }
 
 function closeSettings() {

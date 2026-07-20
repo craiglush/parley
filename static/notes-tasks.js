@@ -441,13 +441,23 @@
      TASKS BOARD (kanban view)
      ======================================================================== */
   let tasksView = localStorage.getItem('tasks-view') === 'board' ? 'board' : 'list';
+  // Lane icons: constant 24x24 SVG strings only -- never interpolate task/user
+  // data into these. They inherit lane color via stroke/fill="currentColor".
+  const LANE_ICONS = {
+    doing: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M10 8.5v7l6-3.5z" fill="currentColor" stroke="none"></path></svg>',
+    overdue: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"></circle><path d="M12 9v4.5l3 2"></path><path d="M9 3h6"></path></svg>',
+    today: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"></path></svg>',
+    week: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="16" rx="2"></rect><path d="M3 9.5h18M8 2.5v4M16 2.5v4"></path></svg>',
+    later: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>',
+    done: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5.5 5.5L20 7"></path></svg>',
+  };
   const LANE_DEFS = [
-    { key: 'doing', label: 'Doing' },
-    { key: 'overdue', label: 'Overdue' },
-    { key: 'today', label: 'Today' },
-    { key: 'week', label: 'This Week' },
-    { key: 'later', label: 'Later' },
-    { key: 'done', label: 'Done' },
+    { key: 'doing', label: 'Doing', icon: LANE_ICONS.doing },
+    { key: 'overdue', label: 'Overdue', icon: LANE_ICONS.overdue },
+    { key: 'today', label: 'Today', icon: LANE_ICONS.today },
+    { key: 'week', label: 'This Week', icon: LANE_ICONS.week },
+    { key: 'later', label: 'Later', icon: LANE_ICONS.later },
+    { key: 'done', label: 'Done', icon: LANE_ICONS.done },
   ];
   const DONE_LANE_CAP = 30;
   let boardFocusRefs = [];       // this-session focus refs from the last triage run
@@ -519,7 +529,7 @@
       const total = lane.key === 'done' ? allTasks.filter((t) => passesBoardFilters(t) && K.laneForTask(t, today) === 'done').length : items.length;
       const wip = lane.key === 'doing' && items.length > 5 ? ' <span class="board-lane-wip">WIP</span>' : '';
       html += '<div class="board-lane" data-lane="' + lane.key + '">'
-        + '<div class="board-lane-head"><span>' + esc(lane.label) + '</span><span class="board-lane-count">' + total + '</span>' + wip + '</div>'
+        + '<div class="board-lane-head"><span class="board-lane-icon">' + lane.icon + '</span><span class="board-lane-label">' + esc(lane.label) + '</span><span class="board-lane-count">' + total + '</span>' + wip + '</div>'
         + '<div class="board-lane-body" data-lane-drop="' + lane.key + '">'
         + (items.length ? items.map((o) => boardCardHtml(o.t, o.i)).join('') : '<div class="board-lane-empty">—</div>')
         + '</div></div>';
