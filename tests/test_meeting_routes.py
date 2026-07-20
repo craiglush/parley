@@ -416,3 +416,42 @@ def test_links_get(tmp_path, monkeypatch):
     _seed_complete(app, tmp_path, mid="m1")
     r = client.get("/meetings/m1/links")
     assert r.status_code == 200, r.text
+
+
+# --------------------------------------------------------------------------- digest/ics settings (kanban T4)
+
+def test_digest_and_ics_settings_merge(tmp_path, monkeypatch):
+    client, app, _ = _client(tmp_path, monkeypatch)
+    r = client.put("/api/settings", json={
+        "digest": {"enabled": True, "time": "08:30", "timezone": "America/New_York", "recipients": "a@x.com"},
+        "ics": {"enabled": True, "token": "secret-token"},
+    })
+    assert r.status_code == 200, r.text
+    settings = r.json()["settings"]
+    assert settings["digest"] == {"enabled": True, "time": "08:30", "timezone": "America/New_York", "recipients": "a@x.com"}
+    assert settings["ics"] == {"enabled": True, "token": "secret-token"}
+    # persisted + reloaded
+    reloaded = client.get("/api/settings").json()["settings"]
+    assert reloaded["digest"]["time"] == "08:30" and reloaded["ics"]["token"] == "secret-token"
+    # defaults present even when never saved
+    fresh = client.post("/api/settings/reset").json()["settings"]
+    assert fresh["digest"] == {"enabled": False, "time": "07:00", "timezone": "Europe/London", "recipients": ""}
+    assert fresh["ics"] == {"enabled": False, "token": ""}
+
+
+def test_digest_settings_time_and_timezone_validation(tmp_path, monkeypatch):
+    client, app, _ = _client(tmp_path, monkeypatch)
+    # malformed time is ignored, keeps the prior/default value
+    r = client.put("/api/settings", json={"digest": {"time": "not-a-time"}})
+    assert r.status_code == 200
+    assert r.json()["settings"]["digest"]["time"] == "07:00"
+    # blank timezone is ignored, keeps the prior/default value
+    r2 = client.put("/api/settings", json={"digest": {"timezone": "  "}})
+    assert r2.json()["settings"]["digest"]["timezone"] == "Europe/London"
+
+
+def test_digest_zoneinfo_fallback():
+    import app
+    assert app._digest_zoneinfo("Europe/London").key == "Europe/London"
+    assert app._digest_zoneinfo("Not/AZone").key == "UTC"
+    assert app._digest_zoneinfo(None).key == "Europe/London"

@@ -137,9 +137,13 @@ NotesSyncLogic.mergeServerList = function (localById, serverRecords) {
 
 // --- checkbox-line transforms mirroring tasks_store.py exactly --------------
 // (No CWE-78 risk: regex patterns are static, not from untrusted input)
-const NT_CHECKBOX_RE = /^(\s*)([-*+])\s+\[([ xX])\]\s+(.*)$/;
+// CRLF parity: use ([^\n]*) not (.*) so \r is captured in rest-group, matching Python behavior
+// (Python . matches \r; JS . does not — this preserves \r through rewrites, byte-identical)
+const NT_CHECKBOX_RE = /^(\s*)([-*+])\s+\[([ xX/])\]\s+([^\n]*)$/;
 const NT_PRIORITY_TO_EMOJI = { high: '⏫', medium: '🔼', low: '🔽' };
 const NT_PRIORITY_EMOJIS = ['⏫', '🔼', '🔽'];
+// Mirrors tasks_store._STATE_TO_MARK exactly.
+const NT_STATE_TO_MARK = { open: ' ', doing: '/', done: 'x' };
 
 // Strip inline metadata (due / priority / @owner) -> clean text, mirroring
 // tasks_store.parse_inline_metadata (used only for the expected_text guard).
@@ -163,7 +167,7 @@ function _ntRemainder(text, owner, due, priority) {
 }
 
 // applyTaskEditToBody(body, op): pure note-body transform for an offline task op.
-// op.kind: 'toggle' | 'add' | 'edit' | 'delete'. Returns { body, ok }.
+// op.kind: 'toggle' | 'add' | 'edit' | 'delete' | 'state'. Returns { body, ok }.
 NotesSyncLogic.applyTaskEditToBody = function (body, op) {
   const src = body == null ? '' : String(body);
   const kind = op && op.kind;
@@ -182,9 +186,15 @@ NotesSyncLogic.applyTaskEditToBody = function (body, op) {
     lines[i] = m[1] + m[2] + ' [' + (op.done ? 'x' : ' ') + '] ' + m[4];
     return { body: lines.join('\n'), ok: true };
   }
+  if (kind === 'state') {
+    if (!NT_STATE_TO_MARK.hasOwnProperty(op.state)) return { body: src, ok: false };
+    lines[i] = m[1] + m[2] + ' [' + NT_STATE_TO_MARK[op.state] + '] ' + m[4];
+    return { body: lines.join('\n'), ok: true };
+  }
   if (kind === 'edit') {
-    const done = m[3].toLowerCase() === 'x';
-    lines[i] = m[1] + m[2] + ' [' + (done ? 'x' : ' ') + '] ' + _ntRemainder(op.text, op.owner, op.due, op.priority);
+    // Preserve the CURRENT mark verbatim (mirrors tasks_store.update_line's T1 fix):
+    // an unrelated text/due/priority edit must never silently clear a 'doing' mark.
+    lines[i] = m[1] + m[2] + ' [' + m[3] + '] ' + _ntRemainder(op.text, op.owner, op.due, op.priority);
     return { body: lines.join('\n'), ok: true };
   }
   if (kind === 'delete') {

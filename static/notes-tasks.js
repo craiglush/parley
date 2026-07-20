@@ -141,6 +141,7 @@
       populateOwnerFilter();
       renderTasks();
       updateTaskBadge();
+      if (tasksView === 'board') renderBoard();
     } catch (e) {
       list.innerHTML = '<div class="tasks-empty">Failed to load tasks: ' + esc(e.message) + '</div>';
     }
@@ -252,9 +253,17 @@
 
   function updateTaskBadge() {
     const badge = $('tasksOpenBadge'); if (!badge) return;
-    const open = allTasks.filter((t) => !t.done).length;
+    const today = todayStr();
+    let open = 0, overdue = 0;
+    for (const t of allTasks) {
+      if (t.done) continue;
+      open++;
+      if (t.due && t.due < today) overdue++;
+    }
     if (open > 0) { badge.textContent = open > 99 ? '99+' : String(open); badge.hidden = false; }
     else badge.hidden = true;
+    badge.classList.toggle('overdue', overdue > 0);
+    badge.title = overdue > 0 ? overdue + ' overdue' : '';
   }
 
   async function toggleTaskByIndex(idx, checkboxEl) {
@@ -409,9 +418,10 @@
       group.querySelectorAll('.task-filter-btn').forEach((b) => b.classList.toggle('active', b === btn));
       taskFilters[key] = btn.dataset.value;
       renderTasks();
+      if (tasksView === 'board') renderBoard();
     });
     const owner = $('taskOwnerFilter');
-    if (owner) owner.addEventListener('change', () => { taskFilters.owner = owner.value; renderTasks(); });
+    if (owner) owner.addEventListener('change', () => { taskFilters.owner = owner.value; renderTasks(); if (tasksView === 'board') renderBoard(); });
     const gb = $('taskGroupBy');
     if (gb) gb.addEventListener('change', () => { taskGroupBy = gb.value; renderTasks(); });
     const newBtn = $('taskNewBtn');
@@ -424,6 +434,313 @@
       const push = e.target.closest('[data-push]'); if (push) { pushMeetingToNote(+push.dataset.push); return; }
       const src = e.target.closest('[data-open-source]'); if (src) { openTaskSource(+src.dataset.openSource); return; }
     });
+    initTasksBoard();
+  }
+
+  /* ==========================================================================
+     TASKS BOARD (kanban view)
+     ======================================================================== */
+  let tasksView = localStorage.getItem('tasks-view') === 'board' ? 'board' : 'list';
+  const LANE_DEFS = [
+    { key: 'doing', label: 'Doing' },
+    { key: 'overdue', label: 'Overdue' },
+    { key: 'today', label: 'Today' },
+    { key: 'week', label: 'This Week' },
+    { key: 'later', label: 'Later' },
+    { key: 'done', label: 'Done' },
+  ];
+  const DONE_LANE_CAP = 30;
+  let boardFocusRefs = [];       // this-session focus refs from the last triage run
+  let boardDismissedNudges = new Set();
+
+  function refMatches(task, ref) {
+    if (!task || !ref || task.source !== ref.source || task.source_id !== ref.source_id) return false;
+    return ref.source === 'note' ? task.line === ref.line : task.index === ref.index;
+  }
+
+  function setTasksView(view) {
+    tasksView = view === 'board' ? 'board' : 'list';
+    localStorage.setItem('tasks-view', tasksView);
+    const toggle = $('tasksViewToggle');
+    if (toggle) toggle.querySelectorAll('[data-view]').forEach((b) => b.classList.toggle('active', b.dataset.view === tasksView));
+    const listEl = $('tasksList'), boardEl = $('tasksBoard'), filtersEl = $('tasksFilters');
+    if (listEl) listEl.style.display = tasksView === 'list' ? '' : 'none';
+    if (boardEl) boardEl.style.display = tasksView === 'board' ? '' : 'none';
+    // Lanes ARE the status/time buckets, so both the status and due filter groups are
+    // inert in board mode -- hide both. mine-only/owner/source filters still apply to
+    // the board (via passesBoardFilters below), so their controls stay visible.
+    if (filtersEl) filtersEl.querySelectorAll('.task-filter-group[data-filter="status"], .task-filter-group[data-filter="due"]').forEach((g) => { g.style.display = tasksView === 'board' ? 'none' : ''; });
+    if (tasksView === 'board') renderBoard();
+  }
+
+  // passesBoardFilters(t): the board's analogue of passesFilters (list view) --
+  // applies ONLY source/owner (status/due don't apply: lanes already ARE the
+  // status/time buckets, and their filter controls are hidden in board mode above).
+  function passesBoardFilters(t) {
+    if (taskFilters.source && t.source !== taskFilters.source) return false;
+    if (taskFilters.owner && (t.owner || '') !== taskFilters.owner) return false;
+    return true;
+  }
+
+  function laneTasksFor(key) {
+    const today = todayStr();
+    const K = window.KanbanLogic;
+    const out = allTasks.map((t, i) => ({ t, i })).filter((o) => passesBoardFilters(o.t) && K.laneForTask(o.t, today) === key);
+    if (key === 'done') return out.slice(0, DONE_LANE_CAP);
+    return out;
+  }
+
+  function boardCardHtml(t, idx) {
+    const isNote = t.source === 'note';
+    const today = todayStr();
+    const overdue = t.due && t.due < today;
+    const due = t.due ? '<span class="task-chip due' + (overdue ? ' overdue' : '') + '">📅 ' + esc(t.due) + '</span>' : '';
+    // Word chip (not emoji) for priority -- deliberate consistency with the list
+    // view's taskRowHtml, which renders the same "high"/"medium"/"low" word chip.
+    const prio = t.priority ? '<span class="task-chip prio-' + esc(t.priority) + '">' + esc(t.priority) + '</span>' : '';
+    const owner = t.owner ? '<span class="task-chip owner">@' + esc(t.owner) + '</span>' : '';
+    const srcIcon = isNote ? '📝' : '🎙';
+    const focus = boardFocusRefs.some((r) => refMatches(t, r)) ? ' focus-pulse' : '';
+    const pushBtn = isNote ? '' : '<button class="task-mini-btn" data-push="' + idx + '" title="Copy into a note">→</button>';
+    return '<div class="board-card' + focus + '" draggable="true" data-card="' + idx + '">'
+      + '<div class="board-card-text" data-open-source="' + idx + '">' + esc(t.text) + '</div>'
+      + '<div class="task-meta">' + due + prio + owner + '<span class="task-chip source">' + srcIcon + ' ' + esc(t.source_title || t.source) + '</span></div>'
+      + '<div class="board-card-actions"><button class="task-mini-btn board-move-btn" data-move="' + idx + '" title="Move to…">⋮</button>' + pushBtn + '</div>'
+      + '</div>';
+  }
+
+  function renderBoard() {
+    const wrap = $('boardLanes'); if (!wrap) return;
+    const today = todayStr();
+    const K = window.KanbanLogic;
+    let html = '';
+    for (const lane of LANE_DEFS) {
+      const items = laneTasksFor(lane.key);
+      const total = lane.key === 'done' ? allTasks.filter((t) => passesBoardFilters(t) && K.laneForTask(t, today) === 'done').length : items.length;
+      const wip = lane.key === 'doing' && items.length > 5 ? ' <span class="board-lane-wip">WIP</span>' : '';
+      html += '<div class="board-lane" data-lane="' + lane.key + '">'
+        + '<div class="board-lane-head"><span>' + esc(lane.label) + '</span><span class="board-lane-count">' + total + '</span>' + wip + '</div>'
+        + '<div class="board-lane-body" data-lane-drop="' + lane.key + '">'
+        + (items.length ? items.map((o) => boardCardHtml(o.t, o.i)).join('') : '<div class="board-lane-empty">—</div>')
+        + '</div></div>';
+    }
+    wrap.innerHTML = html;
+    renderNudges();
+  }
+
+  function renderNudges() {
+    const el = $('boardNudges'); if (!el) return;
+    const today = todayStr();
+    const K = window.KanbanLogic;
+    let overdue = 0, dueToday = 0, doing = 0;
+    for (const t of allTasks) {
+      if (!passesBoardFilters(t)) continue;
+      const lane = K.laneForTask(t, today);
+      if (lane === 'overdue') overdue++;
+      if (lane === 'today') dueToday++;
+      if (lane === 'doing') doing++;
+    }
+    const msgs = [];
+    if (overdue > 0) msgs.push({ id: 'overdue', text: overdue + ' overdue' });
+    if (dueToday > 0) msgs.push({ id: 'today', text: dueToday + ' due today' });
+    if (doing > 5) msgs.push({ id: 'doing', text: 'Doing has ' + doing + ' tasks — consider finishing one before starting another' });
+    const visible = msgs.filter((m) => !boardDismissedNudges.has(m.id));
+    el.innerHTML = visible.map((m) =>
+      '<div class="board-nudge" data-nudge="' + m.id + '">' + esc(m.text) + '<button class="board-nudge-x" data-dismiss-nudge="' + m.id + '">×</button></div>').join('');
+  }
+
+  // ---- drag & drop + move menu ----
+  async function applyKanbanDrop(idx, lane) {
+    const t = allTasks[idx]; if (!t) return;
+    const today = todayStr();
+    if (window.KanbanLogic.laneForTask(t, today) === lane) return;
+    const action = window.KanbanLogic.dropActionFor(t, lane, today);
+    if (!action) return;
+    try {
+      if ('done' in action) {
+        if (t.source === 'note') {
+          await window.NotesSync.applyTask(t.source_id, { kind: 'toggle', line: t.line, done: action.done, expectedText: t.text });
+        } else {
+          await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: t.index, done: action.done }) });
+        }
+        t.done = action.done; t.state = action.done ? 'done' : t.state;
+      }
+      if ('due' in action) {
+        const due = action.due == null ? '' : action.due;
+        if (t.source === 'note') {
+          await window.NotesSync.applyTask(t.source_id, { kind: 'edit', line: t.line, expectedText: t.text, text: t.text, owner: t.owner, due, priority: t.priority });
+        } else {
+          await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: t.index, text: t.text, owner: t.owner, due, priority: t.priority }) });
+        }
+        t.due = action.due;
+      }
+      if (action.state && !('done' in action)) {
+        if (t.source === 'note') {
+          // Note-task state drags route through NotesSync.applyTask (kind:'state'),
+          // exactly like the toggle/edit branches above -- NOT the direct /api/tasks/
+          // state endpoint. That endpoint is note RMW+409's API-parity sibling of
+          // /api/tasks/toggle; going around NotesSync here would skip the offline
+          // queue AND desync the notes-sync mirror's baseHash from the server.
+          await window.NotesSync.applyTask(t.source_id, { kind: 'state', line: t.line, state: action.state, expectedText: t.text });
+        } else {
+          await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks/state', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ index: t.index, state: action.state }) });
+        }
+        t.state = action.state;
+      }
+      renderBoard(); updateTaskBadge();
+      if (t.source === 'note' && currentNoteId === t.source_id && noteEditor) reloadCurrentNoteBody();
+    } catch (e) {
+      if (e.status === 409) { toast('That task moved — refreshing', 'error'); loadTasks(); }
+      else toast('Move failed: ' + e.message, 'error');
+    }
+  }
+
+  function openMoveMenu(idx) {
+    const m = modal('<h3>Move to…</h3><div class="nt-modal-list">'
+      + LANE_DEFS.filter((l) => l.key !== 'overdue').map((l) => '<div class="nt-modal-list-item" data-lane="' + l.key + '">' + esc(l.label) + '</div>').join('')
+      + '</div><div class="nt-modal-actions"><button class="nt-modal-btn" data-cancel>Cancel</button></div>');
+    m.q('[data-cancel]').onclick = m.close;
+    m.el.querySelectorAll('[data-lane]').forEach((el) => { el.onclick = () => { m.close(); applyKanbanDrop(idx, el.dataset.lane); }; });
+  }
+
+  function initBoardDnD() {
+    const wrap = $('boardLanes'); if (!wrap) return;
+    let dragIdx = null;
+    wrap.addEventListener('dragstart', (e) => {
+      const card = e.target.closest('[data-card]'); if (!card) return;
+      dragIdx = +card.dataset.card;
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    wrap.addEventListener('dragover', (e) => {
+      const body = e.target.closest('[data-lane-drop]'); if (!body) return;
+      if (body.dataset.laneDrop === 'overdue') return;   // not a valid drop target
+      e.preventDefault();
+      body.classList.add('drag-over');
+    });
+    wrap.addEventListener('dragleave', (e) => { const body = e.target.closest('[data-lane-drop]'); if (body) body.classList.remove('drag-over'); });
+    wrap.addEventListener('drop', (e) => {
+      const body = e.target.closest('[data-lane-drop]'); if (!body || dragIdx == null) return;
+      e.preventDefault();
+      body.classList.remove('drag-over');
+      const lane = body.dataset.laneDrop;
+      const idx = dragIdx; dragIdx = null;
+      if (lane !== 'overdue') applyKanbanDrop(idx, lane);
+    });
+    wrap.addEventListener('click', (e) => {
+      const mv = e.target.closest('[data-move]'); if (mv) { openMoveMenu(+mv.dataset.move); return; }
+      const push = e.target.closest('[data-push]'); if (push) { pushMeetingToNote(+push.dataset.push); return; }
+      const src = e.target.closest('[data-open-source]'); if (src) { openTaskSource(+src.dataset.openSource); return; }
+    });
+  }
+
+  // ---- AI quick-add ----
+  function renderQuickAddPreview(parsed) {
+    const el = $('boardQuickAddPreview'); if (!el) return;
+    const prios = [['', 'None'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High']];
+    el.innerHTML = '<span class="board-preview-text">' + esc(parsed.text) + '</span>'
+      + '<input type="date" id="qaDue" value="' + esc(parsed.due || '') + '">'
+      + '<select id="qaPrio">' + prios.map((p) => '<option value="' + p[0] + '"' + (p[0] === (parsed.priority || '') ? ' selected' : '') + '>' + p[1] + '</option>').join('') + '</select>'
+      + '<input type="text" id="qaOwner" placeholder="owner" value="' + esc(parsed.owner || '') + '">'
+      + '<button class="nt-modal-btn primary" id="qaConfirm">Add</button>'
+      + '<button class="nt-modal-btn" id="qaCancel">Cancel</button>';
+    el.style.display = 'flex';
+    $('qaConfirm').onclick = async () => {
+      try {
+        await window.NotesSync.addTask({ text: parsed.text, owner: $('qaOwner').value.trim(), due: $('qaDue').value, priority: $('qaPrio').value });
+        el.style.display = 'none'; $('boardQuickAddInput').value = '';
+        if (navigator.onLine && window.NotesSync) { try { await window.NotesSync.flush(); } catch (e) {} }
+        toast('Task added', 'success');
+        await loadTasks();
+      } catch (e) { toast('Add failed: ' + e.message, 'error'); }
+    };
+    $('qaCancel').onclick = () => { el.style.display = 'none'; };
+  }
+
+  function initBoardQuickAdd() {
+    const form = $('boardQuickAdd'); if (!form) return;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const input = $('boardQuickAddInput');
+      const text = input.value.trim(); if (!text) return;
+      try {
+        const parsed = await api('/api/tasks/ai/parse', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+        renderQuickAddPreview(parsed);
+      } catch (e) { toast('Parse failed: ' + e.message, 'error'); }
+    });
+  }
+
+  // ---- AI triage ----
+  function renderTriagePanel(result) {
+    const el = $('boardTriagePanel'); if (!el) return;
+    const rawSuggestions = (result && result.suggestions) || [];
+    // Resolve each suggestion's ref to its current task via refMatches (same helper
+    // boardCardHtml's focus-pulse uses). A suggestion whose ref no longer resolves
+    // (task edited/removed since the triage snapshot was built server-side) is
+    // dropped rather than rendered as an unidentifiable row.
+    const resolved = rawSuggestions
+      .map((s) => ({ sug: s, t: allTasks.find((x) => refMatches(x, s.ref)) }))
+      .filter((r) => r.t);
+    if (!resolved.length) { el.style.display = 'none'; el.innerHTML = ''; boardFocusRefs = []; return; }
+    el.innerHTML = '<div class="board-triage-head"><span>Suggestions</span><button class="nt-modal-btn" id="triageCloseBtn">Close</button></div>'
+      + resolved.map((r, i) => '<div class="board-triage-row" data-sug="' + i + '">'
+        + '<span class="board-triage-text">' + esc(r.t.text) + ' — ' + esc(r.t.priority || 'none') + ' → <b>' + esc(r.sug.priority) + '</b>: ' + esc(r.sug.reason) + '</span>'
+        + '<button class="nt-modal-btn primary" data-apply-sug="' + i + '">Apply</button>'
+        + '<button class="nt-modal-btn" data-dismiss-sug="' + i + '">Dismiss</button></div>').join('');
+    el.style.display = 'block';
+    el._suggestions = resolved.map((r) => r.sug);
+    boardFocusRefs = (result.focus || []);
+    renderBoard();
+  }
+
+  async function applyTriageSuggestion(sug) {
+    const idx = allTasks.findIndex((t) => refMatches(t, sug.ref));
+    if (idx < 0) { toast('Task no longer found — refreshing', 'error'); loadTasks(); return; }
+    const t = allTasks[idx];
+    try {
+      if (t.source === 'note') {
+        await window.NotesSync.applyTask(t.source_id, { kind: 'edit', line: t.line, expectedText: t.text, text: t.text, owner: t.owner, due: t.due, priority: sug.priority });
+      } else {
+        await api('/api/meetings/' + encodeURIComponent(t.source_id) + '/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: t.index, text: t.text, owner: t.owner, due: t.due, priority: sug.priority }) });
+      }
+      t.priority = sug.priority;
+      toast('Priority updated', 'success');
+      if (tasksView === 'board') renderBoard(); else renderTasks();
+    } catch (e) {
+      if (e.status === 409) { toast('That task moved — refreshing', 'error'); loadTasks(); }
+      else toast('Apply failed: ' + e.message, 'error');
+    }
+  }
+
+  function initBoardTriage() {
+    const btn = $('boardTriageBtn'); if (btn) btn.addEventListener('click', async () => {
+      try {
+        const result = await api('/api/tasks/ai/triage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
+        renderTriagePanel(result);
+      } catch (e) { toast('Triage failed: ' + e.message, 'error'); }
+    });
+    const panel = $('boardTriagePanel'); if (panel) panel.addEventListener('click', (e) => {
+      if (e.target.closest('#triageCloseBtn')) { panel.style.display = 'none'; panel.innerHTML = ''; boardFocusRefs = []; renderBoard(); return; }
+      const apply = e.target.closest('[data-apply-sug]');
+      if (apply) { const sug = panel._suggestions[+apply.dataset.applySug]; if (sug) applyTriageSuggestion(sug); return; }
+      const dismiss = e.target.closest('[data-dismiss-sug]');
+      if (dismiss) { const row = dismiss.closest('.board-triage-row'); if (row) row.remove(); return; }
+    });
+    const nudges = $('boardNudges'); if (nudges) nudges.addEventListener('click', (e) => {
+      const x = e.target.closest('[data-dismiss-nudge]'); if (x) { boardDismissedNudges.add(x.dataset.dismissNudge); renderNudges(); }
+    });
+  }
+
+  function initTasksBoard() {
+    const toggle = $('tasksViewToggle');
+    if (toggle) toggle.addEventListener('click', (e) => { const b = e.target.closest('[data-view]'); if (b) setTasksView(b.dataset.view); });
+    initBoardDnD();
+    initBoardQuickAdd();
+    initBoardTriage();
+    setTasksView(tasksView);
   }
 
   /* ==========================================================================

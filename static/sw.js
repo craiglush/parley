@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v17-batch2-collapsible';
+const CACHE_NAME = 'meetings-v18-kanban';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.
@@ -14,6 +14,7 @@ const SHELL_ASSETS = [
   '/static/notes-tasks.js',
   '/static/notes-analysis-logic.js',
   '/static/capture-notes-logic.js',
+  '/static/kanban-logic.js',
   '/static/vendor/codemirror.bundle.js',
   '/static/icons/favicon.svg',
   '/static/icons/favicon-32.png',

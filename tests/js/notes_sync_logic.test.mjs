@@ -193,3 +193,136 @@ test('applyTaskEditToBody: non-checkbox / out-of-range refuses', () => {
   assert.strictEqual(L.applyTaskEditToBody('plain text', { kind: 'toggle', line: 0, done: true }).ok, false);
   assert.strictEqual(L.applyTaskEditToBody('- [ ] x', { kind: 'edit', line: 5, text: 'y' }).ok, false);
 });
+
+test('applyTaskEditToBody: state kind rewrites the mark for open/doing/done', () => {
+  const body = '- [ ] task';
+  assert.strictEqual(L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'doing' }).body, '- [/] task');
+  assert.strictEqual(L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'done' }).body, '- [x] task');
+  assert.strictEqual(L.applyTaskEditToBody('- [/] task', { kind: 'state', line: 0, state: 'open' }).body, '- [ ] task');
+});
+
+test('applyTaskEditToBody: state kind preserves text/metadata', () => {
+  const r = L.applyTaskEditToBody('- [ ] ship it 📅 2026-07-14 @alex ⏫', { kind: 'state', line: 0, state: 'doing' });
+  assert.deepStrictEqual(r, { body: '- [/] ship it 📅 2026-07-14 @alex ⏫', ok: true });
+});
+
+test('applyTaskEditToBody: state kind rejects an invalid state', () => {
+  const body = '- [ ] task';
+  assert.deepStrictEqual(L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'bogus' }), { body, ok: false });
+});
+
+test('applyTaskEditToBody: state kind respects expectedText guard', () => {
+  const body = '- [ ] real';
+  assert.deepStrictEqual(L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'doing', expectedText: 'WRONG' }), { body, ok: false });
+});
+
+test('applyTaskEditToBody: edit kind now PRESERVES a doing mark (regression for the T1-mirroring fix)', () => {
+  const r = L.applyTaskEditToBody('- [/] old text @amy', { kind: 'edit', line: 0, expectedText: 'old text', text: 'new text', owner: 'bob', due: '', priority: 'low' });
+  assert.deepStrictEqual(r, { body: '- [/] new text @bob 🔽', ok: true });
+});
+
+test('applyTaskEditToBody: edit kind still preserves done/open (existing behavior unchanged)', () => {
+  const r = L.applyTaskEditToBody('  * [x] old text @amy', { kind: 'edit', line: 0, expectedText: 'old text', text: 'new text', owner: 'bob', due: '', priority: 'low' });
+  assert.deepStrictEqual(r, { body: '  * [x] new text @bob 🔽', ok: true });
+});
+
+// --- CRLF parity tests (fix for [^\n]* rest-group) ---
+test('applyTaskEditToBody: toggle on CRLF line preserves the \\r', () => {
+  const body = '- [ ] task\r\nx';
+  const r = L.applyTaskEditToBody(body, { kind: 'toggle', line: 0, done: true, expectedText: 'task' });
+  assert.strictEqual(r.body, '- [x] task\r\nx');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: edit on CRLF line (edit rebuilds text, \\r lost but regex now matches)', () => {
+  const body = '- [ ] old\r\nx';
+  const r = L.applyTaskEditToBody(body, { kind: 'edit', line: 0, expectedText: 'old', text: 'new' });
+  // edit rebuilds text via _ntRemainder, so \r is lost; the fix ensures regex matches (not ok:false)
+  assert.strictEqual(r.body, '- [ ] new\nx');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: delete on CRLF line removes the line with \\r', () => {
+  const body = '- [ ] first\r\n- [ ] second\r\n- [ ] third';
+  const r = L.applyTaskEditToBody(body, { kind: 'delete', line: 1, expectedText: 'second' });
+  assert.strictEqual(r.body, '- [ ] first\r\n- [ ] third');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: state on CRLF line preserves the \\r', () => {
+  const body = '- [ ] task\r\nx';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'doing' });
+  assert.strictEqual(r.body, '- [/] task\r\nx');
+  assert.strictEqual(r.ok, true);
+});
+
+// --- State idempotency and transitions ---
+test('applyTaskEditToBody: state doing->doing is idempotent', () => {
+  const body = '- [/] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'doing' });
+  assert.strictEqual(r.body, '- [/] task');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: state open->open is idempotent', () => {
+  const body = '- [ ] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'open' });
+  assert.strictEqual(r.body, '- [ ] task');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: state done->open transition', () => {
+  const body = '- [x] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'open' });
+  assert.strictEqual(r.body, '- [ ] task');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: state done->doing transition', () => {
+  const body = '- [x] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'doing' });
+  assert.strictEqual(r.body, '- [/] task');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: state open->doing transition', () => {
+  const body = '- [ ] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'doing' });
+  assert.strictEqual(r.body, '- [/] task');
+  assert.strictEqual(r.ok, true);
+});
+
+// --- Uppercase-X preservation on edit ---
+test('applyTaskEditToBody: edit preserves uppercase X in checkbox', () => {
+  const body = '- [X] old text';
+  const r = L.applyTaskEditToBody(body, { kind: 'edit', line: 0, expectedText: 'old text', text: 'new text' });
+  assert.strictEqual(r.body, '- [X] new text');
+  assert.strictEqual(r.ok, true);
+});
+
+test('applyTaskEditToBody: edit preserves / (doing) mark in checkbox', () => {
+  const body = '- [/] task text @owner';
+  // When editing, if owner not provided in op, it's dropped (by design; can be re-added explicitly)
+  const r = L.applyTaskEditToBody(body, { kind: 'edit', line: 0, expectedText: 'task text', text: 'updated', owner: 'owner' });
+  assert.strictEqual(r.body, '- [/] updated @owner');
+  assert.strictEqual(r.ok, true);
+});
+
+// --- Additional edge cases ---
+test('applyTaskEditToBody: state on non-checkbox line refuses', () => {
+  const body = 'plain text\n- [ ] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 0, state: 'doing' });
+  assert.deepStrictEqual(r, { body, ok: false });
+});
+
+test('applyTaskEditToBody: state on out-of-range line refuses', () => {
+  const body = '- [ ] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: 10, state: 'done' });
+  assert.deepStrictEqual(r, { body, ok: false });
+});
+
+test('applyTaskEditToBody: state with null line index refuses', () => {
+  const body = '- [ ] task';
+  const r = L.applyTaskEditToBody(body, { kind: 'state', line: null, state: 'done' });
+  assert.deepStrictEqual(r, { body, ok: false });
+});

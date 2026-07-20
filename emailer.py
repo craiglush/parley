@@ -235,6 +235,190 @@ def render_summary_email(
     return subject, html_body, text_body
 
 
+def _digest_task_row_html(t: dict) -> str:
+    bits = []
+    due = t.get("due")
+    if due:
+        bits.append(f'<span style="color:#555;">📅 {_esc(due)}</span>')
+    prio = t.get("priority")
+    if prio:
+        bits.append(f'<span style="color:#555;">{_esc(prio)}</span>')
+    owner = t.get("owner")
+    if owner:
+        bits.append(f'<span style="color:#555;">@{_esc(owner)}</span>')
+    src = t.get("source_title") or t.get("source") or ""
+    if src:
+        bits.append(f'<span style="color:#888;">— {_esc(src)}</span>')
+    meta = "  ".join(bits)
+    return (
+        "<tr>"
+        f'<td style="padding:4px 8px;border-bottom:1px solid #f1f5f9;">{_esc(t.get("text", ""))}</td>'
+        f'<td style="padding:4px 8px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#666;">{meta}</td>'
+        "</tr>"
+    )
+
+
+def _digest_lane_html(title: str, tasks: list) -> str:
+    if not tasks:
+        return ""
+    rows = "".join(_digest_task_row_html(t) for t in tasks)
+    table = f'<table style="border-collapse:collapse;width:100%;font-size:14px;margin:4px 0 12px;">{rows}</table>'
+    return _section(f"{title} ({len(tasks)})", table)
+
+
+def _digest_text(data: dict, link: str) -> str:
+    """Build plain-text digest from data dict (no HTML conversion).
+
+    Renders readable plain text with proper spacing, avoiding the mashed-cell
+    problem of _html_to_text. Only used for digest emails.
+
+    data: {"weekday": str, "date": str, "counts": {...}, "lanes": {...}, "briefing": str}
+    link: public URL for the footer
+    """
+    data = data or {}
+    counts = data.get("counts") or {}
+    lanes = data.get("lanes") or {}
+    weekday = data.get("weekday", "")
+    date_str = data.get("date", "")
+    briefing = (data.get("briefing") or "").strip()
+
+    lines = []
+
+    # Header
+    lines.append(f"Tasks digest — {weekday} {date_str}")
+
+    # Counts summary
+    count_parts = [
+        f"{counts.get('overdue', 0)} overdue",
+        f"{counts.get('today', 0)} today",
+        f"{counts.get('doing', 0)} doing",
+        f"{counts.get('week', 0)} this week",
+    ]
+    lines.append(" · ".join(count_parts))
+    lines.append("")  # blank line
+
+    # Briefing
+    if briefing:
+        lines.append(briefing)
+        lines.append("")  # blank line
+
+    # Lanes
+    for lane_key, lane_label in [
+        ("overdue", "OVERDUE"),
+        ("today", "TODAY"),
+        ("doing", "DOING"),
+        ("week", "THIS WEEK"),
+    ]:
+        tasks = lanes.get(lane_key) or []
+        if not tasks:
+            continue
+
+        lines.append(f"{lane_label} ({len(tasks)})")
+        for task in tasks:
+            task_text = task.get("text", "")
+            chips = []
+
+            due = task.get("due")
+            if due:
+                chips.append(f"[due {due}]")
+
+            priority = task.get("priority")
+            if priority:
+                chips.append(f"[{priority}]")
+
+            owner = task.get("owner")
+            if owner:
+                chips.append(f"[@{owner}]")
+
+            source = task.get("source_title") or task.get("source")
+
+            # Build the line: "- text  [chips] (source)"
+            line = f"- {task_text}"
+            if chips or source:
+                line += "  "
+                if chips:
+                    line += " ".join(chips)
+                if source:
+                    if chips:
+                        line += " "
+                    line += f"({source})"
+
+            lines.append(line)
+
+        lines.append("")  # blank line after lane
+
+    # Footer
+    lines.append(f"Open the task board: {link}")
+
+    return "\n".join(lines)
+
+
+def render_digest_email(data: dict, public_url: str | None = None) -> tuple[str, str, str]:
+    """Render (subject, html_body, text_body) for the daily task digest.
+
+    `data`: {"weekday": str, "date": "YYYY-MM-DD", "counts": {"overdue","today",
+    "doing","week"}, "lanes": {"overdue","today","doing","week": [task,...]},
+    "briefing": str}. Each task dict carries text/due/priority/owner/source/
+    source_title (the same shape /api/tasks returns).
+    """
+    data = data or {}
+    counts = data.get("counts") or {}
+    lanes = data.get("lanes") or {}
+    weekday = data.get("weekday", "")
+    date_str = data.get("date", "")
+
+    subject = (
+        f"Tasks digest — {weekday} {date_str}: "
+        f"{counts.get('overdue', 0)} overdue, {counts.get('today', 0)} today"
+    )
+
+    if public_url is None:
+        public_url = os.getenv("MEETING_PUBLIC_URL", "https://meetings.example.com")
+    link = public_url.rstrip("/")
+
+    count_bits = [
+        f'<strong>{counts.get("overdue", 0)}</strong> overdue',
+        f'<strong>{counts.get("today", 0)}</strong> today',
+        f'<strong>{counts.get("doing", 0)}</strong> doing',
+        f'<strong>{counts.get("week", 0)}</strong> this week',
+    ]
+
+    body_parts = [
+        '<div style="background:linear-gradient(135deg,#041E42 0%,#2C5697 100%);'
+        'padding:20px 24px;border-radius:8px 8px 0 0;">'
+        f'<div style="color:#fff;font-weight:700;font-size:20px;">Tasks digest — {_esc(weekday)} {_esc(date_str)}</div>'
+        f'<div style="color:#70E2CB;font-size:13px;margin-top:6px;">{" &nbsp;•&nbsp; ".join(count_bits)}</div>'
+        "</div>",
+        '<div style="padding:8px 24px 24px;">',
+    ]
+
+    briefing = (data.get("briefing") or "").strip()
+    if briefing:
+        body_parts.append(_section("Today", f'<p style="margin:8px 0;">{_esc(briefing)}</p>'))
+
+    body_parts.append(_digest_lane_html("Overdue", lanes.get("overdue") or []))
+    body_parts.append(_digest_lane_html("Today", lanes.get("today") or []))
+    body_parts.append(_digest_lane_html("Doing", lanes.get("doing") or []))
+    body_parts.append(_digest_lane_html("This Week", lanes.get("week") or []))
+
+    body_parts.append(
+        '<p style="margin:24px 0 0;padding-top:12px;border-top:1px solid #e2e8f0;font-size:13px;color:#888;">'
+        f'Open the task board: <a href="{_esc(link)}" style="color:#2C5697;">{_esc(link)}</a><br>'
+        "Sent automatically by the Meeting Service."
+        "</p>"
+    )
+    body_parts.append("</div>")
+
+    inner = "".join(p for p in body_parts if p)
+    html_body = (
+        '<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;margin:0 auto;'
+        'color:#1a1a1a;font-size:15px;line-height:1.5;border:1px solid #e2e8f0;border-radius:8px;">'
+        f"{inner}</div>"
+    )
+    text_body = _digest_text(data, link)
+    return subject, html_body, text_body
+
+
 # ---------------------------------------------------------------------------
 # SMTP delivery
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -510,6 +511,42 @@ ANALYSIS_SCHEMAS = {
         },
         "required": ["summary"],
     },
+    "digest_briefing": {
+        "type": "object",
+        "properties": {
+            "briefing": {"type": "string"},
+        },
+        "required": ["briefing"],
+    },
+    "task_parse": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "due": {"type": "string"},
+            "priority": {"type": "string"},
+            "owner": {"type": "string"},
+        },
+        "required": ["text"],
+    },
+    "task_triage": {
+        "type": "object",
+        "properties": {
+            "suggestions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "priority": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["index", "priority", "reason"],
+                },
+            },
+            "focus": {"type": "array", "items": {"type": "integer"}},
+        },
+        "required": ["suggestions"],
+    },
 }
 
 DEFAULT_CHAT_SYSTEM_PROMPT = (
@@ -543,6 +580,16 @@ DEFAULT_SETTINGS = {
         "from_name": os.getenv("EMAIL_FROM_NAME", "Meeting Service"),
         "reply_to": os.getenv("EMAIL_REPLY_TO", ""),
         "recipients": os.getenv("EMAIL_RECIPIENTS", ""),  # comma-separated
+    },
+    "digest": {
+        "enabled": False,
+        "time": "07:00",
+        "timezone": "Europe/London",
+        "recipients": "",  # blank -> falls back to EMAIL_RECIPIENTS env / smtp.recipients at send time
+    },
+    "ics": {
+        "enabled": False,
+        "token": "",
     },
 }
 
@@ -583,6 +630,16 @@ def load_settings() -> dict:
                 for key in DEFAULT_SETTINGS["smtp"]:
                     if key in saved["smtp"]:
                         settings["smtp"][key] = saved["smtp"][key]
+            # Merge digest settings
+            if "digest" in saved and isinstance(saved["digest"], dict):
+                for key in DEFAULT_SETTINGS["digest"]:
+                    if key in saved["digest"]:
+                        settings["digest"][key] = saved["digest"][key]
+            # Merge ICS settings
+            if "ics" in saved and isinstance(saved["ics"], dict):
+                for key in DEFAULT_SETTINGS["ics"]:
+                    if key in saved["ics"]:
+                        settings["ics"][key] = saved["ics"][key]
         except Exception as e:
             logger.warning(f"Failed to load settings: {e}")
     return settings
@@ -592,6 +649,16 @@ def save_settings(settings: dict):
     """Persist settings to disk."""
     MEETINGS_DIR.mkdir(parents=True, exist_ok=True)
     _atomic_write(SETTINGS_PATH, json.dumps(settings, indent=2))
+
+
+def _digest_zoneinfo(tz_str: str | None) -> ZoneInfo:
+    """Resolve an IANA timezone name to a ZoneInfo, falling back to UTC on an
+    invalid/unknown name (never raises -- the digest must still fire on a typo'd
+    timezone, just in UTC instead of the intended zone)."""
+    try:
+        return ZoneInfo(tz_str or DEFAULT_SETTINGS["digest"]["timezone"])
+    except Exception:
+        return ZoneInfo("UTC")
 
 
 # Chunking / splitting
@@ -717,6 +784,7 @@ async def _verify_embedding_dim_on_startup():
     _gc_t = asyncio.create_task(_capture_gc_worker()); _bg_tasks.add(_gc_t); _gc_t.add_done_callback(_bg_tasks.discard)
     _ext_t = asyncio.create_task(_extract_worker()); _bg_tasks.add(_ext_t); _ext_t.add_done_callback(_bg_tasks.discard)
     _rescan_t = asyncio.create_task(_rescan_pending_extractions()); _bg_tasks.add(_rescan_t); _rescan_t.add_done_callback(_bg_tasks.discard)
+    _digest_t = asyncio.create_task(_digest_worker()); _bg_tasks.add(_digest_t); _digest_t.add_done_callback(_bg_tasks.discard)
 
 
 # In-memory meeting registry (survives container restarts via on-disk JSON index)
@@ -5317,12 +5385,26 @@ class SmtpSettingsRequest(BaseModel):
     recipients: Optional[str] = None
 
 
+class DigestSettingsRequest(BaseModel):
+    enabled: Optional[bool] = None
+    time: Optional[str] = None
+    timezone: Optional[str] = None
+    recipients: Optional[str] = None
+
+
+class IcsSettingsRequest(BaseModel):
+    enabled: Optional[bool] = None
+    token: Optional[str] = None
+
+
 class SettingsRequest(BaseModel):
     prompts: Optional[dict[str, str]] = None
     ollama_model: Optional[str] = None
     temperature: Optional[float] = None
     chat: Optional[ChatSettingsRequest] = None
     smtp: Optional[SmtpSettingsRequest] = None
+    digest: Optional[DigestSettingsRequest] = None
+    ics: Optional[IcsSettingsRequest] = None
     remove_filler: Optional[bool] = None
 
 
@@ -5393,6 +5475,28 @@ async def update_settings(body: SettingsRequest):
         if body.smtp.recipients is not None:
             smtp["recipients"] = body.smtp.recipients.strip()
 
+    if body.digest is not None:
+        digest = settings.setdefault("digest", json.loads(json.dumps(DEFAULT_SETTINGS["digest"])))
+        if body.digest.enabled is not None:
+            digest["enabled"] = bool(body.digest.enabled)
+        if body.digest.time is not None:
+            t = body.digest.time.strip()
+            if re.match(r"^\d{2}:\d{2}$", t):
+                digest["time"] = t
+        if body.digest.timezone is not None:
+            tz = body.digest.timezone.strip()
+            if tz:
+                digest["timezone"] = tz
+        if body.digest.recipients is not None:
+            digest["recipients"] = body.digest.recipients.strip()
+
+    if body.ics is not None:
+        ics = settings.setdefault("ics", json.loads(json.dumps(DEFAULT_SETTINGS["ics"])))
+        if body.ics.enabled is not None:
+            ics["enabled"] = bool(body.ics.enabled)
+        if body.ics.token is not None:
+            ics["token"] = body.ics.token.strip()
+
     if body.remove_filler is not None:
         settings["remove_filler"] = bool(body.remove_filler)
 
@@ -5438,6 +5542,90 @@ async def test_email():
         logger.warning(f"Test email failed: {e}")
         raise HTTPException(status_code=400, detail=f"Send failed: {e}")
     return {"detail": f"Test email sent to {', '.join(recipients)}"}
+
+
+async def _generate_digest_briefing(snapshot: dict) -> str:
+    """One-shot AI 'what matters today' briefing (2-3 sentences) from the digest task
+    snapshot. Non-fatal: any failure or unparseable/empty response yields "" so the
+    digest still sends without a briefing (email must never be blocked by the GPU)."""
+    settings = load_settings()
+    model = settings.get("ollama_model", OLLAMA_MODEL)
+    temperature = settings.get("temperature", 0.3)
+    counts = snapshot.get("counts", {})
+    lanes = snapshot.get("lanes", {})
+
+    def _fmt(lane_key):
+        return "; ".join((t.get("text") or "") for t in lanes.get(lane_key, [])[:15])
+
+    prompt = (
+        "You are a concise daily-planning assistant. Write a 2-3 sentence briefing "
+        "of what matters today, based on this task snapshot. Be specific (mention "
+        "task names), not generic. Do not use bullet points.\n\n"
+        f"Overdue ({counts.get('overdue', 0)}): {_fmt('overdue')}\n"
+        f"Due today ({counts.get('today', 0)}): {_fmt('today')}\n"
+        f"In progress / Doing ({counts.get('doing', 0)}): {_fmt('doing')}\n"
+        f"This week ({counts.get('week', 0)}): {_fmt('week')}\n\n"
+        'Respond ONLY with valid JSON: {"briefing": "2-3 sentence summary"}'
+    )
+    try:
+        body = _build_generate_body(model, prompt, temperature=temperature, num_predict=512,
+            schema=ANALYSIS_SCHEMAS.get("digest_briefing"))
+        resp = await _retry_ollama_call("POST", f"{OLLAMA_URL}/api/generate",
+            json_body=body, timeout_seconds=60.0, max_retries=2)
+        parsed = _parse_json_object(resp.json().get("response", ""), context="digest-briefing")
+        return str(parsed.get("briefing") or "").strip()
+    except Exception as e:
+        logger.warning(f"digest briefing failed (non-fatal): {e}")
+        return ""
+
+
+async def _build_digest_email() -> tuple[str, str, str]:
+    """Build (subject, html, text) for the daily task digest: collect tasks off the
+    event loop, bucket via tasks_store.build_digest_snapshot in the digest timezone,
+    fold in a non-fatal AI briefing, and render via emailer.render_digest_email."""
+    settings = load_settings()
+    digest = settings.get("digest", DEFAULT_SETTINGS["digest"])
+    tz = _digest_zoneinfo(digest.get("timezone"))
+    now_local = datetime.now(tz)
+
+    tasks = await _collect_all_tasks()
+    today = now_local.strftime("%Y-%m-%d")
+    snapshot = tasks_store.build_digest_snapshot(tasks, today)
+    briefing = await _generate_digest_briefing(snapshot)
+    data = {
+        "weekday": now_local.strftime("%A"),
+        "date": today,
+        "counts": snapshot["counts"],
+        "lanes": snapshot["lanes"],
+        "briefing": briefing,
+    }
+    public_url = os.getenv("MEETING_PUBLIC_URL", "https://meetings.example.com")
+    return emailer.render_digest_email(data, public_url)
+
+
+@app.post("/api/digest/test")
+async def test_digest():
+    """Build and send the daily digest immediately, to the configured recipients.
+    Mirrors POST /api/settings/test-email's shape and failure modes."""
+    settings = load_settings()
+    smtp = settings.get("smtp", {})
+    digest = settings.get("digest", DEFAULT_SETTINGS["digest"])
+    recipients = emailer.parse_recipients(
+        digest.get("recipients") or smtp.get("recipients") or os.getenv("EMAIL_RECIPIENTS", ""))
+    if not smtp.get("host"):
+        raise HTTPException(status_code=400, detail="SMTP host is not configured")
+    if not recipients:
+        raise HTTPException(status_code=400, detail="No digest recipients configured")
+
+    subject, html_body, text_body = await _build_digest_email()
+    try:
+        await asyncio.get_event_loop().run_in_executor(
+            None, emailer.send_email, smtp, recipients, subject, html_body, text_body
+        )
+    except Exception as e:
+        logger.warning(f"Digest send failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Send failed: {e}")
+    return {"detail": f"Digest sent to {', '.join(recipients)}", "subject": subject, "recipients": recipients}
 
 
 # ---------------------------------------------------------------------------
@@ -5494,6 +5682,13 @@ class TaskDelete(BaseModel):
     expected_text: Optional[str] = None
 
 
+class TaskState(BaseModel):
+    note_id: str
+    line: int
+    state: str
+    expected_text: Optional[str] = None
+
+
 class MeetingTaskToggle(BaseModel):
     index: int
     done: bool
@@ -5509,6 +5704,11 @@ class MeetingTaskEdit(BaseModel):
 
 class MeetingTaskDismiss(BaseModel):
     index: int
+
+
+class MeetingTaskState(BaseModel):
+    index: int
+    state: str
 
 
 class NoteRename(BaseModel):
@@ -5774,6 +5974,157 @@ async def _rescan_pending_extractions() -> None:
             _enqueue_extract(note_id, filename)
     except Exception as e:
         logger.warning(f"pending extraction rescan failed (non-fatal): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Daily digest scheduler
+# ---------------------------------------------------------------------------
+
+DIGEST_POLL_SECONDS = 300   # sleep-slice cap so settings edits (time/tz/enabled) apply without a restart
+DIGEST_STATE_FILENAME = "digest_state.json"
+
+
+def _digest_state_path() -> Path:
+    return MEETINGS_DIR / DIGEST_STATE_FILENAME
+
+
+def _load_digest_state() -> dict:
+    p = _digest_state_path()
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_digest_state(state: dict) -> None:
+    _atomic_write(_digest_state_path(), json.dumps(state, indent=2))
+
+
+def _next_digest_fire(now_utc: datetime, time_str: str, tz_str: str) -> datetime:
+    """Pure: the next aware-UTC datetime at which `time_str` ('HH:MM') next occurs in
+    `tz_str`, strictly after now_utc. DST-safe: computed in local wall-clock time via
+    zoneinfo, then converted back to UTC, so the returned UTC instant shifts by
+    exactly the DST offset either side of a transition. A malformed time_str -- or
+    one that matches the settings-save regex (^\\d{2}:\\d{2}$) but is out of range,
+    e.g. "25:99" -- falls back to 07:00 rather than raising."""
+    try:
+        hh, mm = (int(x) for x in time_str.split(":"))
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            raise ValueError("digest time out of range")
+    except Exception:
+        hh, mm = 7, 0
+    tz = _digest_zoneinfo(tz_str)
+    now_local = now_utc.astimezone(tz)
+    candidate = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    # Equality (not just "<") rolls forward: at the exact fire instant the worker is
+    # already inside the send block (this function isn't called again mid-fire), so
+    # the *next* call -- the post-send recompute -- must land on tomorrow, not
+    # immediately re-fire the same instant.
+    if candidate <= now_local:
+        candidate = candidate + timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
+
+
+async def _send_digest_with_retry(smtp: dict, recipients: list, subject: str, html_body: str,
+                                   text_body: str, attempts: int = 3, gap: int = 300) -> None:
+    """Send the digest email via the (sync) emailer, retrying in-place on failure.
+    A single SMTP blip shouldn't cost the whole day's digest -- the next scheduled
+    fire is tomorrow -- so this tries up to `attempts` times total, sleeping `gap`
+    seconds between attempts (never after the last one). Each failed attempt is
+    logged individually. If every attempt fails, re-raises the final attempt's
+    exception so the caller's existing except-block (log + fall through to
+    tomorrow) handles it unchanged."""
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, emailer.send_email, smtp, recipients, subject, html_body, text_body)
+            return
+        except Exception as e:
+            logger.warning(f"Digest send attempt {attempt}/{attempts} failed: {e}")
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(gap)
+
+
+async def _attempt_digest_send(smtp: dict, recipients: list, state: dict, today_local: str) -> None:
+    """The worker's fire-block body, factored out so it's testable without driving
+    the worker's `while True` loop: build the email, retry the SMTP send up to 3x
+    (~10 min window) via `_send_digest_with_retry`, and on success persist
+    `last_sent_date` into `state` (mutated in place) as today. On total failure
+    (all retries exhausted), log the give-up warning and leave `state` unwritten --
+    the next scheduled fire is tomorrow. Same control flow as before this was
+    extracted, just named."""
+    try:
+        subject, html_body, text_body = await _build_digest_email()
+        # Bounded in-place retry (3 attempts / ~10 min window) so one transient
+        # SMTP blip doesn't lose the whole day -- next fire is tomorrow. Only the
+        # final failure falls through to the warning below.
+        await _send_digest_with_retry(smtp, recipients, subject, html_body, text_body)
+        state["last_sent_date"] = today_local
+        _save_digest_state(state)
+        logger.info(f"Digest sent to {', '.join(recipients)}")
+    except Exception as e:
+        logger.warning(f"Digest send failed after all retries (giving up until tomorrow): {e}")
+
+
+def _digest_should_fire(digest: dict, smtp: dict, state: dict, today_local: str) -> bool:
+    """Pure: given already-loaded digest/smtp settings, the persisted
+    digest_state.json dict, and today's date in the digest timezone, should the
+    digest fire right now? True only when the digest is enabled, SMTP is enabled,
+    AND it hasn't already been sent today -- the last_sent_date comparison is the
+    ONLY thing guarding against a double-send (e.g. a restart landing inside the
+    fire minute, or the worker somehow re-entering this branch before its post-fire
+    sleep completes), so this stays the single source of truth for that guard."""
+    return bool(digest.get("enabled")) and bool(smtp.get("enabled")) and state.get("last_sent_date") != today_local
+
+
+async def _digest_worker():
+    """Daily digest scheduler: polls in <=300s slices toward the next configured
+    fire time (re-reading settings each slice, so time/tz/enabled edits apply
+    without a restart) WHILE more than one slice remains; once within one slice of
+    the fire time, sleeps the exact remainder and falls through into the send block
+    below (no `continue` there) -- a naive 'sleep-then-continue' on every pass,
+    including the final slice, would recompute fire_at AFTER it has already rolled
+    to tomorrow and never reach the send block at all, which is exactly the bug this
+    structure avoids. Sends once via the executor (emailer stays sync) when
+    _digest_should_fire says so, and persists the last-sent date so a restart inside
+    the fire minute can't double-send AND a restart later the same day doesn't
+    re-send."""
+    while True:
+        try:
+            settings = load_settings()
+            digest = settings.get("digest", DEFAULT_SETTINGS["digest"])
+            now_utc = datetime.now(timezone.utc)
+            fire_at = _next_digest_fire(now_utc, digest.get("time", "07:00"), digest.get("timezone", "Europe/London"))
+            remaining = (fire_at - now_utc).total_seconds()
+            if remaining > DIGEST_POLL_SECONDS:
+                await asyncio.sleep(DIGEST_POLL_SECONDS)
+                continue
+            # Within one poll slice of the fire time -- sleep the exact remainder,
+            # then fall through into the send block below (deliberately no `continue`).
+            await asyncio.sleep(max(remaining, 0))
+            # Fire minute reached -- re-read settings fresh in case they changed
+            # during the final sleep slice.
+            settings = load_settings()
+            digest = settings.get("digest", DEFAULT_SETTINGS["digest"])
+            smtp = settings.get("smtp", {})
+            tz = _digest_zoneinfo(digest.get("timezone"))
+            today_local = datetime.now(timezone.utc).astimezone(tz).strftime("%Y-%m-%d")
+            state = _load_digest_state()
+            if _digest_should_fire(digest, smtp, state, today_local):
+                recipients = emailer.parse_recipients(
+                    digest.get("recipients") or smtp.get("recipients") or os.getenv("EMAIL_RECIPIENTS", ""))
+                if smtp.get("host") and recipients:
+                    await _attempt_digest_send(smtp, recipients, state, today_local)
+                else:
+                    logger.info("Digest fire skipped: SMTP host or recipients not configured")
+            await asyncio.sleep(61)   # past the fire minute so this branch doesn't re-trigger immediately
+        except Exception as e:
+            logger.warning(f"Digest worker error (non-fatal): {e}")
+            await asyncio.sleep(DIGEST_POLL_SECONDS)
 
 
 @app.get("/api/notes")
@@ -6086,6 +6437,19 @@ def _collect_meeting_tasks() -> list:
     return out
 
 
+async def _collect_all_tasks() -> list:
+    """Collect every note + meeting task, off the event loop (blocking file IO over
+    the slow bind-mount, same reasoning as the inline closure below). Shared by every
+    endpoint that needs the full task list -- POST /api/digest/test (via
+    _build_digest_email), GET /api/tasks/calendar.ics, and POST /api/tasks/ai/
+    triage -- so that collection + executor-hop pattern lives in one place instead
+    of being duplicated a 2nd/3rd/4th time (GET /api/tasks keeps its own inline
+    closure, unchanged)."""
+    def _collect():
+        return _collect_note_tasks() + _collect_meeting_tasks()
+    return await asyncio.get_event_loop().run_in_executor(None, _collect)
+
+
 @app.get("/api/tasks")
 async def api_list_tasks(status: Optional[str] = None, owner: Optional[str] = None,
                          source: Optional[str] = None, due: Optional[str] = None):
@@ -6107,6 +6471,21 @@ async def api_toggle_task(payload: TaskToggle):
         raise HTTPException(status_code=404, detail="Note not found")
     new_body, ok = tasks_store.toggle_line(rec["body"], payload.line, payload.done,
                                            expected_text=payload.expected_text)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
+    notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
+    return {"ok": True}
+
+
+@app.post("/api/tasks/state")
+async def api_set_task_state(payload: TaskState):
+    if payload.state not in ("open", "doing", "done"):
+        raise HTTPException(status_code=400, detail="Invalid state")
+    rec = notes_store.read_note(notes_store.NOTES_DIR, payload.note_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    new_body, ok = tasks_store.set_state_line(rec["body"], payload.line, payload.state,
+                                              expected_text=payload.expected_text)
     if not ok:
         raise HTTPException(status_code=409, detail="Task line changed or not a checkbox; refresh")
     notes_store.update_note(notes_store.NOTES_DIR, payload.note_id, body=new_body)
@@ -6143,6 +6522,149 @@ async def api_create_task(payload: TaskCreate):
     return {"ok": True, "note_id": note_id}
 
 
+# --- AI task capture + triage (non-fatal, never auto-applied) -----------------
+
+def _task_ref(t: dict) -> dict:
+    """The stable {source, source_id, line|index} identity used to route an AI
+    triage suggestion (or a kanban drag) back to the right mutation endpoint --
+    exactly ONE of line/index is present, mirroring how every task dict already
+    carries line (notes) XOR index (meetings)."""
+    ref = {"source": t.get("source"), "source_id": t.get("source_id")}
+    if t.get("source") == "note":
+        ref["line"] = t.get("line")
+    else:
+        ref["index"] = t.get("index")
+    return ref
+
+
+class TaskParseRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/tasks/ai/parse")
+async def api_tasks_ai_parse(payload: TaskParseRequest):
+    """Natural-language task capture: 'chase John about the contract next Friday,
+    high priority' -> {text, due, priority, owner}. Non-fatal -> the original text
+    with blank fields on any failure. Never writes anything -- the UI fills an
+    editable preview row the user must confirm."""
+    text = (payload.text or "").strip()
+    default = {"text": text, "due": "", "priority": "", "owner": ""}
+    if not text:
+        return default
+    settings = load_settings()
+    model = settings.get("ollama_model", OLLAMA_MODEL)
+    temperature = settings.get("temperature", 0.3)
+    tz = _digest_zoneinfo((settings.get("digest") or {}).get("timezone"))
+    today = datetime.now(tz).strftime("%Y-%m-%d")
+    prompt = (
+        f"Today's date is {today}. Parse the following into a task. Resolve relative "
+        "dates (e.g. \"next Friday\", \"tomorrow\") against today's date into an ISO "
+        "YYYY-MM-DD date; leave due \"\" if no date is implied. priority is one of "
+        "high/medium/low, or \"\" if not implied. owner is a first name if one is "
+        "mentioned, else \"\".\n\n"
+        f'TEXT: "{text}"\n\n'
+        "Respond ONLY with valid JSON: "
+        '{"text":"clean task text with no date/priority/owner words","due":"YYYY-MM-DD or empty",'
+        '"priority":"high|medium|low or empty","owner":"name or empty"}'
+    )
+    try:
+        body = _build_generate_body(model, prompt, temperature=temperature, num_predict=512,
+            schema=ANALYSIS_SCHEMAS.get("task_parse"))
+        resp = await _retry_ollama_call("POST", f"{OLLAMA_URL}/api/generate",
+            json_body=body, timeout_seconds=60.0, max_retries=2)
+        parsed = _parse_json_object(resp.json().get("response", ""), context="task-parse")
+        if not parsed:
+            return default
+        due = str(parsed.get("due") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
+            due = ""
+        prio = str(parsed.get("priority") or "").strip().lower()
+        if prio not in ("high", "medium", "low"):
+            prio = ""
+        return {
+            "text": str(parsed.get("text") or text).strip() or text,
+            "due": due, "priority": prio,
+            "owner": str(parsed.get("owner") or "").strip(),
+        }
+    except Exception as e:
+        logger.warning(f"task parse failed (non-fatal): {e}")
+        return default
+
+
+@app.post("/api/tasks/ai/triage")
+async def api_tasks_ai_triage():
+    """AI prioritisation: sends the OPEN task list (capped at 80) to the LLM by INDEX
+    (not full identity -- the model never needs source_id/line), then maps returned
+    indices back to task refs server-side. Never auto-applies -- the UI renders
+    Apply/Dismiss per suggestion."""
+    tasks = await _collect_all_tasks()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    open_tasks = tasks_store.filter_tasks(tasks, status="open", today=today)
+    open_tasks = tasks_store.sort_tasks(open_tasks)[:80]
+    default = {"suggestions": [], "focus": []}
+    if not open_tasks:
+        return default
+
+    settings = load_settings()
+    model = settings.get("ollama_model", OLLAMA_MODEL)
+    temperature = settings.get("temperature", 0.3)
+    lines = []
+    for i, t in enumerate(open_tasks):
+        bits = [f"{i}: {t.get('text', '')}"]
+        if t.get("due"):
+            bits.append(f"due {t['due']}")
+        if t.get("priority"):
+            bits.append(f"priority {t['priority']}")
+        if t.get("owner"):
+            bits.append(f"owner {t['owner']}")
+        if t.get("source_title"):
+            bits.append(f"from {t['source_title']}")
+        lines.append(" | ".join(bits))
+    prompt = (
+        "You are a task-prioritization assistant. Below is a numbered list of open "
+        "tasks (index: text | due | priority | owner | source). Suggest a priority "
+        "(high/medium/low) for tasks whose priority should change, with a one-sentence "
+        "reason, and pick up to 3 indices as today's focus.\n\n"
+        + "\n".join(lines) +
+        "\n\nRespond ONLY with valid JSON: "
+        '{"suggestions":[{"index":0,"priority":"high","reason":"..."}],"focus":[0]}'
+    )
+    try:
+        body = _build_generate_body(model, prompt, temperature=temperature, num_predict=1536,
+            schema=ANALYSIS_SCHEMAS.get("task_triage"))
+        resp = await _retry_ollama_call("POST", f"{OLLAMA_URL}/api/generate",
+            json_body=body, timeout_seconds=180.0, max_retries=2)
+        parsed = _parse_json_object(resp.json().get("response", ""), context="task-triage")
+        if not parsed:
+            return default
+        n = len(open_tasks)
+        suggestions = []
+        for s in parsed.get("suggestions") or []:
+            try:
+                idx = int(s.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= n:
+                continue
+            prio = str(s.get("priority") or "").strip().lower()
+            if prio not in ("high", "medium", "low"):
+                continue
+            suggestions.append({"ref": _task_ref(open_tasks[idx]), "priority": prio,
+                                "reason": str(s.get("reason") or "").strip()})
+        focus = []
+        for idx in (parsed.get("focus") or [])[:3]:
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < n:
+                focus.append(_task_ref(open_tasks[idx]))
+        return {"suggestions": suggestions, "focus": focus}
+    except Exception as e:
+        logger.warning(f"task triage failed (non-fatal): {e}")
+        return default
+
+
 @app.patch("/api/tasks")
 async def api_update_task(payload: TaskUpdate):
     if not (payload.text or "").strip():
@@ -6172,6 +6694,26 @@ async def api_delete_task(payload: TaskDelete):
     return {"ok": True}
 
 
+@app.get("/api/tasks/calendar.ics")
+async def api_tasks_calendar_ics(token: str = ""):
+    """Token-gated ICS feed of open, due-dated tasks. Always 404 on any failure
+    mode (feature disabled, empty configured token, mismatched token) -- never a
+    distinguishing 401/403, which would leak that the route exists/means something."""
+    settings = load_settings()
+    ics = settings.get("ics", DEFAULT_SETTINGS["ics"])
+    configured = (ics.get("token") or "").strip()
+    if not ics.get("enabled") or not configured or not secrets.compare_digest(
+            (token or "").encode("utf-8"), configured.encode("utf-8")):
+        raise HTTPException(status_code=404)
+
+    tasks = await _collect_all_tasks()
+    tasks = tasks_store.filter_tasks(tasks, status="open")
+    now_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    body = tasks_store.render_ics_calendar(tasks, now_stamp=now_stamp)
+    return Response(content=body, media_type="text/calendar; charset=utf-8",
+                    headers={"Cache-Control": "no-store"})
+
+
 # --- Meeting tasks: in-place complete/edit/dismiss via a per-meeting overlay ---
 # Meeting action items are an AI-derived projection (no note to edit), so their
 # mutable state lives in task_overlay.json beside the meeting, keyed by the
@@ -6190,6 +6732,25 @@ async def api_meeting_task_toggle(meeting_id: str, payload: MeetingTaskToggle):
     ov = _load_meeting_overlay(meeting_id)
     entry = ov.get(str(payload.index)) or {}
     entry["done"] = bool(payload.done)
+    # Toggle always lands cleanly on done/open, never doing -- mirrors the note-side
+    # toggle_line, which always rewrites the checkbox mark to 'x' or ' ' regardless
+    # of what it was before. Keeps entry["state"] from going stale after a toggle.
+    entry["state"] = "done" if payload.done else "open"
+    ov[str(payload.index)] = entry
+    if not _save_meeting_overlay(meeting_id, ov):
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    return {"ok": True}
+
+
+@app.post("/api/meetings/{meeting_id}/tasks/state")
+async def api_meeting_task_state(meeting_id: str, payload: MeetingTaskState):
+    if payload.state not in ("open", "doing", "done"):
+        raise HTTPException(status_code=400, detail="Invalid state")
+    _require_meeting_index(meeting_id, payload.index)
+    ov = _load_meeting_overlay(meeting_id)
+    entry = ov.get(str(payload.index)) or {}
+    entry["state"] = payload.state
+    entry["done"] = (payload.state == "done")   # keep the legacy done flag in lockstep
     ov[str(payload.index)] = entry
     if not _save_meeting_overlay(meeting_id, ov):
         raise HTTPException(status_code=404, detail="Meeting not found")

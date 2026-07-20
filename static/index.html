@@ -17,12 +17,13 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
-<link rel="stylesheet" href="/static/notes-tasks.css?v=13">
+<link rel="stylesheet" href="/static/notes-tasks.css?v=14">
 <script defer src="/static/vendor/codemirror.bundle.js?v=12"></script>
-<script defer src="/static/notes-sync-logic.js?v=1"></script>
+<script defer src="/static/notes-sync-logic.js?v=2"></script>
 <script defer src="/static/notes-sync.js?v=3"></script>
 <script defer src="/static/notes-analysis-logic.js?v=1"></script>
-<script defer src="/static/notes-tasks.js?v=14"></script>
+<script defer src="/static/kanban-logic.js?v=1"></script>
+<script defer src="/static/notes-tasks.js?v=15"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -463,6 +464,10 @@
         <div class="tasks-title-row">
           <h2>Tasks</h2>
           <div class="tasks-counts" id="tasksCounts"></div>
+          <div class="tasks-view-toggle" id="tasksViewToggle" role="group" aria-label="View">
+            <button class="task-filter-btn active" data-view="list">List</button>
+            <button class="task-filter-btn" data-view="board">Board</button>
+          </div>
           <button class="tasks-new-btn" id="taskNewBtn">+ New task</button>
         </div>
         <div class="tasks-filters" id="tasksFilters">
@@ -495,7 +500,22 @@
           </label>
         </div>
       </div>
+      <div class="board-topbar" id="tasksQuickAddBar">
+        <form class="board-quickadd" id="boardQuickAdd">
+          <input type="text" id="boardQuickAddInput" placeholder="Add a task in plain English… e.g. &quot;chase John about the contract next Friday, high priority&quot;" autocomplete="off">
+          <button type="submit" class="tasks-new-btn">Add</button>
+        </form>
+      </div>
+      <div id="boardQuickAddPreview" class="board-quickadd-preview" style="display:none"></div>
       <div class="tasks-list" id="tasksList"><div class="tasks-empty">Loading…</div></div>
+      <div class="tasks-board" id="tasksBoard" style="display:none">
+        <div class="board-topbar">
+          <button class="task-filter-btn" id="boardTriageBtn">✨ Prioritise</button>
+        </div>
+        <div id="boardNudges" class="board-nudges"></div>
+        <div id="boardTriagePanel" class="board-triage-panel" style="display:none"></div>
+        <div class="board-lanes" id="boardLanes"></div>
+      </div>
     </div>
   </div>
 </main>
@@ -901,6 +921,67 @@
         </div>
       </div>
 
+      <!-- Daily Task Digest + ICS Calendar Feed -->
+      <div class="settings-section">
+        <div class="settings-section-title">Daily Task Digest &amp; Calendar Feed</div>
+        <div class="settings-section-desc">
+          Email a daily summary of overdue / due-today / doing / this-week tasks, with an
+          AI "what matters today" briefing. The ICS feed lets Nextcloud/Outlook subscribe
+          to your open tasks as calendar events (read-only, one-way).
+        </div>
+        <div style="margin-top:8px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="digestEnabled">
+            Send a daily digest email
+          </label>
+        </div>
+        <div id="digestFields" class="chat-settings-conditional">
+          <div class="settings-model-row" style="margin-top:8px">
+            <div class="field">
+              <label for="digestTime">Send time</label>
+              <input type="time" id="digestTime" value="07:00">
+            </div>
+            <div class="field">
+              <label for="digestTimezone">Timezone (IANA, e.g. Europe/London)</label>
+              <input type="text" id="digestTimezone" placeholder="Europe/London">
+            </div>
+          </div>
+          <div class="settings-model-row" style="margin-top:8px">
+            <div class="field" style="flex:2">
+              <label for="digestRecipients">Recipients (blank = use SMTP recipients)</label>
+              <input type="text" id="digestRecipients" placeholder="alice@example.com, bob@example.com">
+            </div>
+          </div>
+          <div style="margin-top:12px;display:flex;align-items:center;gap:12px;">
+            <button type="button" class="settings-reset-prompt-btn" id="digestTestBtn">Send test digest</button>
+            <span id="digestTestStatus" style="font-size:13px;color:var(--text-secondary);"></span>
+          </div>
+        </div>
+        <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <input type="checkbox" id="icsEnabled">
+            Publish an ICS calendar feed of open tasks
+          </label>
+          <div id="icsFields" class="chat-settings-conditional">
+            <div class="settings-model-row" style="margin-top:8px">
+              <div class="field" style="flex:2">
+                <label for="icsToken">Feed token</label>
+                <input type="text" id="icsToken" placeholder="click Generate" readonly>
+              </div>
+              <div class="field">
+                <label>&nbsp;</label>
+                <button type="button" class="settings-reset-prompt-btn" id="icsGenerateBtn">Generate new token</button>
+              </div>
+            </div>
+            <div class="settings-section-desc" style="margin-top:6px">
+              Subscribe URL: <code id="icsUrlHint">https://meetings.example.com/api/tasks/calendar.ics?token=…</code>.
+              Calendar apps can't send login headers, so this route needs a LAN/bypass
+              path around Authelia (e.g. host.docker.internal:8191).
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div>
     <div class="settings-footer">
       <button class="settings-reset-all-btn" id="settingsResetAll">Reset All to Defaults</button>
@@ -913,7 +994,7 @@
 
 <script src="/static/capture-notes-logic.js?v=1"></script>
 <script src="/static/queue-logic.js?v=1"></script>
-<script src="/static/app.js?v=16"></script>
+<script src="/static/app.js?v=17"></script>
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js');

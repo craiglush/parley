@@ -4537,6 +4537,50 @@ $('smtpTestBtn').addEventListener('click', async () => {
   }
 });
 
+// Digest / ICS settings listeners
+function toggleDigestFields() {
+  const fields = $('digestFields');
+  if (fields) fields.classList.toggle('visible', $('digestEnabled').checked);
+}
+$('digestEnabled').addEventListener('change', () => { toggleDigestFields(); markSettingsDirty(); });
+['digestTime', 'digestTimezone', 'digestRecipients'].forEach(id => {
+  $(id).addEventListener('input', markSettingsDirty);
+});
+$('digestTestBtn').addEventListener('click', async () => {
+  const status = $('digestTestStatus');
+  if (settingsDirty) {
+    status.style.color = 'var(--yellow, #b8860b)';
+    status.textContent = 'Save your settings first, then send a test.';
+    return;
+  }
+  status.style.color = 'var(--text-secondary)';
+  status.textContent = 'Sending…';
+  try {
+    const resp = await fetch(`${API}/api/digest/test`, { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      status.style.color = 'var(--green, #2e7d32)';
+      status.textContent = data.detail || 'Digest sent.';
+    } else {
+      status.style.color = 'var(--red, #c62828)';
+      status.textContent = data.detail || 'Failed to send digest.';
+    }
+  } catch (err) {
+    status.style.color = 'var(--red, #c62828)';
+    status.textContent = 'Failed: ' + err.message;
+  }
+});
+
+function toggleIcsFields() {
+  const fields = $('icsFields');
+  if (fields) fields.classList.toggle('visible', $('icsEnabled').checked);
+}
+$('icsEnabled').addEventListener('change', () => { toggleIcsFields(); markSettingsDirty(); });
+$('icsGenerateBtn').addEventListener('click', () => {
+  $('icsToken').value = crypto.randomUUID().replace(/-/g, '');
+  markSettingsDirty();
+});
+
 // Per-prompt reset buttons
 document.querySelectorAll('.settings-reset-prompt-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -4591,6 +4635,16 @@ $('settingsSave').addEventListener('click', async () => {
       from_name: $('smtpFromName').value.trim(),
       reply_to: $('smtpReplyTo').value.trim(),
       recipients: $('smtpRecipients').value.trim(),
+    },
+    digest: {
+      enabled: $('digestEnabled').checked,
+      time: $('digestTime').value.trim(),
+      timezone: $('digestTimezone').value.trim(),
+      recipients: $('digestRecipients').value.trim(),
+    },
+    ics: {
+      enabled: $('icsEnabled').checked,
+      token: $('icsToken').value.trim(),
     },
   };
   for (const [key, ta] of Object.entries(promptFields)) {
@@ -4672,6 +4726,20 @@ function populateSettingsForm(settings, defaults) {
   $('smtpRecipients').value = smtp.recipients || '';
   $('smtpTestStatus').textContent = '';
   toggleSmtpFields();
+
+  // Digest / ICS settings
+  const digest = settings.digest || {};
+  $('digestEnabled').checked = digest.enabled === true;
+  $('digestTime').value = digest.time || '07:00';
+  $('digestTimezone').value = digest.timezone || 'Europe/London';
+  $('digestRecipients').value = digest.recipients || '';
+  $('digestTestStatus').textContent = '';
+  toggleDigestFields();
+
+  const ics = settings.ics || {};
+  $('icsEnabled').checked = ics.enabled === true;
+  $('icsToken').value = ics.token || '';
+  toggleIcsFields();
 }
 
 function closeSettings() {

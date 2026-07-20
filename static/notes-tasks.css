@@ -342,3 +342,43 @@ body[data-pillar="notes"] #notesView, body[data-pillar="tasks"] #tasksView { ani
   .tasks-inner { padding: 16px 14px 80px; }
   .tasks-filters { gap: 6px; }
 }
+
+/* ============================================================================
+   TASKS BOARD (kanban view)
+   ========================================================================== */
+.tasks-view-toggle { display: inline-flex; background: var(--bg-card); border: 1px solid var(--border); border-radius: 999px; padding: 2px; margin-left: auto; }
+.tasks-board { display: flex; flex-direction: column; gap: 10px; }
+.board-topbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.board-quickadd { display: flex; gap: 8px; flex: 1; min-width: 260px; }
+.board-quickadd input { flex: 1; font-family: var(--font-ui); font-size: 13.5px; color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px; outline: none; }
+.board-quickadd input:focus { border-color: var(--accent); }
+.board-quickadd-preview { display: none; align-items: center; gap: 8px; flex-wrap: wrap; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+.board-quickadd-preview input, .board-quickadd-preview select { font-family: var(--font-ui); font-size: 13px; color: var(--text-primary); background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px 9px; }
+.board-preview-text { font-size: 14px; color: var(--text-primary); flex: 1 1 100%; }
+.board-nudges { display: flex; flex-direction: column; gap: 6px; }
+.board-nudge { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--text-secondary); background: var(--accent-dim); border: 1px solid var(--accent); border-radius: var(--radius-sm); padding: 7px 12px; }
+.board-nudge-x { background: transparent; border: none; color: var(--text-secondary); cursor: pointer; font-size: 14px; }
+.board-triage-panel { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; display: flex; flex-direction: column; gap: 8px; }
+.board-triage-head { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+.board-triage-row { display: flex; align-items: center; gap: 10px; font-size: 13px; padding: 6px 0; border-top: 1px solid var(--border); }
+.board-triage-text { flex: 1; }
+.board-lanes { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; scroll-snap-type: x proximity; }
+.board-lane { flex: 0 0 260px; scroll-snap-align: start; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); display: flex; flex-direction: column; max-height: calc(100vh - 260px); }
+.board-lane-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--text-secondary); border-bottom: 1px solid var(--border); }
+.board-lane-count { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.board-lane-wip { color: var(--yellow); font-size: 10px; }
+.board-lane[data-lane="overdue"] .board-lane-head { color: var(--red); }
+.board-lane-body { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 8px; min-height: 60px; }
+.board-lane-body.drag-over { background: var(--accent-dim); border-radius: var(--radius-sm); }
+.board-lane-empty { text-align: center; color: var(--text-muted); font-size: 12px; padding: 16px 0; }
+.board-card { background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 10px; cursor: grab; display: flex; flex-direction: column; gap: 6px; }
+.board-card:active { cursor: grabbing; }
+.board-card.focus-pulse { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); animation: board-focus-pulse 1.8s ease-in-out infinite; }
+@keyframes board-focus-pulse { 0%, 100% { box-shadow: 0 0 0 1px var(--accent); } 50% { box-shadow: 0 0 0 3px var(--accent-dim); } }
+.board-card-text { font-size: 13px; color: var(--text-primary); line-height: 1.4; cursor: pointer; }
+.board-card-actions { display: flex; justify-content: flex-end; gap: 4px; }
+.pillar-badge.overdue { background: var(--red); }
+
+@media (max-width: 768px) {
+  .board-lane { flex: 0 0 82vw; }
+}
