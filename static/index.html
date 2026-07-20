@@ -17,13 +17,13 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
-<link rel="stylesheet" href="/static/notes-tasks.css?v=15">
+<link rel="stylesheet" href="/static/notes-tasks.css?v=16">
 <script defer src="/static/vendor/codemirror.bundle.js?v=12"></script>
 <script defer src="/static/notes-sync-logic.js?v=2"></script>
 <script defer src="/static/notes-sync.js?v=3"></script>
 <script defer src="/static/notes-analysis-logic.js?v=1"></script>
 <script defer src="/static/kanban-logic.js?v=1"></script>
-<script defer src="/static/notes-tasks.js?v=16"></script>
+<script defer src="/static/notes-tasks.js?v=17"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -75,6 +75,10 @@
       <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 7 5 9 9 5"/><polyline points="3 17 5 19 9 15"/><line x1="13" y1="7" x2="21" y2="7"/><line x1="13" y1="17" x2="21" y2="17"/></svg>
       <span>Tasks</span>
       <span class="pillar-badge" id="tasksOpenBadge" hidden></span>
+    </button>
+    <button class="pillar-btn" data-pillar="board" role="tab" aria-selected="false" title="Board">
+      <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="17" rx="1"/><rect x="9.5" y="4" width="5" height="11" rx="1"/><rect x="16" y="4" width="5" height="14" rx="1"/></svg>
+      <span>Board</span>
     </button>
   </nav>
   <div class="header-side header-right">
@@ -464,10 +468,6 @@
         <div class="tasks-title-row">
           <h2>Tasks</h2>
           <div class="tasks-counts" id="tasksCounts"></div>
-          <div class="tasks-view-toggle" id="tasksViewToggle" role="group" aria-label="View">
-            <button class="task-filter-btn active" data-view="list">List</button>
-            <button class="task-filter-btn" data-view="board">Board</button>
-          </div>
           <button class="tasks-new-btn" id="taskNewBtn">+ New task</button>
         </div>
         <div class="tasks-filters" id="tasksFilters">

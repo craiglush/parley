@@ -93,7 +93,10 @@
       b.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     if (p !== 'meetings' && typeof window.closeDetail === 'function') { try { window.closeDetail(); } catch (e) {} }
-    if (p === 'tasks') loadTasks();
+    if (p === 'tasks' || p === 'board') {
+      setTasksView(p === 'board' ? 'board' : 'list');
+      loadTasks();
+    }
     if (p === 'notes') {
       if (!notesInit) { notesInit = true; loadNotesTree(); }
       else loadNotesTree();

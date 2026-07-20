@@ -38,16 +38,34 @@
 /* ---- Pillar visibility: CSS-driven from body[data-pillar] ------------------- */
 body[data-pillar="notes"] .capture-banner,
 body[data-pillar="tasks"] .capture-banner,
+body[data-pillar="board"] .capture-banner,
 body[data-pillar="notes"] #sidebar,
 body[data-pillar="tasks"] #sidebar,
+body[data-pillar="board"] #sidebar,
 body[data-pillar="notes"] #mainEmptyState,
 body[data-pillar="tasks"] #mainEmptyState,
+body[data-pillar="board"] #mainEmptyState,
 body[data-pillar="notes"] #inlineDetail,
-body[data-pillar="tasks"] #inlineDetail { display: none !important; }
+body[data-pillar="tasks"] #inlineDetail,
+body[data-pillar="board"] #inlineDetail { display: none !important; }
 body[data-pillar="notes"] #notesView { display: flex !important; }
-body[data-pillar="tasks"] #tasksView { display: block !important; }
+body[data-pillar="tasks"] #tasksView,
+body[data-pillar="board"] #tasksView { display: block !important; }
 body[data-pillar="notes"] .main-content,
-body[data-pillar="tasks"] .main-content { overflow: hidden; }
+body[data-pillar="tasks"] .main-content,
+body[data-pillar="board"] .main-content { overflow: hidden; }
+
+/* ---- Board pillar: escape the .tasks-inner reading-width cap and show board-only controls --- */
+body[data-pillar="board"] .tasks-inner { max-width: none; }
+body[data-pillar="board"] #tasksBoard { display: block !important; }
+body[data-pillar="board"] #tasksList,
+body[data-pillar="board"] .tasks-filters .task-filter-group[data-filter="status"],
+body[data-pillar="board"] .tasks-filters .task-filter-group[data-filter="due"],
+body[data-pillar="board"] .task-groupby,
+body[data-pillar="board"] #taskNewBtn { display: none !important; }
+body[data-pillar="tasks"] #tasksBoard,
+body[data-pillar="tasks"] #tasksQuickAddBar,
+body[data-pillar="tasks"] #boardQuickAddPreview { display: none !important; }
 
 /* ============================================================================
    NOTES VIEW
@@ -318,7 +336,7 @@ body[data-pillar="tasks"] .main-content { overflow: hidden; }
 @keyframes nt-toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 
 /* ---- View enter animation -------------------------------------------------- */
-body[data-pillar="notes"] #notesView, body[data-pillar="tasks"] #tasksView { animation: pillar-fade .22s ease; }
+body[data-pillar="notes"] #notesView, body[data-pillar="tasks"] #tasksView, body[data-pillar="board"] #tasksView { animation: pillar-fade .22s ease; }
 @keyframes pillar-fade { from { opacity: 0; } to { opacity: 1; } }
 
 /* ============================================================================
