@@ -18,12 +18,13 @@
 <link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <!-- Notes & Tasks UI (Phase 4): styles + offline CodeMirror bundle + app logic -->
 <link rel="stylesheet" href="/static/notes-tasks.css?v=17">
-<script defer src="/static/vendor/codemirror.bundle.js?v=12"></script>
+<script defer src="/static/vendor/codemirror.bundle.js?v=13"></script>
 <script defer src="/static/notes-sync-logic.js?v=2"></script>
 <script defer src="/static/notes-sync.js?v=3"></script>
+<script defer src="/static/dictation-logic.js?v=1"></script>
 <script defer src="/static/notes-analysis-logic.js?v=1"></script>
 <script defer src="/static/kanban-logic.js?v=1"></script>
-<script defer src="/static/notes-tasks.js?v=18"></script>
+<script defer src="/static/notes-tasks.js?v=19"></script>
 <script>
   // Moonbase theme: apply before paint to avoid a flash of the wrong theme. Default Bravo (dark).
   (function () {
@@ -443,8 +444,10 @@
             <button class="nt-icon-btn" id="noteMoveBtn" title="Rename / move">&#9998;</button>
             <button class="nt-icon-btn" id="noteRetagBtn" title="Re-tag this note now">✨</button>
             <button class="nt-icon-btn" id="noteAnalyzeBtn" title="Analyze this note with AI">🧠</button>
+            <button class="nt-icon-btn dictate-btn" id="noteDictateBtn" title="Dictate into this note">&#127908;</button>
             <button class="nt-icon-btn danger" id="noteDeleteBtn" title="Move to trash">&#128465;</button>
           </div>
+          <span class="dictate-status" id="noteDictateStatus"></span>
         </div>
         <div class="note-toolbar" id="noteToolbar"></div>
         <div class="notes-doc-body">
@@ -503,8 +506,10 @@
       <div class="board-topbar" id="tasksQuickAddBar">
         <form class="board-quickadd" id="boardQuickAdd">
           <input type="text" id="boardQuickAddInput" placeholder="Add a task in plain English… e.g. &quot;chase John about the contract next Friday, high priority&quot;" autocomplete="off">
+          <button type="button" class="nt-icon-btn dictate-btn" id="boardDictateBtn" title="Dictate a task">&#127908;</button>
           <button type="submit" class="tasks-new-btn">Add</button>
         </form>
+        <span class="dictate-status" id="boardDictateStatus"></span>
       </div>
       <div id="boardQuickAddPreview" class="board-quickadd-preview" style="display:none"></div>
       <div class="tasks-list" id="tasksList"><div class="tasks-empty">Loading…</div></div>

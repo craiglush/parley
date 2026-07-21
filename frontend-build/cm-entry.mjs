@@ -438,6 +438,9 @@ function create(opts = {}) {
       changes: { from: 0, to: view.state.doc.length, insert: text || '' },
       selection: { anchor: 0 },
     }),
+    replaceRange: (from, to, text) => view.dispatch({
+      changes: { from, to, insert: text || '' },
+    }),
     applyFormat: (cmd, arg) => applyFormat(view, cmd, arg),
     insertAtCursor: (text) => {
       const sel = view.state.selection.main;

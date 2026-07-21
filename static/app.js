@@ -1183,6 +1183,7 @@ async function startRecording() {
 }
 
 function setupRecorderFromStream(stream, usingLoopback, loopbackName) {
+    window.__meetingRecordingActive = () => !!mediaRecorder && mediaRecorder.state === 'recording';
     recordedChunks = [];
 
     // Reset signal monitoring + clear any stale no-audio warning.

@@ -36,6 +36,77 @@
     d.flush = function (...a) { clearTimeout(t); fn.apply(null, a); };
     return d;
   }
+  // ---- dictation (shared mic-recording -> /api/dictate) ----
+  const DICTATE_MAX_MS = 120000;
+  function wireDictateButton(btn, statusEl, onTranscript) {
+    if (!btn) return;
+    let recorder = null, chunks = [], stopTimer = null, countdownTimer = null;
+    function setIdle() {
+      btn.classList.remove('recording', 'transcribing');
+    }
+    function stopRecording() {
+      if (stopTimer) { clearTimeout(stopTimer); stopTimer = null; }
+      if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+    }
+    btn.onclick = async () => {
+      if (btn.classList.contains('recording')) { stopRecording(); return; }
+      if (btn.classList.contains('transcribing')) return;
+      if (window.__meetingRecordingActive && window.__meetingRecordingActive()) {
+        if (statusEl) statusEl.textContent = "Can't dictate while a meeting is recording";
+        return;
+      }
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        if (statusEl) statusEl.textContent = 'Microphone access denied — check browser permissions';
+        return;
+      }
+      chunks = [];
+      recorder = new MediaRecorder(stream);
+      recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        btn.classList.remove('recording');
+        btn.classList.add('transcribing');
+        if (statusEl) statusEl.textContent = 'Transcribing…';
+        try {
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+          const fd = new FormData();
+          fd.append('audio', blob, 'dictation.webm');
+          const result = await api('/api/dictate', { method: 'POST', body: fd });
+          const text = ((result && result.text) || '').trim();
+          if (!text) { if (statusEl) statusEl.textContent = "Didn't catch that — try again"; }
+          else { onTranscript(text); if (statusEl) statusEl.textContent = ''; }
+        } catch (e) {
+          if (statusEl) statusEl.textContent = 'Transcription failed — try again';
+        } finally {
+          setIdle();
+        }
+      };
+      recorder.start();
+      btn.classList.add('recording');
+      if (statusEl) statusEl.textContent = 'Recording…';
+      let remainingMs = DICTATE_MAX_MS;
+      countdownTimer = setInterval(() => {
+        remainingMs -= 1000;
+        if (remainingMs <= 10000 && remainingMs > 0 && statusEl) {
+          statusEl.textContent = 'Recording… ' + Math.ceil(remainingMs / 1000) + 's left';
+        }
+      }, 1000);
+      stopTimer = setTimeout(stopRecording, DICTATE_MAX_MS);
+    };
+  }
+
+  function initBoardDictate() {
+    wireDictateButton($('boardDictateBtn'), $('boardDictateStatus'), (text) => {
+      const input = $('boardQuickAddInput');
+      input.value = window.DictationLogic.mergeDictationText(input.value, text);
+      input.focus();
+    });
+  }
+
   function todayStr() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
   function fmtDate(iso) {
     if (!iso) return '';
@@ -776,6 +847,7 @@
     if (toggle) toggle.addEventListener('click', (e) => { const b = e.target.closest('[data-view]'); if (b) setTasksView(b.dataset.view); });
     initBoardDnD();
     initBoardQuickAdd();
+    initBoardDictate();
     initBoardTriage();
     setTasksView(tasksView);
   }
@@ -883,10 +955,18 @@
     setSaveState('saving');
     autosave();
     if (previewOn) updatePreview();
+    if (currentNoteId && noteEditor) autoAnalyze(currentNoteId, noteEditor.getValue());
   }
 
   async function openNote(id) {
     try {
+      if (id !== currentNoteId) noteSwitchSeq++;
+      if (pendingSpan) { clearTimeout(pendingSpan.timer); pendingSpan = null; }
+      cleanupInFlight = false;
+      if ($('noteDictateStatus')) $('noteDictateStatus').textContent = '';
+      const panel = $('noteAnalysis');
+      if (panel) { panel._result = null; panel.style.display = 'none'; panel.innerHTML = ''; }
+      $('noteAnalyzeBtn').classList.remove('has-fresh');
       const note = await window.NotesSync.readNote(id);
       if (!note) throw new Error('Note not found');
       currentNote = note; currentNoteId = note.id;
@@ -1114,7 +1194,13 @@
     el.style.display = 'none'; el.innerHTML = '';
     try {
       const data = await api('/api/notes/' + currentNoteId + '/analysis');
-      if (data && data.status === 'done' && data.result) renderAnalysisPanel(data.result);
+      if (data && data.status === 'done' && data.result) {
+        renderAnalysisPanel(data.result);
+        // Seed the "already analyzed" tracking so autoAnalyze's debounced guard
+        // (armed by the same setValue() call that triggered this fetch) doesn't
+        // re-run analysis on pure browsing of a note that's already up to date.
+        lastAnalyzedBody[currentNoteId] = noteEditor ? noteEditor.getValue() : '';
+      }
     } catch (e) {}
   }
 
@@ -1132,14 +1218,127 @@
     }, 3000);
   }
 
-  async function runAnalyze() {
-    if (!currentNoteId) return;
+  const lastAnalyzedBody = {};  // note_id -> body string at last completed analysis
+  let noteSwitchSeq = 0;        // bumped synchronously at the top of openNote; guards
+                                 // against currentNoteId's reassignment lagging behind
+                                 // a note switch while a poll is in flight
+
+  function pollAutoAnalysis(noteId, tries, seq) {
+    if (currentNoteId !== noteId || tries <= 0 || seq !== noteSwitchSeq) return;
+    setTimeout(async () => {
+      if (currentNoteId !== noteId || seq !== noteSwitchSeq) return;
+      try {
+        const data = await api('/api/notes/' + noteId + '/analysis');
+        if (seq !== noteSwitchSeq) return;   // a note switch happened while this was in flight
+        if (data && data.status === 'done' && data.result) {
+          lastAnalyzedBody[noteId] = noteEditor ? noteEditor.getValue() : '';
+          const panel = $('noteAnalysis');
+          if (panel.style.display === 'block') { renderAnalysisPanel(data.result); }
+          else { panel._result = data.result; $('noteAnalyzeBtn').classList.add('has-fresh'); }
+          return;
+        }
+        if (data && data.status === 'error') return;
+      } catch (e) {}
+      pollAutoAnalysis(noteId, tries - 1, seq);
+    }, 3000);
+  }
+
+  const autoAnalyze = debounce((noteId, body) => {
+    if (currentNoteId !== noteId) return;
+    if (lastAnalyzedBody[noteId] === body) return;  // nothing new since last run
+    const seq = noteSwitchSeq;
+    api('/api/notes/' + noteId + '/analyze', { method: 'POST' })
+      .then(() => pollAutoAnalysis(noteId, 40, seq))
+      .catch(() => {});
+  }, 12000);
+
+  // ---- dictation into notes + silent auto-cleanup ----
+  let pendingSpan = null;       // {rawText, timer} -- one open note at a time
+  let cleanupInFlight = false;
+
+  function armPendingSpan(rawText) {
+    if (pendingSpan) {
+      clearTimeout(pendingSpan.timer);
+      pendingSpan.rawText += ' ' + rawText;
+    } else {
+      pendingSpan = { rawText: rawText, timer: null };
+    }
+    pendingSpan.timer = setTimeout(onPendingSpanTimer, 10000);
+  }
+
+  function onPendingSpanTimer() {
+    if (!pendingSpan) return;
+    if (cleanupInFlight) {
+      pendingSpan.timer = setTimeout(onPendingSpanTimer, 10000);  // mutex busy, try again shortly
+      return;
+    }
+    const span = pendingSpan;
+    pendingSpan = null;
+    sendCleanup(span);
+  }
+
+  async function sendCleanup(span) {
+    if (!currentNoteId || !noteEditor) return;
     const noteId = currentNoteId;
+    const fullText = noteEditor.getValue();
+    const at = window.DictationLogic.findUnchangedSpan(fullText, span.rawText);
+    if (at.index < 0 || at.ambiguous) return;  // hand-edited or ambiguous -- drop silently
+    cleanupInFlight = true;
+    const statusEl = $('noteDictateStatus');
+    if (statusEl) statusEl.textContent = '✨ tidying dictated text…';
     try {
-      await api('/api/notes/' + noteId + '/analyze', { method: 'POST' });
-      toast('Analyzing note — runs when the GPU is free…', 'success');
-      pollAnalysis(noteId, 40);
-    } catch (e) { toast('Analyze failed: ' + e.message, 'error'); }
+      await api('/api/notes/' + noteId + '/cleanup-span', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: span.rawText }),
+      });
+      pollCleanupSpan(noteId, span.rawText, 20);
+    } catch (e) {
+      cleanupInFlight = false;
+      if (statusEl) statusEl.textContent = '';
+    }
+  }
+
+  function pollCleanupSpan(noteId, rawText, tries) {
+    const statusEl = $('noteDictateStatus');
+    if (currentNoteId !== noteId || tries <= 0) {
+      cleanupInFlight = false;
+      if (statusEl) statusEl.textContent = '';
+      return;
+    }
+    setTimeout(async () => {
+      if (currentNoteId !== noteId) { cleanupInFlight = false; return; }
+      try {
+        const data = await api('/api/notes/' + noteId + '/cleanup-span');
+        if (data && data.status === 'done' && data.result) {
+          applyCleanup(noteId, rawText, data.result.text);
+          cleanupInFlight = false;
+          if (statusEl) statusEl.textContent = '';
+          return;
+        }
+        if (data && data.status === 'error') {
+          cleanupInFlight = false;
+          if (statusEl) statusEl.textContent = '';
+          return;
+        }
+      } catch (e) {}
+      pollCleanupSpan(noteId, rawText, tries - 1);
+    }, 3000);
+  }
+
+  function applyCleanup(noteId, rawText, cleanedText) {
+    if (currentNoteId !== noteId || !noteEditor) return;
+    const fullText = noteEditor.getValue();
+    const at = window.DictationLogic.findUnchangedSpan(fullText, rawText);
+    if (at.index < 0 || at.ambiguous) return;  // edited/ambiguous since send -- drop silently
+    noteEditor.replaceRange(at.index, at.index + rawText.length, cleanedText);
+  }
+
+  function initNoteDictate() {
+    wireDictateButton($('noteDictateBtn'), $('noteDictateStatus'), (text) => {
+      if (!noteEditor) return;
+      noteEditor.insertAtCursor(text);
+      armPendingSpan(text);
+    });
   }
 
   // ---- preview ----
@@ -1243,7 +1442,16 @@
       } catch (e) { toast('Retag failed: ' + e.message, 'error'); }
     };
 
-    $('noteAnalyzeBtn').onclick = runAnalyze;
+    $('noteAnalyzeBtn').onclick = () => {
+      const panel = $('noteAnalysis');
+      $('noteAnalyzeBtn').classList.remove('has-fresh');
+      // innerHTML = '' only clears to an empty string when collapsing the panel (no
+      // untrusted data involved) -- copied verbatim from the data-na-close handler below.
+      if (panel.style.display === 'block') { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+      if (panel._result) renderAnalysisPanel(panel._result);
+      else loadAnalysis();
+    };
+    initNoteDictate();
     $('noteAnalysis').addEventListener('click', (e) => {
       const panel = $('noteAnalysis');
       if (e.target.closest('[data-na-close]')) { panel.style.display = 'none'; panel.innerHTML = ''; return; }

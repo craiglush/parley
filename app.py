@@ -353,6 +353,21 @@ DEFAULT_PROMPTS = {
         '  "insights": ["non-obvious observation"]\n'
         "}"
     ),
+    "note_cleanup": (
+        "You are tidying up a short piece of dictated (voice-to-text) note content.\n"
+        "Fix punctuation and capitalization, remove filler words and false starts, and\n"
+        "reflow the text into clean paragraphs or bullet points where that helps\n"
+        "readability. Tighten phrasing, but PRESERVE every fact and the original\n"
+        "meaning exactly -- never invent, add, or drop content.\n"
+        "\n"
+        "RAW TEXT:\n"
+        "{text}\n"
+        "\n"
+        "Respond ONLY with valid JSON, no other text:\n"
+        "{\n"
+        '  "text": "the polished version"\n'
+        "}"
+    ),
 }
 
 # Appended to the cleanup preamble AT PROMPT-BUILD TIME when the remove_filler
@@ -510,6 +525,13 @@ ANALYSIS_SCHEMAS = {
             "insights": _STR_ARRAY,
         },
         "required": ["summary"],
+    },
+    "note_cleanup": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+        },
+        "required": ["text"],
     },
     "digest_briefing": {
         "type": "object",
@@ -681,6 +703,10 @@ _SID_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 
 # Attachment handling
 ATTACH_MAX_BYTES = 50 * 1024 * 1024
+
+# Dictation upload cap: generous headroom over uncompressed 16-bit stereo 48kHz
+# audio for the 120s duration cap (~23MB), well below ATTACH_MAX_BYTES.
+DICTATE_MAX_BYTES = 25 * 1024 * 1024
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 _ATTACH_MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                  ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
@@ -781,6 +807,7 @@ async def _verify_embedding_dim_on_startup():
     _probe_t = asyncio.create_task(_probe()); _bg_tasks.add(_probe_t); _probe_t.add_done_callback(_bg_tasks.discard)
     _tag_t = asyncio.create_task(_tag_worker()); _bg_tasks.add(_tag_t); _tag_t.add_done_callback(_bg_tasks.discard)
     _an_t = asyncio.create_task(_analysis_worker()); _bg_tasks.add(_an_t); _an_t.add_done_callback(_bg_tasks.discard)
+    _cln_t = asyncio.create_task(_cleanup_worker()); _bg_tasks.add(_cln_t); _cln_t.add_done_callback(_bg_tasks.discard)
     _gc_t = asyncio.create_task(_capture_gc_worker()); _bg_tasks.add(_gc_t); _gc_t.add_done_callback(_bg_tasks.discard)
     _sgc_t = asyncio.create_task(_sidecar_gc_worker()); _bg_tasks.add(_sgc_t); _sgc_t.add_done_callback(_bg_tasks.discard)
     _ext_t = asyncio.create_task(_extract_worker()); _bg_tasks.add(_ext_t); _ext_t.add_done_callback(_bg_tasks.discard)
@@ -804,6 +831,16 @@ ANALYSIS_IDLE_POLL = 30.0
 _analysis_queue: "asyncio.Queue[str]" = asyncio.Queue()
 _analysis_pending: set = set()
 _analysis_status: dict[str, str] = {}  # note_id -> queued|running|done|error
+
+# Background note-cleanup worker (silent LLM polish of freshly-dictated text; same
+# enqueue -> idle-worker -> LLM shape as tags/analysis, but results are ephemeral --
+# no disk sidecar, consumed by a short client poll within tens of seconds)
+CLEANUP_IDLE_POLL = 30.0
+_cleanup_queue: "asyncio.Queue[str]" = asyncio.Queue()
+_cleanup_pending: set = set()
+_cleanup_status: dict[str, str] = {}   # note_id -> queued|running|done|error
+_cleanup_text: dict[str, str] = {}     # note_id -> pending raw text to clean
+_cleanup_result: dict[str, str] = {}   # note_id -> cleaned text (once done)
 
 # Background attachment-extraction worker (deferred STT/vision — GPU work)
 EXTRACT_IDLE_POLL = 30.0
@@ -1442,6 +1479,31 @@ async def analyze_note_text(text: str) -> dict:
     except Exception as e:
         logger.warning(f"note analysis failed (non-fatal): {e}")
         return default
+
+
+async def cleanup_note_text(text: str) -> str:
+    """Silently polish a short dictated-text fragment: fix punctuation/filler, reflow
+    into clean paragraphs/bullets, tighten phrasing -- preserve meaning and every fact.
+    Non-fatal: any failure or unparseable/empty response returns the original text
+    unchanged, since cleanup must never blank out what the user said."""
+    settings = load_settings()
+    model = settings.get("ollama_model", OLLAMA_MODEL)
+    temperature = settings.get("temperature", 0.3)
+    template = settings["prompts"].get("note_cleanup", DEFAULT_PROMPTS.get("note_cleanup", ""))
+    prompt = template.replace("{text}", text)
+    try:
+        body = _build_generate_body(
+            model, prompt, temperature=temperature, num_predict=2048,
+            schema=ANALYSIS_SCHEMAS.get("note_cleanup"))
+        resp = await _retry_ollama_call(
+            "POST", f"{OLLAMA_URL}/api/generate",
+            json_body=body, timeout_seconds=120.0, max_retries=2)
+        parsed = _parse_json_object(resp.json().get("response", ""), context="note-cleanup")
+        cleaned = str(parsed.get("text", "")).strip() if parsed else ""
+        return cleaned if cleaned else text
+    except Exception as e:
+        logger.warning(f"note cleanup failed (non-fatal): {e}")
+        return text
 
 
 def _build_analysis_corpus(note: dict, extractions: list[dict]) -> str:
@@ -6003,6 +6065,46 @@ async def _analysis_worker():
             _analysis_queue.task_done()
 
 
+async def _run_cleanup_job(note_id: str) -> str:
+    """Run one cleanup pass over the note's pending dictated text. Returns the cleaned
+    text and stores it for polling."""
+    text = _cleanup_text.get(note_id, "")
+    cleaned = await cleanup_note_text(text)
+    _cleanup_result[note_id] = cleaned
+    return cleaned
+
+
+def _enqueue_cleanup(note_id: str, text: str) -> None:
+    """Enqueue (or extend) a pending note-cleanup job. The pending text is always
+    overwritten with the latest span -- this is how a fast follow-up dictation batch
+    extends an already-queued job instead of queuing a second one. In the intended
+    client flow only one cleanup-span request is ever in flight per note at a time, so
+    this mainly guards against a stray duplicate request."""
+    _cleanup_text[note_id] = text
+    if note_id not in _cleanup_pending:
+        _cleanup_pending.add(note_id)
+        _cleanup_status[note_id] = "queued"
+        _cleanup_queue.put_nowait(note_id)
+
+
+async def _cleanup_worker():
+    """Background worker: polish queued dictated text once the meeting pipeline is idle."""
+    while True:
+        note_id = await _cleanup_queue.get()
+        try:
+            while _pipeline_busy():
+                await asyncio.sleep(CLEANUP_IDLE_POLL)
+            _cleanup_status[note_id] = "running"
+            await _run_cleanup_job(note_id)
+            _cleanup_status[note_id] = "done"
+        except Exception as e:
+            logger.warning(f"cleanup worker error (non-fatal): {e}")
+            _cleanup_status[note_id] = "error"
+        finally:
+            _cleanup_pending.discard(note_id)
+            _cleanup_queue.task_done()
+
+
 def _enqueue_extract(note_id: str, filename: str) -> None:
     """Enqueue a deferred (STT/vision) extraction, coalesced by (note_id, filename)."""
     key = f"{note_id}\x00{filename}"
@@ -6027,14 +6129,55 @@ async def _extract_worker():
             _extract_queue.task_done()
 
 
-async def _extract_stt(path: str) -> str:
-    """Transcribe an audio/video attachment (no diarization) into plain lines."""
+def _join_segments(result: dict) -> str:
+    return "\n".join(s.get("text", "") for s in result.get("segments", []) if s.get("text"))
+
+
+async def _transcribe_plain(path: str) -> str:
+    """Transcribe an audio/video file (no diarization) into plain lines. Callers that
+    need a length cap (e.g. interactive dictation) should check stt.preprocess_audio's
+    return themselves rather than adding one here -- attachment transcription has no
+    such cap."""
     loop = asyncio.get_event_loop()
     with tempfile.TemporaryDirectory() as td:
         wav = os.path.join(td, "audio.wav")
         await loop.run_in_executor(None, stt.preprocess_audio, path, wav)
         result = await stt.step_transcribe(wav, None, None, diarize=False)
-    return "\n".join(s.get("text", "") for s in result.get("segments", []) if s.get("text"))
+    return _join_segments(result)
+
+
+async def _extract_stt(path: str) -> str:
+    """Transcribe an audio/video attachment (no diarization) into plain lines."""
+    return await _transcribe_plain(path)
+
+
+DICTATE_MAX_SECONDS = 120.0
+
+
+@app.post("/api/dictate")
+async def api_dictate(audio: UploadFile = File(...)):
+    """Transcribe a short dictation clip (no diarization, no note/meeting association).
+    Stateless: audio in, text out. Not gated behind _pipeline_busy() -- this is an
+    interactive, user-waited call, unlike the silent background cleanup/analysis passes."""
+    data = await audio.read()
+    if len(data) > DICTATE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Recording too large")
+    loop = asyncio.get_event_loop()
+    with tempfile.TemporaryDirectory() as td:
+        suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+        input_path = os.path.join(td, f"input{suffix}")
+        with open(input_path, "wb") as f:
+            f.write(data)
+        wav = os.path.join(td, "audio.wav")
+        try:
+            duration = await loop.run_in_executor(None, stt.preprocess_audio, input_path, wav)
+        except Exception as e:
+            logger.warning(f"dictate preprocess failed: {e}")
+            raise HTTPException(status_code=400, detail="Could not process audio")
+        if duration > DICTATE_MAX_SECONDS:
+            raise HTTPException(status_code=400, detail="Recording too long")
+        result = await stt.step_transcribe(wav, None, None, diarize=False)
+    return {"text": _join_segments(result)}
 
 
 async def _extract_scanned_pdf(path: str) -> str:
@@ -6427,6 +6570,33 @@ async def api_get_note_analysis(note_id: str):
     if status == "done" and result is None:
         # In-memory says done but the sidecar is missing/corrupt — never
         # present "done" without content; the UI renders result on "done".
+        status = "error"
+    return {"status": status, "result": result}
+
+
+class NoteCleanupSpanRequest(BaseModel):
+    text: str
+
+
+@app.post("/api/notes/{note_id}/cleanup-span")
+async def api_cleanup_span(note_id: str, payload: NoteCleanupSpanRequest):
+    """Enqueue (or extend) a background cleanup pass over a freshly-dictated text span.
+    Returns immediately; poll GET .../cleanup-span."""
+    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    _enqueue_cleanup(note_id, payload.text)
+    return {"queued": True, "status": _cleanup_status.get(note_id, "queued")}
+
+
+@app.get("/api/notes/{note_id}/cleanup-span")
+async def api_get_cleanup_span(note_id: str):
+    """Report cleanup status + the cleaned text (if ready) for this note's pending span."""
+    if notes_store.read_note(notes_store.NOTES_DIR, note_id) is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    status = _cleanup_status.get(note_id, "idle")
+    cleaned = _cleanup_result.get(note_id)
+    result = {"text": cleaned} if (status == "done" and cleaned is not None) else None
+    if status == "done" and result is None:
         status = "error"
     return {"status": status, "result": result}
 

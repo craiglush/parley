@@ -42,6 +42,7 @@ Meeting-AI tools are everywhere — but they ship your most sensitive conversati
 
 ### 📝 Notes & Tasks
 - Markdown notes with a **CodeMirror 6** editor: headings, checkboxes, **`[[wiki-links]]`** + backlinks, autocomplete, live preview.
+- **Voice dictation** — a mic button on the tasks quick-add box and in the notes editor transcribes speech locally and drops it straight into the text; notes are silently auto-polished by a local LLM a few seconds after you stop talking, with a byte-for-byte safety check so it never clobbers a hand-edit.
 - A **Tasks dashboard** with full CRUD — create, edit, complete, and group tasks by due date / owner / priority. Meeting action items are tracked right alongside your own.
 - **Automatic linking** between notes and the meetings they relate to (and back again).
 - **File attachments** (drag / drop / paste) and a built-in **SVG sketch canvas**.

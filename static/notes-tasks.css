@@ -104,6 +104,17 @@ body[data-pillar="tasks"] #boardQuickAddPreview { display: none !important; }
 .nt-icon-btn.lg { width: auto; padding: 0 14px; height: 40px; gap: 6px; font-size: 14px; }
 .nt-icon-btn.active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
 
+.dictate-btn.recording { color: var(--red); border-color: var(--red); animation: dictate-pulse 1.2s ease-in-out infinite; }
+.dictate-btn.transcribing { opacity: .6; cursor: wait; }
+@keyframes dictate-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+.dictate-status { font-size: 12px; color: var(--text-secondary); }
+
+#noteAnalyzeBtn { position: relative; }
+#noteAnalyzeBtn.has-fresh::after {
+  content: ''; position: absolute; top: 4px; right: 4px;
+  width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+}
+
 .notes-search-wrap { display: flex; gap: 6px; }
 .notes-search {
   flex: 1; font-family: var(--font-ui); font-size: 13px; color: var(--text-primary);

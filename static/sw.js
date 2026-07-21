@@ -1,4 +1,4 @@
-const CACHE_NAME = 'meetings-v21-cleanups';
+const CACHE_NAME = 'meetings-v22-voice-dictation';
 
 // Minimal service worker for PWA installability.
 // Only caches the app shell; API calls always go to network.
@@ -13,6 +13,7 @@ const SHELL_ASSETS = [
   '/static/notes-sync.js',
   '/static/notes-tasks.js',
   '/static/notes-analysis-logic.js',
+  '/static/dictation-logic.js',
   '/static/capture-notes-logic.js',
   '/static/kanban-logic.js',
   '/static/vendor/codemirror.bundle.js',
