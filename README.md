@@ -16,6 +16,21 @@
 
 ---
 
+## Screenshots
+
+<table>
+<tr>
+<td width="50%"><img src="assets/screenshots/meeting-summary.png" alt="Meeting capture with AI summary, key topics, and sentiment"></td>
+<td width="50%"><img src="assets/screenshots/notes-dictation.png" alt="Notes editor with voice dictation and AI analysis"></td>
+</tr>
+<tr>
+<td width="50%"><img src="assets/screenshots/kanban-board.png" alt="Kanban task board with AI-triaged action items"></td>
+<td width="50%"><img src="assets/screenshots/settings.png" alt="Settings: Ollama model picker and Parakeet+pyannote STT selector"></td>
+</tr>
+</table>
+
+---
+
 ## Why Parley?
 
 Meeting-AI tools are everywhere — but they ship your most sensitive conversations to someone else's servers and bill you monthly for the privilege. Parley does the opposite:
