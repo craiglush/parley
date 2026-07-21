@@ -657,7 +657,9 @@
         <div class="settings-model-row">
           <div class="field">
             <label for="settingsModel">Ollama Model</label>
-            <input type="text" id="settingsModel" placeholder="e.g. llama3.1:8b">
+            <select id="settingsModel"></select>
+            <input type="text" id="settingsModelCustom" placeholder="custom model tag (optional)"
+                   style="margin-top:6px;display:none">
           </div>
           <div class="field">
             <label>Temperature: <span class="settings-temp-value" id="tempDisplay">0.3</span></label>
@@ -671,6 +673,20 @@
         <div class="settings-section-desc">While recording, stream a copy to the server so a long meeting survives even if this device dies before you upload. Recordings are always auto-saved in this browser regardless.</div>
         <label style="display:block;margin-top:8px">
           <input type="checkbox" id="settingsStreamBackup"> Stream a server-side backup while recording
+        </label>
+      </div>
+
+      <!-- Transcription (STT) -->
+      <div class="settings-section">
+        <div class="settings-section-title">Transcription (STT)</div>
+        <div class="settings-section-desc">Engine used to transcribe &amp; diarize meeting audio.</div>
+        <label>Engine:
+          <select id="settingsSttBackend">
+            <option value="parakeet">Parakeet + pyannote</option>
+          </select>
+        </label>
+        <label style="display:block;margin-top:8px">
+          <input type="checkbox" id="settingsDiarize"> Speaker diarization (who said what)
         </label>
       </div>
 

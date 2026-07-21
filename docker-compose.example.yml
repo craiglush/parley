@@ -1,7 +1,8 @@
 # Example compose for running Meeting Service standalone.
 # Copy to `docker-compose.yml` and adjust. No secrets live here — values come from
-# your `.env` (see .env.example). WhisperX (STT) and Ollama are expected to be
-# provided separately; point the URLs at your own instances.
+# your `.env` (see .env.example). Parakeet (STT), pyannote (diarization), and
+# Ollama are expected to be provided separately; point the URLs at your own
+# instances.
 
 services:
   meeting-service:
@@ -13,9 +14,10 @@ services:
       - ./data/meetings:/data/meetings
       - ./data/notes:/data/notes
     environment:
-      - WHISPERX_URL=${WHISPERX_URL:-http://whisperx:8000}
+      - PARAKEET_URL=${PARAKEET_URL:-http://parakeet-asr:5092}
+      - DIARIZER_URL=${DIARIZER_URL:-http://pyannote-diarizer:8000}
       - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
-      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3.5:9b}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:14b}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-qwen3-embedding:0.6b}
       - QDRANT_URL=${QDRANT_URL:-http://qdrant:6333}
       - OPENWEBUI_URL=${OPENWEBUI_URL:-}
@@ -37,6 +39,7 @@ services:
       - ./data/qdrant:/qdrant/storage
     restart: unless-stopped
 
-  # WhisperX / faster-whisper (STT) and Ollama (LLM + embeddings) are NOT included
-  # here — run them yourself and set WHISPERX_URL / OLLAMA_URL accordingly. Ollama
+  # Parakeet (STT, OpenAI-compatible /v1/audio/transcriptions endpoint) and
+  # pyannote (speaker diarization, /diarize endpoint) are NOT included here —
+  # run them yourself and set PARAKEET_URL / DIARIZER_URL accordingly. Ollama
   # typically runs natively on the host (reached via host.docker.internal).

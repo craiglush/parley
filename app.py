@@ -1,7 +1,7 @@
 """
 Meeting Service - Orchestrator for audio transcription, summarization, and search.
 
-Pipeline: Upload audio -> WhisperX transcription -> LLM transcript cleanup -> Ollama summarization -> Qdrant storage -> file output
+Pipeline: Upload audio -> Parakeet+pyannote transcription -> LLM transcript cleanup -> Ollama summarization -> Qdrant storage -> file output
 """
 
 import asyncio
@@ -65,10 +65,9 @@ from llm import (
     _parse_json_object,
     _parse_json_array,
 )
-# WhisperX + audio helpers live in stt.py; re-bound so process_meeting's bare
+# STT + audio helpers live in stt.py; re-bound so process_meeting's bare
 # calls (preprocess_audio, split_audio, step_transcribe, merge_chunk_segments) resolve.
 from stt import (
-    _retry_whisperx_call,
     preprocess_audio,
     probe_duration,
     split_audio,
@@ -107,7 +106,6 @@ logging.basicConfig(
 # Configuration
 # ---------------------------------------------------------------------------
 
-WHISPERX_URL = os.getenv("WHISPERX_URL", "http://whisperx:8000")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
@@ -581,6 +579,8 @@ DEFAULT_SETTINGS = {
     "prompts": dict(DEFAULT_PROMPTS),
     "ollama_model": OLLAMA_MODEL,
     "temperature": 0.3,
+    "stt_backend": os.getenv("MEETING_STT_BACKEND", "parakeet"),
+    "diarize": True,
     "remove_filler": True,
     "chat": {
         "endpoint": "ollama",  # "ollama", "openwebui", or "custom"
@@ -634,6 +634,10 @@ def load_settings() -> dict:
                 settings["ollama_model"] = saved["ollama_model"]
             if "temperature" in saved:
                 settings["temperature"] = saved["temperature"]
+            if saved.get("stt_backend") in ("parakeet",):
+                settings["stt_backend"] = saved["stt_backend"]
+            if isinstance(saved.get("diarize"), bool):
+                settings["diarize"] = saved["diarize"]
             if isinstance(saved.get("remove_filler"), bool):
                 settings["remove_filler"] = saved["remove_filler"]
             # Merge chat settings
@@ -681,6 +685,33 @@ def _digest_zoneinfo(tz_str: str | None) -> ZoneInfo:
         return ZoneInfo(tz_str or DEFAULT_SETTINGS["digest"]["timezone"])
     except Exception:
         return ZoneInfo("UTC")
+
+
+def _parse_ollama_tags(data: dict) -> list[dict]:
+    """Shape Ollama /api/tags output into the UI model list, sorted by name."""
+    out = []
+    for m in data.get("models", []):
+        det = m.get("details", {}) or {}
+        out.append({
+            "name": m.get("name", ""),
+            "size": m.get("size", 0),
+            "parameter_size": det.get("parameter_size", ""),
+            "quantization": det.get("quantization_level", ""),
+        })
+    out.sort(key=lambda x: x["name"])
+    return out
+
+
+async def _list_ollama_models() -> list[dict]:
+    """Fetch installed Ollama models; empty list on any failure (UI degrades to free text)."""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.get(f"{OLLAMA_URL}/api/tags")
+            resp.raise_for_status()
+            return _parse_ollama_tags(resp.json())
+    except Exception as e:
+        logger.warning(f"Failed to list Ollama models: {e}")
+        return []
 
 
 # Chunking / splitting
@@ -2350,6 +2381,10 @@ async def process_meeting(meeting_id: str):
             None, split_audio, wav_path, duration
         )
 
+        _stt_cfg = load_settings()
+        _stt_backend = _stt_cfg.get("stt_backend")          # None -> stt env default
+        _stt_diarize = _stt_cfg.get("diarize", True)
+
         chunk_results = []
         total_chunks = len(chunks)
         for ci, chunk in enumerate(chunks):
@@ -2361,6 +2396,8 @@ async def process_meeting(meeting_id: str):
                 chunk["path"],
                 meeting.get("min_speakers"),
                 meeting.get("max_speakers"),
+                backend=_stt_backend,
+                diarize=_stt_diarize,
             )
             result["offset"] = chunk["offset"]
             chunk_results.append(result)
@@ -2562,7 +2599,7 @@ async def process_meeting(meeting_id: str):
         original_ext = os.path.splitext(original_path)[1]
         shutil.copy2(original_path, out_dir / f"audio{original_ext}")
 
-        # Write raw transcript JSON (original WhisperX output)
+        # Write raw transcript JSON (original Parakeet+pyannote output)
         raw_transcript_data = {
             "meeting_id": meeting_id,
             "date": meeting["date"],
@@ -5593,7 +5630,15 @@ class SettingsRequest(BaseModel):
     smtp: Optional[SmtpSettingsRequest] = None
     digest: Optional[DigestSettingsRequest] = None
     ics: Optional[IcsSettingsRequest] = None
+    stt_backend: Optional[str] = None
+    diarize: Optional[bool] = None
     remove_filler: Optional[bool] = None
+
+
+@app.get("/api/models")
+async def api_models():
+    """List installed Ollama models for the settings model picker."""
+    return {"models": await _list_ollama_models()}
 
 
 @app.get("/api/settings")
@@ -5684,6 +5729,12 @@ async def update_settings(body: SettingsRequest):
             ics["enabled"] = bool(body.ics.enabled)
         if body.ics.token is not None:
             ics["token"] = body.ics.token.strip()
+
+    if body.stt_backend is not None and body.stt_backend in ("parakeet",):
+        settings["stt_backend"] = body.stt_backend
+
+    if body.diarize is not None:
+        settings["diarize"] = bool(body.diarize)
 
     if body.remove_filler is not None:
         settings["remove_filler"] = bool(body.remove_filler)

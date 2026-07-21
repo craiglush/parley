@@ -4443,6 +4443,41 @@ function appendChatMessage(role, content) {
 }
 
 
+// --- Model dropdown helpers ---
+async function populateModelDropdown(selectedModel) {
+  const sel = document.getElementById('settingsModel');
+  const custom = document.getElementById('settingsModelCustom');
+  let models = [];
+  try {
+    const r = await fetch('/api/models');
+    models = (await r.json()).models || [];
+  } catch (_) { /* fall back to free text */ }
+  while (sel.firstChild) sel.removeChild(sel.firstChild);   // safe clear (no innerHTML)
+  for (const m of models) {
+    const gb = (m.size / 1e9).toFixed(1);
+    const o = document.createElement('option');
+    o.value = m.name;
+    o.textContent = `${m.name} (${gb} GB${m.parameter_size ? ', ' + m.parameter_size : ''})`;
+    sel.appendChild(o);
+  }
+  const opt = document.createElement('option');
+  opt.value = '__custom__'; opt.textContent = 'Custom…';
+  sel.appendChild(opt);
+  if (selectedModel && models.some(m => m.name === selectedModel)) {
+    sel.value = selectedModel; custom.style.display = 'none';
+  } else if (selectedModel) {
+    sel.value = '__custom__'; custom.style.display = 'block'; custom.value = selectedModel;
+  }
+  sel.onchange = () => { custom.style.display = sel.value === '__custom__' ? 'block' : 'none'; };
+}
+
+function selectedModelValue() {
+  const sel = document.getElementById('settingsModel');
+  return sel.value === '__custom__'
+    ? document.getElementById('settingsModelCustom').value.trim()
+    : sel.value;
+}
+
 // --- Settings ---
 let settingsData = null;   // loaded from server
 let settingsDefaults = null;
@@ -4481,7 +4516,10 @@ Object.values(promptFields).forEach(ta => ta.addEventListener('input', markSetti
 $('settingsStreamBackup').addEventListener('change', (e) => {
   localStorage.setItem('captureStreamBackup', e.target.checked ? 'on' : 'off');
 });
-$('settingsModel').addEventListener('input', markSettingsDirty);
+$('settingsModel').addEventListener('change', markSettingsDirty);
+$('settingsModelCustom').addEventListener('input', markSettingsDirty);
+$('settingsSttBackend').addEventListener('change', markSettingsDirty);
+$('settingsDiarize').addEventListener('change', markSettingsDirty);
 $('settingsRemoveFiller').addEventListener('change', markSettingsDirty);
 $('settingsTemp').addEventListener('input', () => {
   $('tempDisplay').textContent = parseFloat($('settingsTemp').value).toFixed(2);
@@ -4617,7 +4655,7 @@ $('settingsResetAll').addEventListener('click', async () => {
     const resp = await fetch(`${API}/api/settings/reset`, { method: 'POST' });
     if (resp.ok) {
       const data = await resp.json();
-      populateSettingsForm(data.settings, settingsDefaults);
+      await populateSettingsForm(data.settings, settingsDefaults);
       settingsDirty = false;
       $('settingsUnsaved').classList.remove('visible');
     }
@@ -4630,8 +4668,10 @@ $('settingsResetAll').addEventListener('click', async () => {
 $('settingsSave').addEventListener('click', async () => {
   const body = {
     prompts: {},
-    ollama_model: $('settingsModel').value.trim(),
+    ollama_model: selectedModelValue(),
     temperature: parseFloat($('settingsTemp').value),
+    stt_backend: $('settingsSttBackend').value,
+    diarize: $('settingsDiarize').checked,
     remove_filler: $('settingsRemoveFiller').checked,
     chat: {
       endpoint: $('chatEndpoint').value,
@@ -4700,17 +4740,19 @@ async function openSettings() {
     const data = await resp.json();
     settingsData = data.settings;
     settingsDefaults = data.defaults;
-    populateSettingsForm(settingsData, settingsDefaults);
+    await populateSettingsForm(settingsData, settingsDefaults);
   } catch (err) {
     $('settingsBody').innerHTML = `<div style="color:var(--red);padding:20px">Failed to load settings: ${escHtml(err.message)}</div>`;
   }
 }
 
-function populateSettingsForm(settings, defaults) {
+async function populateSettingsForm(settings, defaults) {
   $('settingsStreamBackup').checked = streamBackupEnabled();
-  $('settingsModel').value = settings.ollama_model || '';
+  await populateModelDropdown(settings.ollama_model);
   $('settingsTemp').value = settings.temperature || 0.3;
   $('tempDisplay').textContent = parseFloat(settings.temperature || 0.3).toFixed(2);
+  $('settingsSttBackend').value = settings.stt_backend || 'parakeet';
+  $('settingsDiarize').checked = settings.diarize !== false;
   // default-ON semantics: a missing key (pre-feature server) renders checked
   $('settingsRemoveFiller').checked = settings.remove_filler !== false;
 
